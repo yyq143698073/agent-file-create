@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>文档生成智能体</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <!-- ═══ Top Bar ═══ -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="logo">📄</span>
+        <h1>文档生成智能体</h1>
+      </div>
+      <div class="topbar-right">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText" class="status-text">就绪</span>
+        <span class="task-badge" id="taskBadge" title="当前任务">无任务</span>
+      </div>
+    </header>
+
+    <!-- ═══ Toast container ═══ -->
+    <div id="toastBox" class="toast-box"></div>
+
+    <!-- ═══ Main Layout ═══ -->
+    <div class="main">
+
+      <!-- ── Left Panel ── -->
+      <aside class="panel panel-left">
+
+        <!-- Upload Card -->
+        <section class="card">
+          <h2 class="card-title">📤 上传材料</h2>
+          <div class="drop-zone" id="dropZone">
+            <div class="drop-hint">拖拽文件到此处，或点击选择</div>
+            <input type="file" id="files" class="file-in" multiple hidden />
+            <button class="btn btn-outline btn-sm" id="btnPickFiles">选择文件</button>
+            <div id="fileList" class="file-list"></div>
+          </div>
+          <div class="field mt">
+            <label class="field-label">模板（可选）</label>
+            <input type="file" id="templates" class="file-in-sm" multiple />
+            <div id="tplList" class="file-list"></div>
+          </div>
+          <div class="field mt">
+            <label class="field-label">需求描述</label>
+            <input id="userPrompt" type="text" class="input" placeholder="例如：生成一份 AI 行业分析报告" />
+          </div>
+          <div class="field mt">
+            <label class="check-label">
+              <input id="abEval" type="checkbox" />
+              <span>启用 A/B 预处理对比评估</span>
+            </label>
+          </div>
+          <div class="field mt">
+            <label class="check-label">
+              <input id="addToKb" type="checkbox" />
+              <span>同时加入知识库</span>
+            </label>
+          </div>
+          <div class="field mt" id="kbNameField" style="display:none">
+            <label class="field-label">知识库名称</label>
+            <div class="field-row">
+              <input id="kbNameInUpload" type="text" class="input input-sm" placeholder="default" />
+              <span class="kv-value" style="font-size:11px">不填则使用「default」</span>
+            </div>
+          </div>
+          <details class="mt">
+            <summary class="card-subtitle">📚 从知识库选择文件（可选）</summary>
+            <div class="field mt">
+              <div class="field-row">
+                <select id="kbDocSelect" class="input input-sm"></select>
+                <button id="btnKbDocLoad" class="btn btn-outline btn-sm">加载文档列表</button>
+              </div>
+            </div>
+            <div id="kbDocList" class="kb-doc-list" style="max-height:180px;overflow:auto"></div>
+            <div id="kbDocCount" class="kv-value" style="margin-top:4px;display:none">已选 0 个文档</div>
+          </details>
+          <div class="btn-row mt">
+            <button id="btnUpload" class="btn btn-primary">🚀 生成报告</button>
+            <button id="btnAppend" class="btn btn-outline">追加到当前任务</button>
+          </div>
+          <div id="clarifyWrap" class="clarify-box" style="display:none">
+            <div class="clarify-header">📋 需要补充信息</div>
+            <div id="clarifyQuestions" class="clarify-questions"></div>
+            <textarea id="clarifyAnswers" class="input clarify-input" placeholder="逐条回答上述问题..."></textarea>
+            <div class="btn-row">
+              <button id="btnClarifySubmit" class="btn btn-primary btn-sm">提交并继续</button>
+              <button id="btnClarifySkip" class="btn btn-outline btn-sm">跳过</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- Task Info Card -->
+        <section class="card">
+          <h2 class="card-title">📋 任务信息</h2>
+          <div class="field-row">
+            <input id="taskIdInput" type="text" class="input" placeholder="输入 task_id 加载已有任务" />
+            <button id="btnLoadTask" class="btn btn-outline btn-sm">加载</button>
+            <select id="taskListSelect" class="select" style="max-width:200px;display:none;" onchange="onTaskListSelect()">
+              <option value="">— 历史任务 —</option>
+            </select>
+            <button id="btnRefreshTasks" class="btn btn-outline btn-sm" title="刷新历史任务" style="display:none;">↻</button>
+          </div>
+          <div class="kv-row">
+            <span class="kv-label">当前任务</span>
+            <code id="taskId" class="kv-value">—</code>
+          </div>
+          <div class="progress-wrap" id="progressWrap" style="display:none">
+            <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+            <div id="progressMsg" class="progress-msg"></div>
+          </div>
+          <div class="kv-row">
+            <span class="kv-label">输出文件</span>
+          </div>
+          <ul id="downloadList" class="download-list"></ul>
+          <details class="mt">
+            <summary class="card-subtitle">📝 预览报告</summary>
+            <div class="tabs" id="previewTabs">
+              <button class="tab active" data-tab="outline">大纲</button>
+              <button class="tab" data-tab="content">正文</button>
+            </div>
+            <div id="previewBox" class="preview-box"></div>
+          </details>
+        </section>
+
+        <!-- KB Card -->
+        <section class="card">
+          <h2 class="card-title">📚 知识库</h2>
+          <div class="tabs" id="kbTabs">
+            <button class="tab active" data-tab="kb-query">智能问答</button>
+            <button class="tab" data-tab="kb-upload">文档入库</button>
+          </div>
+
+          <!-- KB Query Tab -->
+          <div class="tab-panel active" id="tab-kb-query">
+            <div class="field-row mt">
+              <select id="kbSelect" class="input input-sm"></select>
+              <button id="btnKbRefresh" class="btn btn-outline btn-sm">刷新</button>
+            </div>
+            <div class="field mt">
+              <label class="field-label">查询问题</label>
+              <div class="field-row">
+                <input id="kbQuestion" type="text" class="input" placeholder="输入问题，例如：报销流程是什么？" />
+                <input id="kbTopK" type="number" class="input input-sm" value="6" min="1" max="20" style="width:70px" />
+                <button id="btnKbQuery" class="btn btn-primary btn-sm">查询</button>
+              </div>
+            </div>
+            <div class="field mt">
+              <label class="field-label">过滤条件（可选 JSON）</label>
+              <input id="kbFilters" type="text" class="input" placeholder='{"doc_type":"制度"}' />
+            </div>
+            <div class="field mt">
+              <label class="field-label">回答</label>
+              <div id="kbAnswer" class="kb-answer"></div>
+            </div>
+            <details>
+              <summary class="card-subtitle">引用片段</summary>
+              <div id="kbCitations" class="kb-citations"></div>
+            </details>
+          </div>
+
+          <!-- KB Upload Tab -->
+          <div class="tab-panel" id="tab-kb-upload">
+            <div class="field-row mt">
+              <span class="field-label" style="margin:0 8px 0 0">KB 名称</span>
+              <input id="kbName" type="text" class="input" placeholder="default" />
+              <button id="btnKbUse" class="btn btn-outline btn-sm">确认</button>
+              <span id="kbCurrent" class="kv-value">default</span>
+            </div>
+            <div class="field mt">
+              <label class="field-label">入库文件</label>
+              <input type="file" id="kbFiles" class="file-in-sm" multiple />
+            </div>
+            <div class="field mt">
+              <label class="field-label">文档类型标签（可选）</label>
+              <input id="kbDocType" type="text" class="input" placeholder="制度 / 规范 / FAQ" />
+            </div>
+            <button id="btnKbUpload" class="btn btn-primary mt">上传入库</button>
+            <div id="kbStatus" class="status-text mt"></div>
+          </div>
+        </section>
+      </aside>
+
+      <!-- ── Right Panel ── -->
+      <main class="panel panel-right">
+
+        <!-- Chat Card -->
+        <section class="card card-chat">
+          <h2 class="card-title">💬 对话</h2>
+          <div id="chatLog" class="chat-log">
+            <div class="chat-empty">
+              <div class="chat-empty-icon">💡</div>
+              <div>上传材料开始生成报告，或直接提问。</div>
+              <div class="chat-hints">
+                <span>/help</span><span>/status</span><span>/pause</span><span>/resume</span><span>/cancel</span>
+              </div>
+            </div>
+          </div>
+          <div class="chat-bar">
+            <input id="chatInput" type="text" class="input" placeholder="输入消息，Enter 发送..." />
+            <button id="btnSend" class="btn btn-primary">发送</button>
+          </div>
+        </section>
+
+        <!-- A/B Eval Card -->
+        <section class="card" id="abCard" style="display:none">
+          <h2 class="card-title">🔬 A/B 评估结果</h2>
+          <div id="abBox" class="ab-box"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,8 @@
+logs/
+result/
+resource/
+__pycache__/
+*.pyc
+*.db
+.venv/
+.idea/
