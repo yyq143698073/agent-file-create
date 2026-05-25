@@ -188,6 +188,54 @@ def _run_task(task_id: str, file_paths: list[str], user_prompt: str, *, ab_eval:
             if cancel_ev.is_set():
                 task_manager.write_status(task_id, "canceled", stage="clarify", message="已取消", extra={"saved_templates": st_names})
                 return ""
+
+            q = (question or "").strip()
+
+            # Detect satisfaction interrupts by stage prefix
+            if q.startswith("[STAGE:satisfaction_outline]") or q.startswith("[STAGE:satisfaction_content]"):
+                is_outline = q.startswith("[STAGE:satisfaction_outline]")
+                stage_name = "outline" if is_outline else "content"
+                scope_default = "outline" if is_outline else "content_only"
+                label = "大纲" if is_outline else "报告正文"
+
+                # Extract preview text between the first and last "---" markers
+                preview_text = ""
+                try:
+                    idx1 = q.index("---")
+                    idx2 = q.rindex("---")
+                    if idx1 < idx2:
+                        preview_text = q[idx1 + 3:idx2].strip()
+                except ValueError:
+                    pass
+
+                # Extract version number from question (e.g. "当前版本：V2")
+                import re as _re
+                preview_version = 1
+                vm = _re.search(r"当前版本[：:]\s*V(\d+)", q)
+                if vm:
+                    try:
+                        preview_version = int(vm.group(1))
+                    except ValueError:
+                        pass
+
+                task_manager.write_status(
+                    task_id, "need_user", stage=f"satisfaction_{stage_name}",
+                    message=f"{label}生成完成，请审阅并选择是否满意。",
+                    extra={f"{stage_name}_satisfied": None, "satisfaction_feedback": "",
+                           "regeneration_scope": scope_default,
+                           "preview_text": preview_text,
+                           "preview_version": preview_version,
+                           "ab_eval": bool(ab_eval), "ab_results": ab_results[-20:],
+                           "saved_templates": st_names},
+                )
+                result = task_manager.wait_for_satisfaction(task_id, stage_name, timeout_s=1800)
+                if cancel_ev.is_set():
+                    import json as _json
+                    return _json.dumps({"satisfied": True, "feedback": "", "scope": scope_default})
+                import json as _json
+                return _json.dumps(result)
+
+            # Regular clarify interrupt
             qs = _split_questions(question)
             task_manager.write_status(
                 task_id, "need_user", stage="clarify",
@@ -212,7 +260,10 @@ def _run_task(task_id: str, file_paths: list[str], user_prompt: str, *, ab_eval:
         if cancel_ev.is_set():
             task_manager.write_status(task_id, "canceled", stage="done", message="已取消", extra={"saved_templates": st_names})
         else:
-            task_manager.write_status(task_id, "finished", stage="done", message="生成完成", extra={"result": {"output_dir": state.get("output_dir")}, "saved_templates": st_names})
+            extra: dict[str, Any] = {"result": {"output_dir": state.get("output_dir")}, "saved_templates": st_names}
+            if state.get("eval_report"):
+                extra["eval"] = state["eval_report"]
+            task_manager.write_status(task_id, "finished", stage="done", message="生成完成", extra=extra)
     except Exception as e:
         task_manager.write_status(task_id, "failed", stage="done", message="生成失败", extra={"error": str(e)[:400]})
 
@@ -255,7 +306,10 @@ def _run_document_only(task_id: str, *, user_prompt: str, file_paths: list[str],
         if cancel_ev.is_set():
             task_manager.write_status(task_id, "canceled", stage="done", message="已取消", extra={"saved_templates": st_names})
         else:
-            task_manager.write_status(task_id, "finished", stage="done", message="重新生成完成", extra={"result": {"output_dir": state.get("output_dir")}, "saved_templates": st_names})
+            extra: dict[str, Any] = {"result": {"output_dir": state.get("output_dir")}, "saved_templates": st_names}
+            if state.get("eval_report"):
+                extra["eval"] = state["eval_report"]
+            task_manager.write_status(task_id, "finished", stage="done", message="重新生成完成", extra=extra)
     except Exception as e:
         task_manager.write_status(task_id, "failed", stage="done", message="重新生成失败", extra={"error": str(e)[:400]})
 
@@ -672,6 +726,87 @@ async def api_clarify(request: Request):
     skip = bool(body.get("skip"))
     task_manager.write_status(task_id, "processing", stage="clarify", message="已收到补充信息，正在继续…", extra={"clarify_answers": answers, "clarify_skip": skip, "clarify_submitted_at": float(time.time())})
     return {"task_id": task_id, "ok": True}
+
+
+@app.post("/api/satisfaction")
+async def api_satisfaction(request: Request):
+    """Handle user satisfaction feedback for outline or content stage."""
+    task_manager = TaskManager()
+    body = await request.json()
+    task_id = task_manager.normalize_task_id(str(body.get("task_id") or ""))
+    if not task_id:
+        raise HTTPException(400, "task_id 不能为空")
+
+    stage = str(body.get("stage") or "").strip()  # "outline" | "content"
+    satisfied = bool(body.get("satisfied", True))
+    feedback = str(body.get("feedback") or "").strip()
+    scope = str(body.get("scope") or "outline").strip()  # "outline" | "content_only"
+
+    if stage not in {"outline", "content"}:
+        raise HTTPException(400, "stage 必须是 outline 或 content")
+
+    # Save satisfaction state in status for the polling thread to pick up
+    current_st = task_manager.read_status(task_id)
+    extra_update: dict[str, Any] = {
+        f"{stage}_satisfied": satisfied,
+        "satisfaction_feedback": feedback,
+        "regeneration_scope": scope,
+    }
+
+    if satisfied:
+        task_manager.write_status(
+            task_id, "processing",
+            stage=f"satisfaction_{stage}",
+            message=f"用户对{stage}表示满意，继续生成…",
+            extra={**current_st, **extra_update},
+        )
+    else:
+        task_manager.write_status(
+            task_id, "processing",
+            stage=f"satisfaction_{stage}",
+            message=f"用户对{stage}不满意，将重新生成（范围：{scope}）",
+            extra={**current_st, **extra_update},
+        )
+
+    return {"task_id": task_id, "ok": True, "satisfied": satisfied}
+
+
+@app.get("/api/versions")
+def api_versions(task_id: str = Query(""), type: str = Query("outline")):
+    """List versions of outline or content for a task."""
+    task_manager = TaskManager()
+    tid = task_manager.normalize_task_id(task_id)
+    if not tid:
+        raise HTTPException(400, "task_id 不能为空")
+    if type not in {"outline", "content"}:
+        raise HTTPException(400, "type 必须是 outline 或 content")
+    versions = task_manager.list_versions(tid, type)
+    return {"task_id": tid, "type": type, "versions": versions}
+
+
+@app.post("/api/versions/select")
+async def api_versions_select(request: Request):
+    """Select a specific version as the final version for outline or content."""
+    task_manager = TaskManager()
+    body = await request.json()
+    task_id = task_manager.normalize_task_id(str(body.get("task_id") or ""))
+    if not task_id:
+        raise HTTPException(400, "task_id 不能为空")
+    vtype = str(body.get("type") or "outline").strip()
+    if vtype not in {"outline", "content"}:
+        raise HTTPException(400, "type 必须是 outline 或 content")
+    try:
+        version_num = int(body.get("version") or 0)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "version 必须是整数")
+    if version_num <= 0:
+        raise HTTPException(400, "version 必须大于0")
+
+    ok = task_manager.select_version(task_id, vtype, version_num)
+    if not ok:
+        raise HTTPException(404, f"版本 V{version_num} 不存在")
+
+    return {"task_id": task_id, "type": vtype, "version": version_num, "ok": True}
 
 
 @app.post("/api/chat")

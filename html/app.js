@@ -6,7 +6,6 @@ const S = {
   taskId: "",
   pollTimer: null,
   history: [],
-  clarifyShown: false,
   kb: "default",
   lastAbText: "",
   previewTab: "outline",
@@ -14,6 +13,14 @@ const S = {
   generating: false,
   _outlineDone: false,
   _sending: false,
+  _evalData: null,
+  _evalTab: "combined",
+  _waitingFeedback: false,         // user clicked "不满意", next chat msg is feedback
+  _feedbackStage: "",              // "outline" | "content" — stage for feedback
+  _satisfactionKey: "",            // "outline_v2" — prevents duplicate satisfaction msgs
+  _versions: { outline: [], content: [] },
+  _selectedVersion: { outline: null, content: null },
+  _compareData: null,            // { oldText, newText, type }
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -51,20 +58,106 @@ function setTaskBadge(tid) {
   $("taskIdInput").value = tid || "";
 }
 
-/* ── Simple Markdown-ish rendering ──────────────────────────────────── */
+/* ── Markdown rendering ─────────────────────────────────────────────── */
 
 function renderMD(text) {
+  if (!text) return "";
   let h = esc(text);
-  // Bold: **text**
+
+  // ── Phase 1: Code blocks (fenced) ──
+  const codeBlocks = [];
+  h = h.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push({ lang: esc(lang || ""), code: code.replace(/\n$/, "") });
+    return `\x00CODEBLOCK_${idx}\x00`;
+  });
+
+  // ── Phase 2: Escape inline HTML in non-code content ──
+  // (already escaped via esc(), but we need to protect the placeholders)
+
+  // ── Phase 3: Block-level elements ──
+
+  // Headings (must come before paragraphs)
+  h = h.replace(/^#### (.+)$/gm, "<h4>$1</h4>");
+  h = h.replace(/^### (.+)$/gm, "<h3>$1</h3>");
+  h = h.replace(/^## (.+)$/gm, "<h2>$1</h2>");
+  h = h.replace(/^# (.+)$/gm, "<h1>$1</h1>");
+
+  // Horizontal rules
+  h = h.replace(/^(---|\*\*\*|___)\s*$/gm, "<hr>");
+
+  // Tables
+  h = h.replace(/((?:^\|.+?\|[ \t]*\n)+(?:^\|[-: |]+\|[ \t]*\n)(?:^\|.+?\|[ \t]*\n)+)/gm, (match) => {
+    const lines = match.trim().split("\n");
+    if (lines.length < 2) return match;
+    // Skip separator line (|---|---|)
+    const headerLine = lines[0];
+    const bodyLines = lines.slice(2);
+    const buildRow = (line, tag) => {
+      const cells = line.replace(/^\||\|$/g, "").split("|").map(c => `<${tag}>${c.trim()}</${tag}>`);
+      return `<tr>${cells.join("")}</tr>`;
+    };
+    let tbl = "<table><thead>" + buildRow(headerLine, "th") + "</thead><tbody>";
+    for (const bl of bodyLines) {
+      if (bl.trim()) tbl += buildRow(bl, "td");
+    }
+    tbl += "</tbody></table>";
+    return tbl;
+  });
+
+  // Blockquotes
+  h = h.replace(/^(> .+(?:\n> .+)*)/gm, (m) => {
+    const content = m.replace(/^> /gm, "");
+    return "<blockquote>" + content + "</blockquote>";
+  });
+
+  // Unordered lists (multi-line)
+  h = h.replace(/((?:^[-*] .+(?:\n|$))+)/gm, (m) => {
+    const items = m.trim().split("\n").filter(l => /^[-*] /.test(l)).map(l => "<li>" + l.replace(/^[-*] /, "") + "</li>");
+    return "<ul>" + items.join("") + "</ul>";
+  });
+
+  // Ordered lists (multi-line)
+  h = h.replace(/((?:^\d+\. .+(?:\n|$))+)/gm, (m) => {
+    const items = m.trim().split("\n").filter(l => /^\d+\. /.test(l)).map(l => "<li>" + l.replace(/^\d+\. /, "") + "</li>");
+    return "<ol>" + items.join("") + "</ol>";
+  });
+
+  // Paragraphs: consecutive non-empty, non-tag lines
+  h = h.replace(/(\n\n+)/g, "\n\n");
+  const blocks = h.split(/\n\n+/);
+  h = blocks.map(b => {
+    const trimmed = b.trim();
+    if (!trimmed) return "";
+    // If already wrapped in a block tag, leave as is
+    if (/^<(h[1-4]|table|ul|ol|blockquote|hr|pre|div)/.test(trimmed)) return trimmed;
+    // Wrap in paragraph
+    return "<p>" + trimmed.replace(/\n/g, "<br>") + "</p>";
+  }).join("\n");
+
+  // ── Phase 4: Inline elements ──
+  // Bold and italic
+  h = h.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
   h = h.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  // Inline code: `text`
+  h = h.replace(/\*(.+?)\*/g, "<em>$1</em>");
+
+  // Inline code (single backtick)
   h = h.replace(/`([^`]+)`/g, "<code>$1</code>");
-  // Unordered lists: lines starting with - or *
-  h = h.replace(/(^|\n)[-*] (.+?)(?=\n|$)/g, (m, nl, item) => nl + "<li>" + item + "</li>");
-  // Wrap consecutive <li> in <ul>
-  h = h.replace(/((?:<li>.*?<\/li>\n?)+)/g, "<ul>$1</ul>");
-  // Line breaks
-  h = h.replace(/\n/g, "<br>");
+
+  // Links [text](url)
+  h = h.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  // Images ![alt](url)
+  h = h.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%">');
+
+  // ── Phase 5: Restore code blocks ──
+  h = h.replace(/\x00CODEBLOCK_(\d+)\x00/g, (_, idx) => {
+    const cb = codeBlocks[parseInt(idx, 10)];
+    if (!cb) return "";
+    const langAttr = cb.lang ? ` data-lang="${cb.lang}"` : "";
+    return `<pre${langAttr}><code>${cb.code}</code></pre>`;
+  });
+
   return h;
 }
 
@@ -189,7 +282,8 @@ async function uploadAndGenerate() {
   S.lastAbText = "";
   $("abBox").textContent = "";
   $("abCard").style.display = "none";
-  hideClarify();
+  $("evalCard").style.display = "none";
+  S._evalData = null;
   S._outlineDone = false;
 
   try {
@@ -239,6 +333,8 @@ async function appendToTask() {
   $("btnAppend").disabled = true;
   setStatus("追加中…", "busy");
   S._outlineDone = false;
+  $("evalCard").style.display = "none";
+  S._evalData = null;
   try {
     const data = await apiPost("/api/append", fd);
     setTaskBadge(data.task_id || tid);
@@ -301,11 +397,20 @@ async function pollStatus() {
     }
 
     if (st === "need_user") {
-      setStatus(msg || "需要补充信息", "busy");
-      showClarify(data.clarify_questions || [], data.clarify_answers || "");
+      if (stage === "satisfaction_outline" || stage === "satisfaction_content") {
+        setStatus(msg || "请审阅并反馈", "busy");
+        const previewText = data.preview_text || "";
+        const previewVersion = data.preview_version || 1;
+        showSatisfactionInChat(stage === "satisfaction_outline" ? "outline" : "content", previewText, previewVersion);
+      } else {
+        setStatus(msg || "需要补充信息", "busy");
+        showClarifyInChat(data.clarify_questions || []);
+      }
     } else if (st === "processing") {
       setStatus(`生成中 (${stage || "处理中"})`, "busy");
-      hideClarify();
+      hideSatisfaction();
+      S._satisfactionKey = "";
+      _clarifyMsgShown = false;
       // Load partial content preview during document generation
       if (stage === "document") {
         const content = await fetchText(`/result/${encodeURIComponent(S.taskId)}/content.md`);
@@ -316,10 +421,14 @@ async function pollStatus() {
       }
     } else if (st === "queued") {
       setStatus("排队等待…", "busy");
-      hideClarify();
+      hideSatisfaction();
+      S._satisfactionKey = "";
+      _clarifyMsgShown = false;
     } else if (st === "finished") {
       setStatus("完成", "ok");
-      hideClarify();
+      hideSatisfaction();
+      S._satisfactionKey = "";
+      _clarifyMsgShown = false;
       stopPolling();
       // Load preview
       const outline = await fetchText(`/result/${encodeURIComponent(S.taskId)}/outline.md`);
@@ -327,13 +436,27 @@ async function pollStatus() {
       S._outline = outline;
       S._content = content;
       showPreview();
+      // Load versions
+      await loadVersions("outline");
+      await loadVersions("content");
+      // Show version bar and compare tab if multiple versions exist
+      const ov = S._versions.outline || [];
+      const cv = S._versions.content || [];
+      if (ov.length > 1) { showVersionTags("outline"); $("tabCompare").style.display = ""; }
+      if (cv.length > 1) { showVersionTags("content"); $("tabCompare").style.display = ""; }
+      // Eval results
+      if (data.eval && typeof data.eval === "object") {
+        S._evalData = data.eval;
+        renderEval();
+      }
       S.generating = false;
       $("btnUpload").disabled = false;
       $("btnAppend").disabled = false;
       loadTaskList();
     } else if (st === "failed") {
       setStatus("失败", "err");
-      hideClarify();
+      hideSatisfaction();
+      S._satisfactionKey = "";
       stopPolling();
       toast("生成失败: " + (data.error || msg || "未知"), "err");
       S.generating = false;
@@ -342,7 +465,8 @@ async function pollStatus() {
       loadTaskList();
     } else if (st === "canceled" || st === "cancelled") {
       setStatus("已取消", "ok");
-      hideClarify();
+      hideSatisfaction();
+      S._satisfactionKey = "";
       stopPolling();
       S.generating = false;
       $("btnUpload").disabled = false;
@@ -381,8 +505,117 @@ async function fetchText(url) {
 
 function showPreview() {
   const tab = S.previewTab;
-  const raw = tab === "outline" ? (S._outline || "（无）") : (S._content || "（无）");
-  $("previewBox").innerHTML = tab === "outline" ? renderMD(raw) : renderMD(raw);
+  const raw = tab === "outline" ? (S._outline || "（大纲尚未生成）") : (S._content || "（正文尚未生成）");
+  $("previewBox").innerHTML = renderMD(raw);
+  // Show/hide full-screen button when content exists
+  const btn = $("btnFullPreview");
+  if (btn) btn.style.display = (S._content && S._content.trim()) ? "" : "none";
+}
+
+function openFullPreview() {
+  if (!S._content || !S._content.trim()) return;
+  const win = window.open("", "_blank");
+  win.document.write(`<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>报告正文 — ${esc(S.taskId)}</title>
+<style>
+  body { max-width:900px; margin:40px auto; padding:20px; font-family:system-ui,-apple-system,sans-serif; line-height:1.8; color:#1a1a1a; }
+  h1 { font-size:1.8em; border-bottom:2px solid #e0e0e0; padding-bottom:12px; }
+  h2 { font-size:1.4em; margin-top:32px; border-bottom:1px solid #eee; padding-bottom:8px; }
+  h3 { font-size:1.15em; margin-top:24px; }
+  h4 { font-size:1.05em; margin-top:20px; }
+  table { border-collapse:collapse; width:100%; margin:16px 0; }
+  th,td { border:1px solid #ddd; padding:10px 14px; text-align:left; }
+  th { background:#f5f5f5; font-weight:600; }
+  pre { background:#f8f8f8; border:1px solid #e0e0e0; border-radius:6px; padding:14px 18px; overflow-x:auto; font-size:0.9em; line-height:1.5; }
+  code { background:#f0f0f0; padding:2px 6px; border-radius:3px; font-size:0.9em; }
+  pre code { background:none; padding:0; }
+  blockquote { border-left:4px solid #ccc; padding-left:16px; color:#666; margin:16px 0; }
+  hr { border:none; border-top:1px solid #e0e0e0; margin:24px 0; }
+  ul,ol { padding-left:24px; }
+  a { color:#2563eb; }
+  img { max-width:100%; }
+</style></head><body>${renderMD(S._content)}</body></html>`);
+  win.document.close();
+}
+
+/* ── Eval rendering ─────────────────────────────────────────────────── */
+
+function colorClass(v) {
+  if (v >= 0.7) return "high";
+  if (v >= 0.4) return "mid";
+  return "low";
+}
+
+function avgBadgeColor(avg) {
+  if (avg >= 0.7) return "var(--c-green)";
+  if (avg >= 0.4) return "var(--c-amber)";
+  return "var(--c-red)";
+}
+
+function renderScoreBar(label, score) {
+  const pct = Math.round(score * 100);
+  return `<div class="eval-dim">
+    <span class="eval-label">${esc(label)}</span>
+    <div class="eval-bar-wrap"><div class="eval-bar-fill ${colorClass(score)}" style="width:${pct}%"></div></div>
+    <span class="eval-score">${pct}</span>
+  </div>`;
+}
+
+function renderEvalPanel(scores) {
+  if (!scores) return '<div class="eval-empty">暂无数据</div>';
+  const dims = [
+    ["相关性", scores.relevance || 0],
+    ["忠实度", scores.faithfulness || 0],
+    ["连贯性", scores.coherence || 0],
+    ["完整性", scores.completeness || 0],
+  ];
+  const avg = (dims.reduce((s, d) => s + d[1], 0) / 4);
+  let html = dims.map(d => renderScoreBar(d[0], d[1])).join("");
+  html += `<div class="eval-avg">
+    <span>综合均分</span>
+    <span class="eval-avg-badge" style="background:${avgBadgeColor(avg)}">${(avg * 100).toFixed(0)}</span>
+  </div>`;
+  return html;
+}
+
+function renderEval() {
+  const data = S._evalData;
+  if (!data) {
+    $("evalCard").style.display = "none";
+    return;
+  }
+  $("evalCard").style.display = "";
+  const tab = S._evalTab;
+  const content = $("evalContent");
+  const tabs = document.querySelectorAll("#evalTabs .eval-tab");
+  tabs.forEach(t => t.classList.toggle("active", t.dataset.eval === tab));
+
+  let html = "";
+  if (tab === "combined") {
+    html = renderEvalPanel(data.combined || data.decomposed);
+    if (data.warnings && data.warnings.length) {
+      html += `<div class="eval-warnings">⚠ ${data.warnings.map(esc).join("<br>")}</div>`;
+    }
+  } else if (tab === "decomposed") {
+    html = renderEvalPanel(data.decomposed);
+    if (data.decomposed_details) {
+      const dd = data.decomposed_details;
+      if (dd.faithfulness_warnings && dd.faithfulness_warnings.length) {
+        html += `<div class="eval-warnings">⚠ ${dd.faithfulness_warnings.map(esc).join("<br>")}</div>`;
+      }
+    }
+  } else if (tab === "llm") {
+    html = renderEvalPanel(data.llm_judge);
+  } else if (tab === "reasoning") {
+    const reasoning = data.llm_reasoning || "";
+    html = reasoning
+      ? `<div class="eval-reasoning">${esc(reasoning)}</div>`
+      : '<div class="eval-empty">LLM 评判未启用或暂无评语</div>';
+  }
+  content.innerHTML = html || '<div class="eval-empty">暂无数据</div>';
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -405,42 +638,301 @@ function setDownloads(data) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   Clarify
+   Chat action messages (clarify & satisfaction)
    ═══════════════════════════════════════════════════════════════════════ */
 
-function showClarify(questions, answers) {
-  const wrap = $("clarifyWrap");
-  const qBox = $("clarifyQuestions");
-  qBox.innerHTML = "";
-  for (const q of (questions.length ? questions : ["请补充你希望生成文档的侧重点/受众/篇幅/风格等信息。"])) {
-    const d = document.createElement("div");
-    d.className = "qitem";
-    d.textContent = q;
-    qBox.appendChild(d);
+function addActionMsg(html, buttons) {
+  const log = $("chatLog");
+  const empty = log.querySelector(".chat-empty");
+  if (empty) empty.remove();
+
+  const wrap = document.createElement("div");
+  wrap.className = "msg assistant";
+
+  const r = document.createElement("div");
+  r.className = "role";
+  r.textContent = "助手";
+
+  const b = document.createElement("div");
+  b.className = "bubble";
+  b.innerHTML = html;
+
+  if (buttons && buttons.length) {
+    const btnRow = document.createElement("div");
+    btnRow.style.cssText = "margin-top:10px;display:flex;gap:8px;flex-wrap:wrap";
+    for (const btn of buttons) {
+      const el = document.createElement("button");
+      el.className = btn.cls || "btn btn-sm";
+      el.textContent = btn.text;
+      el.addEventListener("click", btn.onClick);
+      btnRow.appendChild(el);
+    }
+    b.appendChild(btnRow);
   }
-  if (!S.clarifyShown) $("clarifyAnswers").value = answers || "";
-  wrap.style.display = "";
-  S.clarifyShown = true;
+
+  wrap.appendChild(r);
+  wrap.appendChild(b);
+  log.appendChild(wrap);
+  log.scrollTop = log.scrollHeight;
+  return wrap;
 }
 
-function hideClarify() {
-  $("clarifyWrap").style.display = "none";
-  S.clarifyShown = false;
+/* ── Clarify in chat ──────────────────────────────────────────────────── */
+
+let _clarifyMsgShown = false;
+
+function showClarifyInChat(questions) {
+  if (_clarifyMsgShown) return;
+  _clarifyMsgShown = true;
+  const qs = questions.length ? questions : ["请补充你希望生成文档的侧重点/受众/篇幅/风格等信息。"];
+  const items = qs.map((q, i) => `${i + 1}. ${esc(q)}`).join("<br>");
+  addActionMsg(
+    `<p>📋 <strong>需要补充信息</strong></p><div style="font-size:13px;line-height:1.7;margin:8px 0">${items}</div><p style="font-size:11px;color:var(--c-text3)">请在聊天框输入回答后发送，或发送 <code>跳过</code></p>`
+  );
 }
 
-async function submitClarify(skip) {
-  if (!S.taskId) return;
-  const answers = $("clarifyAnswers").value.trim();
-  $("btnClarifySubmit").disabled = $("btnClarifySkip").disabled = true;
+function resetClarifyMsg() { _clarifyMsgShown = false; }
+
+/* ── Satisfaction in chat ─────────────────────────────────────────────── */
+
+let _satisfactionChatMsg = null;  // track the satisfaction message element
+
+function showSatisfactionInChat(stage, previewText, versionNum) {
+  const key = stage + "_v" + (versionNum || 1);
+  if (S._satisfactionKey === key) return;
+  S._satisfactionKey = key;
+  S._feedbackStage = stage;
+  S._waitingFeedback = false;
+
+  const label = stage === "outline" ? "大纲" : "报告正文";
+  const ver = versionNum || 1;
+
+  // Show preview in right panel
+  const previewCard = $("satisfactionPreviewCard");
+  const previewTitle = $("satisfactionPreviewTitle");
+  const previewContent = $("satisfactionPreviewContent");
+  previewTitle.textContent = `📝 ${label}已生成 — V${ver}`;
+  const text = previewText || (stage === "outline" ? (S._outline || "") : (S._content || ""));
+  previewContent.innerHTML = text ? renderMD(text) : "<p style='color:var(--c-text3)'>（内容加载中…）</p>";
+  previewCard.style.display = "";
+
+  // Add chat message with action buttons
+  _satisfactionChatMsg = addActionMsg(
+    `<p>📝 <strong>${label}已生成 — V${ver}</strong></p><p>请查看下方预览区的内容，然后选择：</p>`,
+    [
+      {
+        text: "满意，继续", cls: "btn btn-primary btn-sm",
+        onClick: function () {
+          const row = this.parentElement;
+          row.querySelectorAll("button").forEach(b => b.disabled = true);
+          $("satisfactionPreviewCard").style.display = "none";
+          submitSatisfactionChat(true, stage, "");
+        }
+      },
+      {
+        text: "不满意，重新生成", cls: "btn btn-outline btn-sm",
+        onClick: function () {
+          const row = this.parentElement;
+          row.querySelectorAll("button").forEach(b => b.disabled = true);
+          $("satisfactionPreviewCard").style.display = "none";
+          S._waitingFeedback = true;
+          S._feedbackStage = stage;
+          addActionMsg(
+            `<p>请描述<strong>为什么不满意</strong>以及<strong>新的要求</strong>。</p><p style="font-size:11px;color:var(--c-text3)">在聊天框输入反馈内容后发送。` +
+            (stage === "content" ? "<br>如需从大纲重来，请说明" : "") +
+            `</p>`
+          );
+        }
+      },
+    ]
+  );
+}
+
+function hideSatisfaction() {
+  $("satisfactionPreviewCard").style.display = "none";
+  S._feedbackStage = "";
+  S._waitingFeedback = false;
+  _satisfactionChatMsg = null;
+  // NOTE: _satisfactionKey is NOT cleared here — it persists so that
+  // pollStatus won't re-trigger showSatisfactionInChat for the same version.
+}
+
+async function submitSatisfactionChat(satisfied, stage, feedback) {
+  const fb = (feedback || "").trim();
+  let scope = stage === "outline" ? "outline" : "content_only";
+  // Detect scope from feedback keywords
+  if (!satisfied && fb && stage === "content") {
+    if (/从大纲|全部重|重新开始|重头/.test(fb)) scope = "outline";
+  }
+
+  // Save version before regenerating
+  if (!satisfied && fb) {
+    if (stage === "outline" && S._outline) {
+      S._versions.outline = S._versions.outline || [];
+      S._versions.outline.push({ version: (S._versions.outline.length + 1), content: S._outline, feedback: fb, ts: Date.now() / 1000 });
+    } else if (stage === "content" && S._content) {
+      S._versions.content = S._versions.content || [];
+      S._versions.content.push({ version: (S._versions.content.length + 1), content: S._content, feedback: fb, ts: Date.now() / 1000 });
+    }
+  }
+
+  // Show confirmation in chat
+  if (satisfied) {
+    addMsg("assistant", "✅ 已收到：满意，继续生成…");
+  } else {
+    addMsg("assistant", `✅ 已收到反馈：${fb || "重新生成"}\n\n🔄 正在重新生成…`);
+  }
+
+  hideSatisfaction();
+
   try {
-    await apiPost("/api/clarify", { task_id: S.taskId, answers, skip: !!skip });
-    hideClarify();
-    setStatus("已提交，继续生成…", "busy");
-    await pollStatus();
+    await apiPost("/api/satisfaction", {
+      task_id: S.taskId,
+      stage: stage,
+      satisfied: satisfied,
+      feedback: fb,
+      scope: scope,
+    });
+    if (satisfied) {
+      setStatus("满意，继续生成…", "busy");
+    } else {
+      setStatus("已提交反馈，重新生成中…", "busy");
+      S._outlineDone = false;
+      $("previewBox").textContent = "";
+      S._compareData = null;
+      startPolling();
+    }
+    // Don't call pollStatus() here — the 2s interval will pick up changes.
+    // Calling it immediately would race with the backend status update and
+    // could re-trigger showSatisfactionInChat for the same version.
   } catch (e) {
     toast("提交失败: " + e.message, "err");
-  } finally {
-    $("btnClarifySubmit").disabled = $("btnClarifySkip").disabled = false;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Version management
+   ═══════════════════════════════════════════════════════════════════════ */
+
+async function loadVersions(type) {
+  if (!S.taskId) return [];
+  try {
+    const data = await apiGet(`/api/versions?task_id=${encodeURIComponent(S.taskId)}&type=${type}`);
+    const versions = Array.isArray(data.versions) ? data.versions : [];
+    S._versions[type] = versions;
+    showVersionTags(type);
+    return versions;
+  } catch {
+    return [];
+  }
+}
+
+function showVersionTags(type) {
+  const bar = $("versionBar");
+  const tags = $("versionTags");
+  const versions = S._versions[type] || [];
+
+  if (versions.length <= 1) {
+    bar.style.display = "none";
+    return;
+  }
+
+  bar.style.display = "flex";
+  tags.innerHTML = "";
+  for (const v of versions) {
+    const vn = v.version || 1;
+    const tag = document.createElement("span");
+    tag.className = "version-tag";
+    if (v.selected) tag.classList.add("selected");
+    if (S._selectedVersion[type] === vn) tag.classList.add("active");
+    tag.textContent = `V${vn}`;
+    tag.title = v.feedback ? `反馈: ${v.feedback}` : `版本 ${vn}`;
+    tag.onclick = () => switchVersion(type, vn);
+    tags.appendChild(tag);
+  }
+}
+
+function switchVersion(type, versionNum) {
+  const versions = S._versions[type] || [];
+  const found = versions.find(v => v.version === versionNum);
+  if (!found || !found.content) return;
+
+  S._selectedVersion[type] = versionNum;
+  showVersionTags(type);
+
+  if (type === "outline") {
+    S._outline = found.content;
+  } else {
+    S._content = found.content;
+  }
+
+  if (S.previewTab === type || (type === "outline" && S.previewTab === "compare")) {
+    showPreview();
+  }
+}
+
+function showCompare() {
+  const tab = $("tabCompare");
+  tab.style.display = "";
+
+  // Determine what to compare
+  const versions = S._versions[S.previewTab === "outline" ? "outline" : "content"] || [];
+  if (versions.length < 2) {
+    toast("至少需要 2 个版本才能对比", "info", 3000);
+    return;
+  }
+
+  // Get the last two versions
+  const sorted = [...versions].sort((a, b) => (b.version || 0) - (a.version || 0));
+  const newVer = sorted[0];
+  const oldVer = sorted[1];
+
+  $("compareOld").innerHTML = renderMD(oldVer.content || "（无内容）");
+  $("compareNew").innerHTML = renderMD(newVer.content || "（无内容）");
+
+  // Set select buttons
+  $("btnSelectOld").onclick = () => selectVersion(S.previewTab === "outline" ? "outline" : "content", oldVer.version);
+  $("btnSelectNew").onclick = () => selectVersion(S.previewTab === "outline" ? "outline" : "content", newVer.version);
+
+  // Show compare view
+  $("compareBox").style.display = "grid";
+  $("previewBox").style.display = "none";
+}
+
+async function selectVersion(type, versionNum) {
+  if (!S.taskId) return;
+  try {
+    await apiPost("/api/versions/select", {
+      task_id: S.taskId,
+      type: type,
+      version: versionNum,
+    });
+    S._selectedVersion[type] = versionNum;
+    // Update versions metadata
+    const versions = S._versions[type] || [];
+    for (const v of versions) {
+      v.selected = (v.version === versionNum);
+    }
+    showVersionTags(type);
+    toast(`已选择 V${versionNum} 作为最终版本`, "ok", 3000);
+
+    // Reload preview
+    if (type === "outline") {
+      const found = versions.find(v => v.version === versionNum);
+      if (found && found.content) {
+        S._outline = found.content;
+      }
+    } else {
+      const found = versions.find(v => v.version === versionNum);
+      if (found && found.content) {
+        S._content = found.content;
+      }
+    }
+    showPreview();
+    $("compareBox").style.display = "none";
+    $("previewBox").style.display = "";
+  } catch (e) {
+    toast("选择版本失败: " + e.message, "err");
   }
 }
 
@@ -547,6 +1039,18 @@ async function sendChat() {
   S._sending = true;
   $("chatInput").value = "";
   addMsg("user", msg);
+
+  // If waiting for satisfaction feedback, route to satisfaction
+  if (S._waitingFeedback) {
+    S._waitingFeedback = false;
+    $("btnSend").disabled = true;
+    setStatus("提交反馈中…", "busy");
+    await submitSatisfactionChat(false, S._feedbackStage, msg);
+    S._sending = false;
+    $("btnSend").disabled = false;
+    return;
+  }
+
   S.history.push({ role: "user", content: msg });
   setStatus("思考中…", "busy");
   $("btnSend").disabled = true;
@@ -636,6 +1140,8 @@ async function loadTaskById() {
   setDownloads({ files: [] });
   setStatus("加载中…", "busy");
   stopPolling();
+  $("evalCard").style.display = "none";
+  S._evalData = null;
 
   try {
     const hr = await fetch(`/api/chat/history?task_id=${encodeURIComponent(tid)}`);
@@ -884,13 +1390,17 @@ function init() {
   setupTabs("previewTabs");
   setupTabs("kbTabs");
 
+  // Eval tabs
+  $("evalTabs").addEventListener("click", (e) => {
+    const tab = e.target.closest(".eval-tab");
+    if (!tab) return;
+    S._evalTab = tab.dataset.eval;
+    renderEval();
+  });
+
   // Upload
   $("btnUpload").addEventListener("click", uploadAndGenerate);
   $("btnAppend").addEventListener("click", appendToTask);
-
-  // Clarify
-  $("btnClarifySubmit").addEventListener("click", () => submitClarify(false));
-  $("btnClarifySkip").addEventListener("click", () => submitClarify(true));
 
   // Chat
   $("btnSend").addEventListener("click", sendChat);
@@ -904,9 +1414,25 @@ function init() {
   $("previewTabs").addEventListener("click", (e) => {
     const tab = e.target.closest(".tab");
     if (!tab) return;
-    S.previewTab = tab.dataset.tab;
+    const tabName = tab.dataset.tab;
+    if (tabName === "compare") {
+      S.previewTab = S.previewTab; // keep current tab for compare context
+      showCompare();
+      return;
+    }
+    S.previewTab = tabName;
+    $("compareBox").style.display = "none";
+    $("previewBox").style.display = "";
     showPreview();
+    // Update version tags for this tab
+    const versions = S._versions[tabName] || [];
+    if (versions.length > 1) {
+      $("tabCompare").style.display = "";
+    }
+    showVersionTags(tabName);
   });
+  // Full-screen preview button
+  $("btnFullPreview").addEventListener("click", openFullPreview);
 
   // KB
   $("btnKbRefresh").addEventListener("click", loadKbList);

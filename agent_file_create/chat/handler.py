@@ -6,11 +6,17 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
 from agent_file_create.chat.history import TaskChatMessageHistory
-from agent_file_create.chat.prompts import lobby_prompt, task_chat_prompt
+from agent_file_create.chat.prompts import (
+    CHECK_RELEVANCE_PROMPT,
+    FOLLOWUPS_PROMPT,
+    REWRITE_QUERY_PROMPT,
+    SUMMARIZE_HISTORY_PROMPT,
+    lobby_prompt,
+    task_chat_prompt,
+)
 from agent_file_create.config import (
     CONTENT_API_ENDPOINT,
     CONTENT_API_KEY,
@@ -25,24 +31,6 @@ from agent_file_create.task.manager import TaskManager
 logger = logging.getLogger(__name__)
 
 _KB = KnowledgeBase()
-
-# Lightweight prompts for summarization and query rewriting (module-level so
-# they are only created once, not on every invocation).
-_summarize_prompt = ChatPromptTemplate.from_messages([("human", "{text}")])
-_rewrite_prompt = ChatPromptTemplate.from_messages([("human", "{text}")])
-
-_followups_prompt = ChatPromptTemplate.from_messages([
-    ("human", """\
-基于对话上下文，为用户推荐 2-3 个值得继续追问的问题。每个问题一行，以 "- " 开头。问题要具体、可执行，不超过 50 字。不要重复用户已经问过的内容。
-
-用户问题：{question}
-
-你的回复要点：{reply_summary}
-
-报告主题：{report_topics}
-
-追问推荐："""),
-])
 
 
 class ChatHandler:
@@ -525,16 +513,13 @@ class ChatHandler:
         if not qtext:
             qtext = "（未提供具体问题）"
         try:
-            prompt = (
-                "判断用户回复是否合理回答了澄清问题。\n\n"
-                f"澄清问题：\n{qtext}\n\n"
-                f"用户回复：{m}\n\n"
-                "如果用户回复明显不相关（如闲聊、天气、完全无关的话题），回复 NO。\n"
-                "如果是对问题的合理回答（包括「跳过」「不用了」），回复 YES。\n"
-                "只回复 YES 或 NO。"
-            )
-            chain = _summarize_prompt | self._shared_llm | StrOutputParser()
-            result = (chain.invoke({"text": prompt}) or "").strip().upper()
+            chain = CHECK_RELEVANCE_PROMPT | self._shared_llm | StrOutputParser()
+            result = (
+                chain.invoke({
+                    "clarify_question": qtext,
+                    "user_reply": m,
+                }) or ""
+            ).strip().upper()
             if result and "NO" in result and "YES" not in result:
                 return False, (
                     f"你的回复似乎与当前问题不太相关。请针对以下问题提供补充信息：\n{qtext}\n\n"
@@ -575,7 +560,7 @@ class ChatHandler:
         reply_summary = r[:500]
 
         try:
-            chain = _followups_prompt | self._shared_llm | StrOutputParser()
+            chain = FOLLOWUPS_PROMPT | self._shared_llm | StrOutputParser()
             raw = (chain.invoke({
                 "question": q,
                 "reply_summary": reply_summary,
@@ -637,17 +622,11 @@ class ChatHandler:
         if not transcript.strip():
             return
 
-        prompt = (
-            "将以下对话历史压缩为一段不超过150字的摘要。必须保留：\n"
-            "1) 用户首次提出的实质性提问（即第一个非问候、非闲聊的问题）；\n"
-            "2) 双方达成的关键决策与偏好；\n"
-            "3) 用户明确表示满意/不满意的内容。\n"
-            "禁止编造未发生的对话。如果无法确定某项信息，就不要写入摘要。\n\n"
-            + transcript
-        )
         try:
-            chain = _summarize_prompt | self._shared_llm | StrOutputParser()
-            new_summary = (chain.invoke({"text": prompt}) or "").strip()
+            chain = SUMMARIZE_HISTORY_PROMPT | self._shared_llm | StrOutputParser()
+            new_summary = (
+                chain.invoke({"transcript": transcript}) or ""
+            ).strip()
         except Exception:
             return
 
@@ -671,14 +650,11 @@ class ChatHandler:
         if len(q) < 10 or len(q) > 80:
             return q
 
-        prompt = (
-            "将用户问题改写为一个适合知识库检索的查询短语，补充可能相关的关键词和同义词。"
-            "只输出改写后的查询，不要解释。\n\n"
-            f"用户问题：{q}\n\n查询："
-        )
         try:
-            chain = _rewrite_prompt | self._shared_llm | StrOutputParser()
-            rewritten = (chain.invoke({"text": prompt}) or "").strip()
+            chain = REWRITE_QUERY_PROMPT | self._shared_llm | StrOutputParser()
+            rewritten = (
+                chain.invoke({"question": q}) or ""
+            ).strip()
             return rewritten[:200] if rewritten else q
         except Exception:
             return q
@@ -696,6 +672,22 @@ class ChatHandler:
             "是否", "应该", "如果", "假设", "评估", "判断",
         ]
         return any(m in q for m in complex_markers)
+
+    @staticmethod
+    def _should_use_hyde(message: str) -> bool:
+        """Only trigger HyDE when the question has clear reasoning / analysis intent.
+        HyDE costs an extra LLM call to generate a hypothetical answer, so we avoid
+        it for simple factual / short queries even when CoT is used."""
+        q = (message or "").strip()
+        if len(q) < 15:
+            return False
+        hyde_markers = [
+            "为什么", "原因", "影响", "关系",
+            "对比", "区别", "比较", "优劣", "优缺点", "分析",
+            "vs", "VS", " versus ", "是否", "应该", "如果",
+            "假设", "评估", "判断", "趋势", "归纳", "总结", "概括",
+        ]
+        return any(m in q for m in hyde_markers)
 
     # ── Modification intent keywords ──────────────────────────────────────
 
@@ -778,8 +770,8 @@ class ChatHandler:
             if active_kb:
                 try:
                     msg = str(message or "")
-                    # For complex questions, expand via HyDE before retrieval
-                    if self._is_complex_question(msg):
+                    # For reasoning questions, expand via HyDE before retrieval
+                    if self._should_use_hyde(msg):
                         search_query = _KB._hyde_expand(msg)
                     else:
                         search_query = self._rewrite_query(msg)

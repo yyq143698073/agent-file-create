@@ -244,6 +244,7 @@ def _build_section_prompt(
     level: int,
     target_range: tuple[int, int],
     next_title: str = "",
+    feedback: str = "",
 ) -> str:
     lo, hi = target_range
     parts = [
@@ -278,6 +279,15 @@ def _build_section_prompt(
         "用户需求：",
         (user_prompt or "").strip() or "生成报告正文",
         "",
+    ]
+    if feedback:
+        parts += [
+            "⚠️ 上一版报告的调整要求（来自用户反馈）：",
+            feedback,
+            "请特别注意上述反馈，在写作时针对性修正问题。",
+            "",
+        ]
+    parts += [
         f"写作要求：本节建议 {lo}~{hi} 字。",
         "只输出本节正文，不要输出标题行。不要输出「本节」「本章」等元描述文字。",
         "",
@@ -332,14 +342,15 @@ def generate_section_content(
     next_title: str = "",
     *,
     task_id: str = "",
+    feedback: str = "",
 ) -> str:
     multimodal_digest = _multimodal_summary(multimodal_results)
     if level == 2:
-        target_range = (200, 300)
-        num_predict = 720
+        target_range = (120, 180)
+        num_predict = 500
     else:
-        target_range = (300, 500)
-        num_predict = 900
+        target_range = (180, 280)
+        num_predict = 600
 
     prompt = _build_section_prompt(
         section_title=section_title,
@@ -350,9 +361,10 @@ def generate_section_content(
         level=level,
         target_range=target_range,
         next_title=next_title,
+        feedback=feedback,
     )
 
-    for attempt in range(3):
+    for attempt in range(2):
         _check_cancel(task_id)
         t0 = time.perf_counter()
         text = _call_qwen_text(prompt, timeout_s=MODEL_TIMEOUT, num_predict=num_predict)
@@ -368,10 +380,13 @@ def generate_section_content(
 
 
 def _llm_summarize_for_next(section_title: str, content: str) -> str:
-    """Generate a coherence summary using the LLM, capturing key claims and logical role."""
+    """Generate a rolling summary for cross-section coherence."""
     s = re.sub(r"\s+", " ", (content or "").strip())
     if len(s) < 120:
         return s
+    # Use LLM only for long h2 sections (>600 chars); text truncation for others
+    if len(s) <= 600:
+        return s[:200] + ("…" if len(s) > 200 else "")
     try:
         llm = get_chat_model(
             style=CONTENT_API_STYLE,
@@ -379,8 +394,8 @@ def _llm_summarize_for_next(section_title: str, content: str) -> str:
             endpoint=CONTENT_API_ENDPOINT,
             api_key=CONTENT_API_KEY,
             temperature=0.1,
-            max_tokens=200,
-            timeout_s=60,
+            max_tokens=160,
+            timeout_s=30,
         )
         chain = _SECTION_SUMMARY_PROMPT | llm | StrOutputParser()
         summary = (chain.invoke({"title": section_title, "content": s[:2000]}) or "").strip()
@@ -388,9 +403,7 @@ def _llm_summarize_for_next(section_title: str, content: str) -> str:
             return summary[:280]
     except Exception:
         pass
-    if len(s) <= 180:
-        return s
-    return s[:180] + "…"
+    return s[:200] + ("…" if len(s) > 200 else "")
 
 
 def _verify_section_facts(section_title: str, section_text: str, multimodal_digest: str) -> list[str]:
@@ -420,13 +433,25 @@ def _verify_section_facts(section_title: str, section_text: str, multimodal_dige
 
 
 def _final_coherence_review(full_text: str, multimodal_digest: str) -> str:
-    """Post-generation coherence review: LLM contradiction check + structured fact cross-check."""
-    if len(full_text) < 500:
+    """Post-generation coherence review with layered clipping.
+
+    Layer 3 (LLM contradiction check) and Layer 4 (regex fact cross-check) are
+    expensive — each costs an extra LLM call.  Skip them for short reports where
+    the base prompt constraints (Layer 1) and data-handling rules (Layer 2) already
+    provide reasonable guardrails.
+    """
+    text_len = len(full_text)
+
+    # Short report (< 3000 chars): layers 1 & 2 suffice
+    if text_len < 3000:
         return full_text
+
+    # Medium report (3000–8000 chars): layer 3 only (LLM review), skip layer 4
+    run_layer4 = text_len >= 8000
 
     all_issues: list[str] = []
 
-    # ── Step 1: LLM coherence review ─────────────────────────────────────
+    # ── Step 1: LLM coherence review (layer 3) ──────────────────────────────
     try:
         llm = get_chat_model(
             style=CONTENT_API_STYLE,
@@ -450,14 +475,15 @@ def _final_coherence_review(full_text: str, multimodal_digest: str) -> str:
     except Exception:
         pass
 
-    # ── Step 2: Structured fact cross-check ──────────────────────────────
-    try:
-        material_facts = _extract_facts_from_materials(multimodal_digest)
-        fact_issues = _cross_check_facts(full_text, material_facts)
-        for fi in fact_issues:
-            all_issues.append(f"## 事实核查: {fi}")
-    except Exception:
-        pass
+    # ── Step 2: Structured fact cross-check (layer 4, long reports only) ────
+    if run_layer4:
+        try:
+            material_facts = _extract_facts_from_materials(multimodal_digest)
+            fact_issues = _cross_check_facts(full_text, material_facts)
+            for fi in fact_issues:
+                all_issues.append(f"## 事实核查: {fi}")
+        except Exception:
+            pass
 
     if not all_issues:
         return full_text
@@ -487,7 +513,7 @@ def _final_coherence_review(full_text: str, multimodal_digest: str) -> str:
     return corrected
 
 
-def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "") -> str:
+def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "", feedback: str = "") -> str:
     flat = parse_outline_sections(outline)
     if not flat:
         return ""
@@ -527,7 +553,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
         if level == 2:
             out_lines.append("")
             out_lines.append(f"## {title}")
-            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id)
+            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback)
             out_lines.append("")
             out_lines.append(body)
             previous_summary = _llm_summarize_for_next(title, body)
@@ -537,7 +563,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
         if level == 3:
             out_lines.append("")
             out_lines.append(f"### {title}")
-            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id)
+            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback)
             out_lines.append("")
             out_lines.append(body)
             previous_summary = _llm_summarize_for_next(title, body)
@@ -546,7 +572,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
 
         out_lines.append("")
         out_lines.append("#" * level + " " + title)
-        body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id)
+        body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback)
         out_lines.append("")
         out_lines.append(body)
         previous_summary = _llm_summarize_for_next(title, body)
@@ -556,8 +582,8 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
     return _final_coherence_review(raw, multimodal_digest)
 
 
-def generate_content(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "") -> str:
-    return generate_full_content_parallel(outline, multimodal_results, user_prompt, task_id=task_id)
+def generate_content(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "", feedback: str = "") -> str:
+    return generate_full_content_parallel(outline, multimodal_results, user_prompt, task_id=task_id, feedback=feedback)
 
 
 def _prepare_section_tasks(flat: List[dict]) -> List[dict]:
@@ -580,7 +606,7 @@ def _prepare_section_tasks(flat: List[dict]) -> List[dict]:
     return tasks
 
 
-def _build_section_args(task: dict, multimodal_results: Dict[str, Any], user_prompt: str, parent_summary: str = "", *, task_id: str = "") -> dict:
+def _build_section_args(task: dict, multimodal_results: Dict[str, Any], user_prompt: str, parent_summary: str = "", *, task_id: str = "", feedback: str = "") -> dict:
     return {
         "section_title": task["title"],
         "parent_title": task["parent_title"],
@@ -589,10 +615,11 @@ def _build_section_args(task: dict, multimodal_results: Dict[str, Any], user_pro
         "previous_summary": parent_summary,
         "level": task["level"],
         "task_id": task_id,
+        "feedback": feedback,
     }
 
 
-def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "") -> str:
+def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "", feedback: str = "") -> str:
     flat = parse_outline_sections(outline)
     if not flat:
         return ""
@@ -658,23 +685,31 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
         except Exception:
             pass
 
-    # Phase 1: serialize h2 sections with rolling summaries
+    # Phase 1: parallelize h2 sections
     h2_summaries: dict[int, str] = {}  # flat_index -> summary
-    rolling_summary = ""
-    for t in tasks:
-        if t["level"] != 2:
-            continue
+    h2_tasks = [t for t in tasks if t["level"] == 2]
+    if h2_tasks:
         _check_cancel(task_id)
-        body = generate_section_content(
-            t["title"], t["parent_title"], multimodal_results,
-            user_prompt, rolling_summary, t["level"],
-            task_id=task_id,
-        )
-        results[t["index"]] = body
-        rolling_summary = _llm_summarize_for_next(t["title"], body)
-        h2_summaries[t["index"]] = rolling_summary
-        done_count += 1
-        _notify_section_progress(task_id, done_count, total_sections, t["title"])
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {}
+            for t in h2_tasks:
+                args = _build_section_args(t, multimodal_results, user_prompt, task_id=task_id, feedback=feedback)
+                futures[pool.submit(generate_section_content, **args)] = t["index"]
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    results[idx] = str(fut.result() or "")
+                except Exception as e:
+                    results[idx] = f"（本节生成失败：{str(e)[:120]}）"
+                _check_cancel(task_id)
+                done_count += 1
+                section_title = str(flat[idx].get("title") or "") if idx < len(flat) else ""
+                _notify_section_progress(task_id, done_count, total_sections, section_title)
+        # Compute summaries after all h2s complete
+        for t in h2_tasks:
+            idx = t["index"]
+            body = results.get(idx, "")
+            h2_summaries[idx] = _llm_summarize_for_next(t["title"], body)
         _flush_partial()
 
     # Phase 2: parallelize h3+ sections under their parent h2 context
@@ -686,7 +721,7 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
             for t in sub_tasks:
                 parent_h2_idx = h2_index_map.get(t["index"], -1)
                 parent_summary = h2_summaries.get(parent_h2_idx, "") if parent_h2_idx >= 0 else ""
-                args = _build_section_args(t, multimodal_results, user_prompt, parent_summary=parent_summary, task_id=task_id)
+                args = _build_section_args(t, multimodal_results, user_prompt, parent_summary=parent_summary, task_id=task_id, feedback=feedback)
                 futures[pool.submit(generate_section_content, **args)] = t["index"]
             for fut in as_completed(futures):
                 idx = futures[fut]

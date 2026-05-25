@@ -1,83 +1,248 @@
-"""Document generation agent powered by LangGraph.
+"""Document generation agent powered by LangGraph StateGraph.
 
-Replaces the deprecated langchain_classic (create_react_agent / AgentExecutor /
-ConversationSummaryBufferMemory) with langgraph.prebuilt.create_react_agent
-and MemorySaver checkpointing.
+Uses explicit graph nodes (not create_react_agent), native interrupt() for
+human-in-the-loop, SqliteSaver checkpointing, and modular prompts.
 """
+
+from __future__ import annotations
 
 import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
+from agent_file_create.agent.prompts import CLARIFY_QUESTIONS_PROMPT
+from agent_file_create.agent.state import AgentState
 from agent_file_create.config import (
     CONTENT_API_ENDPOINT,
     CONTENT_API_KEY,
     CONTENT_API_STYLE,
     CONTENT_MODEL_NAME,
     MODEL_NAME,
+    MODEL_TIMEOUT,
     MODEL_TIMEOUT_SHORT,
-    PLANNER_API_ENDPOINT,
-    PLANNER_API_KEY,
-    PLANNER_API_STYLE,
-    PLANNER_MODEL_NAME,
 )
 from agent_file_create.llm_factory import get_chat_model
-from agent_file_create.utils import safe_json
+from agent_file_create.utils import retry_call, safe_json
 
 logger = logging.getLogger(__name__)
 
+CHECKPOINT_DB_PATH = "result/checkpoints.db"
 
-# ── Tools ─────────────────────────────────────────────────────────────────
-# Bound to a DocumentAgent instance so they can read/write agent.state.
+# ── Module-level SqliteSaver singleton ────────────────────────────────────────
+
+_checkpointer: Optional[SqliteSaver] = None
+_checkpointer_cm: Optional[object] = None
 
 
-def _build_tools(agent: "DocumentAgent"):
-    from langchain_core.tools import tool
+def _get_checkpointer() -> SqliteSaver:
+    global _checkpointer, _checkpointer_cm
+    if _checkpointer is None:
+        _checkpointer_cm = SqliteSaver.from_conn_string(CHECKPOINT_DB_PATH)
+        _checkpointer = _checkpointer_cm.__enter__()
+    return _checkpointer
 
-    @tool
-    def extract_files(preprocess: str = "true") -> str:
-        """从已上传文件中抽取结构化信息 (title/keywords/summary/key_points/data/conclusion/prediction)。
 
-参数 preprocess: "true"(默认, 进行图片预处理) 或 "false"(跳过图片预处理)。
-如果所有文件都返回 error, 说明格式不支持或文件损坏, 应调用 ask_user 告知用户。
-        """
-        if (
-            not agent.state.get("force_regen")
-            and isinstance(agent.state.get("analysis_results"), list)
-            and agent.state.get("analysis_results")
-        ):
-            return "analysis_results 已存在, 跳过抽取。"
+# ── DocumentAgent ─────────────────────────────────────────────────────────────
+
+
+class DocumentAgent:
+    """Deterministic 7‑step document‑generation workflow backed by LangGraph.
+
+    Steps
+    -----
+    1. extract   – parse all uploaded files
+    2. assess    – compute quality metrics
+    3. clarify   – ask the user for preferences (interrupt / human‑in‑the‑loop)
+    4. outline   – generate a markdown outline
+    5. content   – expand outline into full‑length content
+    6. render    – produce final .md / .docx / .pdf outputs
+    7. END
+
+    The graph uses *SqliteSaver* so every successful step is persisted.
+    Transient failures are retried with exponential backoff.
+    """
+
+    def __init__(
+        self,
+        *,
+        task_id: str,
+        user_prompt: str,
+        file_paths: List[str],
+        template_dir_override: Optional[str] = None,
+    ) -> None:
+        self.task_id = str(task_id)
+        self.user_prompt = str(user_prompt or "")
+        self.file_paths = [str(x) for x in (file_paths or [])]
+        self.template_dir_override = template_dir_override
+        # Public state dict — callers may pre‑populate analysis_results,
+        # force_regen, or user_clarifications before calling run().
+        self.state: Dict[str, Any] = {}
+        self._graph = self._build_graph()
+        self._stored_human_input_fn: Optional[Callable[[str], str]] = None
+
+    # ── LLM helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_llm(timeout_s: int = MODEL_TIMEOUT_SHORT):
+        """Lightweight LLM for clarification / routing (not content generation)."""
+        style = (
+            CONTENT_API_STYLE or "openai"
+        ).strip().lower()
+        endpoint = (CONTENT_API_ENDPOINT or "").strip()
+        model = (CONTENT_MODEL_NAME or MODEL_NAME).strip()
+        key = (CONTENT_API_KEY or "").strip()
+        if not endpoint and not key:
+            style = "ollama"
+        return get_chat_model(
+            style=style,
+            model=model,
+            endpoint=endpoint,
+            api_key=key,
+            temperature=0.2,
+            max_tokens=1024,
+            timeout_s=int(timeout_s),
+        )
+
+    # ── Graph construction ───────────────────────────────────────────────────
+
+    def _build_graph(self):
+        builder = StateGraph(AgentState)
+
+        # Nodes
+        builder.add_node("extract", self._node_extract)
+        builder.add_node("assess", self._node_assess)
+        builder.add_node("clarify", self._node_clarify)
+        builder.add_node("outline", self._node_outline)
+        builder.add_node("satisfaction_outline", self._node_satisfaction_outline)
+        builder.add_node("content", self._node_content)
+        builder.add_node("satisfaction_content", self._node_satisfaction_content)
+        builder.add_node("render", self._node_render)
+        builder.add_node("eval", self._node_eval)
+        builder.add_node("handle_error", self._node_handle_error)
+
+        # Edges
+        builder.add_edge(START, "extract")
+        builder.add_edge("extract", "assess")
+        builder.add_conditional_edges(
+            "assess",
+            self._route_after_assess,
+            {"clarify": "clarify", "outline": "outline"},
+        )
+        builder.add_edge("clarify", "outline")
+
+        # outline -> satisfaction_outline (then conditional)
+        builder.add_edge("outline", "satisfaction_outline")
+        builder.add_conditional_edges(
+            "satisfaction_outline",
+            self._route_after_satisfaction_outline,
+            {"outline": "outline", "content": "content", "error": "handle_error"},
+        )
+
+        # content -> satisfaction_content (then conditional)
+        builder.add_edge("content", "satisfaction_content")
+        builder.add_conditional_edges(
+            "satisfaction_content",
+            self._route_after_satisfaction_content,
+            {"outline": "outline", "content": "content", "render": "render", "error": "handle_error"},
+        )
+
+        # Error‑aware routing for render
+        builder.add_conditional_edges(
+            "render",
+            self._route_after_render,
+            {"eval": "eval", "end": END, "error": "handle_error"},
+        )
+        builder.add_edge("eval", END)
+        builder.add_edge("handle_error", END)
+
+        return builder.compile(checkpointer=_get_checkpointer())
+
+    # ── Routing ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _route_after_assess(state: AgentState) -> str:
+        """Skip clarification if the user has already provided preferences."""
+        if state.get("force_regen"):
+            return "outline"
+        if (state.get("user_clarifications") or "").strip():
+            return "outline"
+        return "clarify"
+
+    @staticmethod
+    def _route_on_error(state: AgentState) -> str:
+        """Route to error handler if a non‑recoverable error was set."""
+        if state.get("error"):
+            return "error"
+        return "next"
+
+    @staticmethod
+    def _route_after_render(state: AgentState) -> str:
+        """Route to eval if enabled, otherwise END."""
+        if state.get("error"):
+            return "error"
+        if state.get("eval_enabled"):
+            return "eval"
+        return "end"
+
+    @staticmethod
+    def _route_after_satisfaction_outline(state: AgentState) -> str:
+        """After satisfaction check on outline, decide next step."""
+        if state.get("error"):
+            return "error"
+        if state.get("outline_satisfied"):
+            return "content"
+        # Not satisfied — check regeneration scope
+        scope = state.get("regeneration_scope", "outline")
+        if scope == "content_only":
+            return "content"
+        return "outline"
+
+    @staticmethod
+    def _route_after_satisfaction_content(state: AgentState) -> str:
+        """After satisfaction check on content, decide next step."""
+        if state.get("error"):
+            return "error"
+        if state.get("content_satisfied"):
+            return "render"
+        scope = state.get("regeneration_scope", "outline")
+        if scope == "content_only":
+            return "content"
+        return "outline"
+
+    # ── Node: extract ────────────────────────────────────────────────────────
+
+    def _node_extract(self, state: AgentState) -> dict:
+        logger.info("extract start  task=%s", self.task_id)
+        if state.get("analysis_results") and not state.get("force_regen"):
+            logger.info("extract skip   task=%s (already done)", self.task_id)
+            return {}
 
         from agent_file_create.document.extractor import extract_from_file
 
-        pp = str(preprocess or "").strip().lower() != "false"
         results: List[dict] = []
-        for fp in agent.file_paths:
-            res = extract_from_file(fp, preprocess=pp)
+        for fp in state.get("file_paths", self.file_paths):
+            res = retry_call(extract_from_file, fp, preprocess=True)
             res["_file"] = Path(fp).name
             results.append(res)
-        agent.state["analysis_results"] = results
-        agent.state["force_regen"] = False
-        return f"已抽取 {len(results)} 个文件。"
 
-    @tool
-    def assess_material(dummy: str = "") -> str:
-        """评估当前抽取结果的质量。输入留空即可。
+        logger.info("extract done   task=%s files=%d", self.task_id, len(results))
+        return {"analysis_results": results, "force_regen": False}
 
-每行输出包含文件名、标题、摘要预览、filled 字段数(满分7)。
-判断标准: 多数文件 filled<3 说明质量差; filled<5 说明信息可能不足, 应考虑 ask_user。
-        """
+    # ── Node: assess ─────────────────────────────────────────────────────────
+
+    def _node_assess(self, state: AgentState) -> dict:
+        logger.info("assess  start  task=%s", self.task_id)
+
         from agent_file_create.preprocessor import compute_quality_metrics
 
-        ar = (
-            agent.state.get("analysis_results")
-            if isinstance(agent.state.get("analysis_results"), list)
-            else []
-        )
+        ar = state.get("analysis_results") or []
+        if not ar:
+            return {"last_output": "（无文件可评估）"}
+
         lines: list[str] = []
         for it in ar[:8]:
             if not isinstance(it, dict):
@@ -92,294 +257,525 @@ def _build_tools(agent: "DocumentAgent"):
                 f" r={float(q.get('field_ratio') or 0):.2f}"
             )
             s = " | ".join(
-                [
-                    x
-                    for x in [
-                        title,
-                        summary[:160] + ("…" if len(summary) > 160 else ""),
-                    ]
-                    if x
+                x
+                for x in [
+                    title,
+                    summary[:160] + ("…" if len(summary) > 160 else ""),
                 ]
+                if x
             ).strip()
             if err:
                 s = (s + " | " if s else "") + ("ERROR=" + err[:120])
             head = (fn + ": ") if fn else ""
             lines.append(head + (s or "（无摘要）") + " | " + qtxt)
-        return "\n".join(lines).strip() or "（暂无抽取结果）"
 
-    @tool
-    def generate_outline(dummy: str = "") -> str:
-        """根据抽取结果和用户需求生成报告大纲(Markdown)。输入留空。
+        assessment = "\n".join(lines).strip() or "（暂无抽取结果）"
+        logger.info("assess  done   task=%s", self.task_id)
+        return {"last_output": assessment}
 
-输出包含 # 标题、## 主章节(>=3个)、### 子节的完整大纲。
-调用前确保 analysis_results 存在且 assess_material 评估通过。
-        """
-        if not agent.state.get("force_regen") and str(
-            agent.state.get("outline") or ""
-        ).strip():
-            return "outline 已存在, 跳过生成。"
+    # ── Node: clarify ────────────────────────────────────────────────────────
 
-        from agent_file_create.document.outline_generator import (
-            generate_outline as _gen,
+    def _node_clarify(self, state: AgentState) -> dict:
+        logger.info("clarify start  task=%s", self.task_id)
+
+        assessment = state.get("last_output", "")
+        user_prompt = state.get("user_prompt", self.user_prompt)
+
+        # Generate clarification questions via LLM
+        llm = self._build_llm()
+        prompt = CLARIFY_QUESTIONS_PROMPT.invoke({
+            "user_prompt": user_prompt,
+            "assessment": assessment,
+        })
+        try:
+            response = retry_call(llm.invoke, prompt)
+            question = (
+                response.content
+                if hasattr(response, "content")
+                else str(response)
+            ).strip()
+        except Exception as exc:
+            logger.warning("clarify llm failed: %s, using fallback", exc)
+            question = (
+                "请确认以下偏好以便生成更精准的报告：\n"
+                "1. 报告使用场景？A.内部决策/B.对外汇报/C.学术发表\n"
+                "2. 侧重点偏向？A.技术深度/B.商业价值/C.风险分析\n"
+                "3. 篇幅偏好？A.3000字精简/B.5000字标准/C.8000字详尽"
+            )
+
+        # Native LangGraph interrupt — pauses the graph here
+        answer = interrupt(question)
+
+        # ── Resumed with user answer ─────────────────────────────────
+        prev = (state.get("user_clarifications") or "").strip()
+        new_clarifications = (
+            f"{prev}\n{str(answer or '').strip()}" if prev
+            else str(answer or "").strip()
         )
-
-        ar = agent.state.get("analysis_results") or []
-        multimodal = {f"source_{i}": r for i, r in enumerate(ar)}
-        outline = _gen(multimodal, agent.user_prompt)
-        agent.state["outline"] = outline
-        agent.state["force_regen"] = False
-        return f"outline 已生成 (chars={len(outline or '')})。"
-
-    @tool
-    def generate_content(dummy: str = "") -> str:
-        """根据大纲和抽取结果生成报告正文(Markdown)。输入留空。
-
-调用前确保 outline 已生成。
-        """
-        if not agent.state.get("force_regen") and str(
-            agent.state.get("content") or ""
-        ).strip():
-            return "content 已存在, 跳过生成。"
-
-        from agent_file_create.document.content_generator import (
-            generate_full_content as _gen,
-        )
-
-        ar = agent.state.get("analysis_results") or []
-        multimodal = {f"source_{i}": r for i, r in enumerate(ar)}
-        outline = str(agent.state.get("outline") or "")
-        content = _gen(outline, multimodal, agent.user_prompt, task_id=agent.task_id)
-        agent.state["content"] = content
-        agent.state["force_regen"] = False
-        return f"content 已生成 (chars={len(content or '')})。"
-
-    @tool
-    def render_templates(dummy: str = "") -> str:
-        """将大纲和正文渲染为最终文档文件(md/docx/pdf), 输出到 result/<task_id>/ 目录。
-
-输入留空。调用前确保 content 已生成。
-        """
-        from agent_file_create.document_service import generate_document
-
-        ar = agent.state.get("analysis_results") or []
-        result = generate_document(
-            user_prompt=agent.user_prompt,
-            analysis_results=ar,
-            document_type="report",
-            task_id=agent.task_id,
-            template_dir_override=agent.template_dir_override,
-        )
-        agent.state["outputs"] = result.get("rendered_outputs") or []
-        agent.state["output_dir"] = result.get("output_dir") or ""
-        agent.state["outline"] = (
-            result.get("document_outline") or agent.state.get("outline") or ""
-        )
-        agent.state["content"] = (
-            result.get("document_content") or agent.state.get("content") or ""
-        )
-        return (
-            f"已生成文档, output_dir={agent.state.get('output_dir') or ''}"
-            f" outputs={len(agent.state.get('outputs') or [])}。"
-        )
-
-    @tool
-    def ask_user(question: str) -> str:
-        """当材料信息不足、与需求不匹配、或侧重点不清晰时, 向用户提问。
-
-question: 对用户提出的问题。可以是单个问题, 或换行分隔的多个问题(2-6个)。
-如需选项, 用 A./B./C. 格式写在同一行。
-示例: "报告偏向技术深度还是行业广度？A.技术深度/B.行业广度/C.两者兼顾"
-
-重要: 调用后系统会暂停等待用户回复。在确实需要时才调用, 不要滥用。
-工具执行后会立即返回, 请不要在调用 ask_user 后继续调用其他工具。
-        """
-        q = str(question or "").strip() or "请补充你希望生成文档的侧重点/受众/篇幅/风格等信息。"
-        agent.state["awaiting_user"] = True
-        agent.state["clarify_question"] = q
-        return q
-
-    @tool
-    def finish(dummy: str = "") -> str:
-        """结束任务。调用条件: render_templates 已执行且 output_dir 存在。输入留空。"""
-        agent.state["finished"] = True
-        return "ok"
-
-    return [
-        extract_files,
-        assess_material,
-        generate_outline,
-        generate_content,
-        render_templates,
-        ask_user,
-        finish,
-    ]
-
-
-# ── System prompt ─────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """\
-你是一个文档生成智能体。你的目标：基于用户提供的文件材料生成报告，并输出文档（md/docx/pdf 视模板而定）。
-
-工作流程（严格按顺序推进）：
-1) 首先调用 extract_files 抽取所有文件的结构化信息。
-2) 抽取后调用 assess_material 判断材料完整度。
-   - 如果大部分文件解析失败（超过一半返回 error），必须先 ask_user 告知用户并建议重新上传或检查文件格式。
-   - 如果材料明显与用户需求不相关（如用户要财务报告但材料全是技术文档），必须先 ask_user 确认。
-   - 如果材料信息不足以支撑报告（摘要质量差、关键字段大量缺失），必须先 ask_user 请用户补充侧重点或材料。
-3) 只有材料评估通过后，才依次调用 generate_outline → generate_content → render_templates。
-4) 收到用户澄清回复后，根据当前进度继续推进（已有大纲则直接 generate_content，已有正文则 render_templates）。
-5) render_templates 执行成功后调用 finish 结束。
-
-重要约束：
-- 调用 ask_user 后，你必须立即停止，等待用户回复。不要在 ask_user 之后调用任何其他工具。
-- 如果用户已提供过澄清信息 (user_clarifications)，应直接推进而非重复提问。"""
-
-
-# ── DocumentAgent ─────────────────────────────────────────────────────────
-
-
-class DocumentAgent:
-    def __init__(
-        self,
-        *,
-        task_id: str,
-        user_prompt: str,
-        file_paths: List[str],
-        template_dir_override: Optional[str] = None,
-    ) -> None:
-        self.task_id = str(task_id)
-        self.user_prompt = str(user_prompt or "")
-        self.file_paths = [str(x) for x in (file_paths or [])]
-        self.template_dir_override = template_dir_override
-        self.state: Dict[str, Any] = {
-            "task_id": self.task_id,
-            "force_regen": False,
-            "file_paths": list(self.file_paths),
-            "template_dir_override": str(self.template_dir_override or ""),
+        logger.info("clarify done   task=%s", self.task_id)
+        return {
+            "user_clarifications": new_clarifications,
+            "clarify_question": "",
         }
-        self._agent_llm = self._build_agent_llm()
-        self._tools = _build_tools(self)
-        self._graph = self._build_graph()
 
-    # ── LLM ────────────────────────────────────────────────────────────
+    # ── Node: satisfaction_outline ───────────────────────────────────────────
 
-    def _build_agent_llm(self):
-        style = (PLANNER_API_STYLE or CONTENT_API_STYLE or "").strip().lower()
-        endpoint = (PLANNER_API_ENDPOINT or CONTENT_API_ENDPOINT or "").strip()
-        model = (PLANNER_MODEL_NAME or CONTENT_MODEL_NAME or MODEL_NAME).strip()
-        key = (PLANNER_API_KEY or CONTENT_API_KEY or "").strip()
-        if not style:
-            if endpoint and "/v1/" in endpoint:
-                style = "openai"
+    def _node_satisfaction_outline(self, state: AgentState) -> dict:
+        logger.info("satisfaction_outline start  task=%s", self.task_id)
+
+        current_ver = state.get("current_outline_version", 1)
+        outline = state.get("outline", "")
+        versions = state.get("outline_versions") or []
+
+        # Build prompt showing the outline and asking for satisfaction
+        prompt_parts = [
+            "[STAGE:satisfaction_outline]",
+            "📋 大纲已生成完成，请审阅：",
+            "",
+            "---",
+            outline[:3000] if outline else "（大纲为空）",
+            "---",
+            "",
+            f"当前版本：V{current_ver}",
+        ]
+        if len(versions) > 1:
+            prompt_parts.append(f"共 {len(versions)} 个版本")
+        prompt_parts.append("请选择：[满意] 继续生成报告  /  [不满意] 重新生成")
+        question = "\n".join(prompt_parts)
+
+        answer = interrupt(question)
+
+        # Parse answer: user sends JSON-like structure via Command
+        # The answer is a dict from the frontend: {"satisfied": bool, "feedback": "...", "scope": "outline|content_only"}
+        import json as _json
+        try:
+            if isinstance(answer, str):
+                ans = _json.loads(answer)
             else:
-                style = "ollama"
+                ans = answer if isinstance(answer, dict) else {}
+        except Exception:
+            ans = {"satisfied": True, "feedback": "", "scope": "outline"}
 
-        return get_chat_model(
-            style=style,
-            model=model,
-            endpoint=endpoint,
-            api_key=key,
-            temperature=0.2,
-            max_tokens=420,
-            timeout_s=int(MODEL_TIMEOUT_SHORT),
+        satisfied = bool(ans.get("satisfied", True))
+        feedback = str(ans.get("feedback") or "").strip()
+        scope = str(ans.get("scope") or "outline").strip()
+
+        logger.info("satisfaction_outline done  task=%s satisfied=%s", self.task_id, satisfied)
+        return {
+            "outline_satisfied": satisfied,
+            "satisfaction_feedback": feedback,
+            "regeneration_scope": scope,
+            "waiting_satisfaction": "",
+        }
+
+    # ── Node: satisfaction_content ───────────────────────────────────────────
+
+    def _node_satisfaction_content(self, state: AgentState) -> dict:
+        logger.info("satisfaction_content start  task=%s", self.task_id)
+
+        current_ver = state.get("current_content_version", 1)
+        content = state.get("content", "")
+        versions = state.get("content_versions") or []
+
+        prompt_parts = [
+            "[STAGE:satisfaction_content]",
+            "📄 报告正文已生成完成，请审阅：",
+            "",
+            "---",
+            content[:3000] if content else "（报告为空）",
+            "---",
+            "",
+            f"当前版本：V{current_ver}",
+        ]
+        if len(versions) > 1:
+            prompt_parts.append(f"共 {len(versions)} 个版本")
+        prompt_parts.append("请选择：[满意] 完成并渲染  /  [不满意] 重新生成")
+        question = "\n".join(prompt_parts)
+
+        answer = interrupt(question)
+
+        import json as _json
+        try:
+            if isinstance(answer, str):
+                ans = _json.loads(answer)
+            else:
+                ans = answer if isinstance(answer, dict) else {}
+        except Exception:
+            ans = {"satisfied": True, "feedback": "", "scope": "content_only"}
+
+        satisfied = bool(ans.get("satisfied", True))
+        feedback = str(ans.get("feedback") or "").strip()
+        scope = str(ans.get("scope") or "content_only").strip()
+
+        logger.info("satisfaction_content done  task=%s satisfied=%s scope=%s", self.task_id, satisfied, scope)
+        result: dict = {
+            "content_satisfied": satisfied,
+            "satisfaction_feedback": feedback,
+            "regeneration_scope": scope,
+            "waiting_satisfaction": "",
+        }
+        # When user wants to restart from outline, reset outline_satisfied
+        # so the outline node regenerates instead of skipping.
+        if not satisfied and scope == "outline":
+            result["outline_satisfied"] = False
+        return result
+
+    # ── Node: outline ────────────────────────────────────────────────────────
+
+    def _node_outline(self, state: AgentState) -> dict:
+        logger.info("outline start  task=%s", self.task_id)
+        if (
+            state.get("outline")
+            and state.get("outline", "").strip()
+            and state.get("outline_satisfied")
+        ):
+            logger.info("outline skip   task=%s (already satisfied)", self.task_id)
+            return {}
+
+        try:
+            from agent_file_create.document.outline_generator import (
+                generate_outline as _gen,
+            )
+
+            ar = state.get("analysis_results") or []
+            multimodal = {f"source_{i}": r for i, r in enumerate(ar)}
+            user_prompt = state.get("user_prompt", self.user_prompt)
+            feedback = state.get("satisfaction_feedback", "")
+            outline = _gen(multimodal, user_prompt, feedback=feedback)
+
+            # Version management
+            versions = list(state.get("outline_versions") or [])
+            current_ver = int(state.get("current_outline_version") or 0) + 1
+            import time
+            versions.append({
+                "version": current_ver,
+                "content": outline,
+                "feedback": feedback,
+                "selected": False,
+                "ts": time.time(),
+            })
+
+            logger.info("outline done   task=%s chars=%d ver=%d", self.task_id, len(outline or ""), current_ver)
+            return {
+                "outline": outline,
+                "outline_versions": versions,
+                "current_outline_version": current_ver,
+                "outline_satisfied": False,  # reset for new version
+                "satisfaction_feedback": "",
+            }
+        except Exception as exc:
+            logger.warning("outline failed  task=%s err=%s", self.task_id, exc)
+            return {"error": f"大纲生成失败: {exc}"}
+
+    # ── Node: content ────────────────────────────────────────────────────────
+
+    def _node_content(self, state: AgentState) -> dict:
+        logger.info("content start  task=%s", self.task_id)
+        if (
+            state.get("content")
+            and state.get("content", "").strip()
+            and state.get("content_satisfied")
+        ):
+            logger.info("content skip   task=%s (already satisfied)", self.task_id)
+            return {}
+
+        try:
+            from agent_file_create.document.content_generator import (
+                generate_full_content as _gen,
+            )
+
+            ar = state.get("analysis_results") or []
+            multimodal = {f"source_{i}": r for i, r in enumerate(ar)}
+            outline = str(state.get("outline") or "")
+            user_prompt = state.get("user_prompt", self.user_prompt)
+            feedback = state.get("satisfaction_feedback", "")
+            content = _gen(outline, multimodal, user_prompt, task_id=self.task_id, feedback=feedback)
+
+            # Version management
+            versions = list(state.get("content_versions") or [])
+            current_ver = int(state.get("current_content_version") or 0) + 1
+            import time
+            versions.append({
+                "version": current_ver,
+                "content": content,
+                "feedback": feedback,
+                "selected": False,
+                "ts": time.time(),
+            })
+
+            logger.info("content done   task=%s chars=%d ver=%d", self.task_id, len(content or ""), current_ver)
+            return {
+                "content": content,
+                "content_versions": versions,
+                "current_content_version": current_ver,
+                "content_satisfied": False,
+                "satisfaction_feedback": "",
+            }
+        except Exception as exc:
+            logger.warning("content failed  task=%s err=%s", self.task_id, exc)
+            return {"error": f"正文生成失败: {exc}"}
+
+    # ── Node: render ─────────────────────────────────────────────────────────
+
+    def _node_render(self, state: AgentState) -> dict:
+        logger.info("render  start  task=%s", self.task_id)
+
+        try:
+            from agent_file_create.document_service import generate_document
+
+            ar = state.get("analysis_results") or []
+            user_prompt = state.get("user_prompt", self.user_prompt)
+            result = retry_call(
+                generate_document,
+                user_prompt=user_prompt,
+                analysis_results=ar,
+                document_type="report",
+                task_id=self.task_id,
+                template_dir_override=state.get("template_dir_override") or "",
+                outline=str(state.get("outline") or "") or None,
+                content=str(state.get("content") or "") or None,
+            )
+
+            logger.info("render  done   task=%s", self.task_id)
+            return {
+                "outputs": result.get("rendered_outputs") or [],
+                "output_dir": result.get("output_dir") or "",
+                "outline": result.get("document_outline") or state.get("outline") or "",
+                "content": result.get("document_content") or state.get("content") or "",
+                "finished": True,
+            }
+        except Exception as exc:
+            logger.warning("render failed   task=%s err=%s", self.task_id, exc)
+            return {"error": f"文档渲染失败: {exc}"}
+
+    # ── Node: eval ───────────────────────────────────────────────────────────
+
+    def _node_eval(self, state: AgentState) -> dict:
+        """Run post‑generation evaluation synchronously so the result is
+        available when the status is written."""
+        logger.info("eval    start  task=%s", self.task_id)
+
+        content = str(state.get("content") or "")
+        if not content.strip():
+            logger.info("eval    skip   task=%s (no content)", self.task_id)
+            return {}
+
+        outline = str(state.get("outline") or "")
+        analysis_results = list(state.get("analysis_results") or [])
+        user_prompt = str(state.get("user_prompt") or self.user_prompt)
+
+        try:
+            from agent_file_create.evaluation import evaluate
+
+            report = evaluate(
+                content=content,
+                outline=outline,
+                analysis_results=analysis_results,
+                user_prompt=user_prompt,
+                enable_llm=True,
+            )
+            eval_dict = report.to_dict()
+            logger.info(
+                "eval    done   task=%s combined=%.2f/%.2f/%.2f/%.2f",
+                self.task_id,
+                report.combined.relevance,
+                report.combined.faithfulness,
+                report.combined.coherence,
+                report.combined.completeness,
+            )
+            return {"eval_report": eval_dict}
+        except Exception as exc:
+            logger.warning("eval    failed task=%s err=%s", self.task_id, exc)
+            return {}
+
+    # ── Node: handle_error ───────────────────────────────────────────────────
+
+    def _node_handle_error(self, state: AgentState) -> dict:
+        err = state.get("error", "unknown error")
+        logger.error(
+            "workflow_error task=%s phase=%s err=%s",
+            self.task_id,
+            state.get("last_output", "")[:80],
+            err,
         )
+        return {
+            "finished": True,
+            "last_output": f"工作流异常终止：{err}",
+        }
 
-    # ── Graph ──────────────────────────────────────────────────────────
-
-    def _build_graph(self):
-        checkpointer = MemorySaver()
-        return create_react_agent(
-            model=self._agent_llm,
-            tools=self._tools,
-            prompt=SYSTEM_PROMPT,
-            checkpointer=checkpointer,
-        )
-
-    # ── Run ────────────────────────────────────────────────────────────
+    # ── Public API ───────────────────────────────────────────────────────────
 
     def run(
         self,
         *,
-        max_turns: int = 6,
+        max_turns: int = 0,  # no‑op — kept for backward compatibility
         human_input_fn: Optional[Callable[[str], str]] = None,
     ) -> Dict[str, Any]:
-        self.state.pop("awaiting_user", None)
-        self.state.pop("clarify_question", None)
-        self.state.pop("finished", None)
+        """Execute the document-generation workflow.
+
+        Parameters
+        ----------
+        max_turns:
+            Ignored (StateGraph has no turn limit).  Kept for backward
+            compatibility with the old create_react_agent API.
+        human_input_fn:
+            If provided, called when the graph pauses for user clarification.
+            When ``None`` the method returns early with ``need_user=True`` and
+            the question so the caller can present it to the user and call
+            :meth:`resume` later.
+
+        Returns
+        -------
+        dict
+            Always contains ``task_id``.  May contain ``need_user``,
+            ``question`` when waiting for human input.
+        """
+        # Store human_input_fn for use in subsequent interrupts
+        if human_input_fn is not None:
+            self._stored_human_input_fn = human_input_fn
 
         config = {"configurable": {"thread_id": self.task_id}}
 
-        start_input = (
-            f"任务ID：{self.task_id}\n"
-            "请开始推进任务。\n"
-            "用户需求：\n"
-            f"{self.user_prompt or '生成一份报告'}"
-        )
-
-        # Helper: run one graph invocation and extract final text
-        def _invoke_graph(input_text: str) -> str:
-            state_json = safe_json(
-                {k: v for k, v in self.state.items() if k not in ("awaiting_user", "clarify_question")},
-                2600,
-            )
-            full_input = f"当前状态(state_json)：\n{state_json}\n\n---\n\n{input_text}"
-            result = self._graph.invoke(
-                {"messages": [HumanMessage(content=full_input)]},
-                config=config,
-            )
-            msgs = result.get("messages", [])
-            final = ""
-            for msg in reversed(msgs if isinstance(msgs, list) else []):
-                content = getattr(msg, "content", "")
-                if isinstance(content, str) and content.strip():
-                    final = content
-                    break
-            return final
+        # Build initial graph state, folding in any caller‑set values
+        external = self.state
+        initial: AgentState = {
+            "task_id": self.task_id,
+            "user_prompt": self.user_prompt,
+            "file_paths": list(self.file_paths),
+            "template_dir_override": str(self.template_dir_override or ""),
+            "force_regen": bool(external.get("force_regen", False)),
+            "user_clarifications": str(external.get("user_clarifications", "")),
+            "eval_enabled": bool(external.get("eval_enabled", True)),
+            "messages": [],
+            "outline_versions": list(external.get("outline_versions") or []),
+            "content_versions": list(external.get("content_versions") or []),
+            "current_outline_version": int(external.get("current_outline_version") or 0),
+            "current_content_version": int(external.get("current_content_version") or 0),
+            "outline_satisfied": bool(external.get("outline_satisfied", False)),
+            "content_satisfied": bool(external.get("content_satisfied", False)),
+            "satisfaction_feedback": str(external.get("satisfaction_feedback") or ""),
+            "regeneration_scope": str(external.get("regeneration_scope") or ""),
+            "waiting_satisfaction": str(external.get("waiting_satisfaction") or ""),
+        }
+        # If caller pre‑populated analysis_results (e.g. from a previous run
+        # or external extractor), carry them forward to skip extraction.
+        if isinstance(external.get("analysis_results"), list) and external["analysis_results"]:
+            initial["analysis_results"] = list(external["analysis_results"])
+        if isinstance(external.get("outline"), str) and external["outline"].strip():
+            initial["outline"] = external["outline"]
+        if isinstance(external.get("content"), str) and external["content"].strip():
+            initial["content"] = external["content"]
 
         try:
-            text = _invoke_graph(start_input)
-            self.state["last_output"] = text
-
-            # ── Handle ask_user ──────────────────────────────────────
-            if self.state.get("awaiting_user"):
-                question = str(self.state.get("clarify_question") or text or "").strip()
-                if human_input_fn is None:
-                    self.state["need_user"] = True
-                    self.state["question"] = question
-                    return dict(self.state)
-
-                answer = str(human_input_fn(question) or "").strip()
-                self.state["need_user"] = False
-                self.state.pop("awaiting_user", None)
-                self.state.pop("clarify_question", None)
-                if answer:
-                    self.state["user_clarifications"] = (
-                        str(self.state.get("user_clarifications") or "") + "\n" + answer
-                    ).strip()
-                    resume_input = f"用户补充信息：\n{answer}\n\n请根据补充信息继续推进任务。"
-                else:
-                    resume_input = "用户未补充更多信息，请在当前信息基础上继续推进。"
-
-                text = _invoke_graph(resume_input)
-                self.state["last_output"] = text
-
-                # Check for second ask_user
-                if self.state.get("awaiting_user"):
-                    if human_input_fn is None:
-                        self.state["need_user"] = True
-                        self.state["question"] = str(
-                            self.state.get("clarify_question") or text or ""
-                        ).strip()
-                        return dict(self.state)
-                    # Could handle another round, but for now just continue
-                    self.state.pop("awaiting_user", None)
-                    self.state.pop("clarify_question", None)
-
-            self.state["finished"] = True
-
+            result = self._graph.invoke(initial, config)
         except Exception as exc:
-            logger.warning(f"agent_graph_error task={self.task_id} err={exc}")
-            self.state["last_output"] = f"Agent error: {exc}"
-            self.state["finished"] = True
+            # GraphInterrupt is expected — any other exception is a real error
+            if "GraphInterrupt" in type(exc).__name__:
+                return self._handle_interrupt(config, human_input_fn)
+            logger.warning(
+                "agent_graph_error task=%s err=%s", self.task_id, exc
+            )
+            self.state.update({
+                "finished": True,
+                "last_output": f"Agent error: {exc}",
+                "error": str(exc),
+            })
+            return dict(self.state)
 
+        # Check if graph was interrupted (some versions don't raise)
+        snapshot = self._graph.get_state(config)
+        if snapshot and snapshot.interrupts:
+            return self._handle_interrupt(config, human_input_fn)
+
+        # Write final state back so callers can read agent.state["output_dir"] etc.
+        self.state.update(result)
         return dict(self.state)
+
+    def resume(
+        self,
+        answer: str,
+        *,
+        human_input_fn: Optional[Callable[[str], str]] = None,
+    ) -> Dict[str, Any]:
+        """Resume a paused workflow with the user's answer.
+
+        Call this after :meth:`run` returned ``need_user=True``.
+        """
+        from langgraph.types import Command
+
+        config = {"configurable": {"thread_id": self.task_id}}
+
+        try:
+            result = self._graph.invoke(
+                Command(resume=answer),
+                config,
+            )
+        except Exception as exc:
+            if "GraphInterrupt" in type(exc).__name__:
+                return self._handle_interrupt(config, human_input_fn)
+            logger.warning(
+                "agent_resume_error task=%s err=%s", self.task_id, exc
+            )
+            self.state.update({
+                "finished": True,
+                "last_output": f"Agent error: {exc}",
+                "error": str(exc),
+            })
+            return dict(self.state)
+
+        snapshot = self._graph.get_state(config)
+        if snapshot and snapshot.interrupts:
+            return self._handle_interrupt(config, human_input_fn)
+
+        self.state.update(result)
+        return dict(self.state)
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _handle_interrupt(
+        self,
+        config: dict,
+        human_input_fn: Optional[Callable[[str], str]],
+    ) -> Dict[str, Any]:
+        """Extract the interrupt question and either auto‑answer or signal UI."""
+        snapshot = self._graph.get_state(config)
+        question = ""
+        interrupt_node = ""
+        if snapshot and snapshot.interrupts:
+            for interrupt_data in snapshot.interrupts:
+                question = (
+                    interrupt_data.value
+                    if hasattr(interrupt_data, "value")
+                    else str(interrupt_data)
+                )
+                # Detect which node triggered the interrupt
+                if hasattr(interrupt_data, "ns"):
+                    ns = interrupt_data.ns
+                    if isinstance(ns, (list, tuple)):
+                        interrupt_node = str(ns[-1]) if ns else ""
+                    else:
+                        interrupt_node = str(ns)
+                break
+
+        # Determine the interrupt type
+        is_satisfaction = "satisfaction" in interrupt_node.lower() if interrupt_node else False
+        is_clarify = "clarify" in interrupt_node.lower() if interrupt_node else False
+
+        # Store human_input_fn for later resume calls
+        fn = human_input_fn or self._stored_human_input_fn
+
+        if fn:
+            answer = str(fn(question) or "").strip()
+            if answer:
+                return self.resume(answer)
+            return self.resume('{"satisfied": true, "feedback": "", "scope": "outline"}')
+
+        return {
+            "task_id": self.task_id,
+            "need_user": True,
+            "question": question or "请补充你的需求偏好。",
+            "finished": False,
+            "interrupt_node": interrupt_node,
+            "is_satisfaction": is_satisfaction,
+            "is_clarify": is_clarify,
+        }

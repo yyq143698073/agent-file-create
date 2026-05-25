@@ -81,15 +81,6 @@
             <button id="btnUpload" class="btn btn-primary">🚀 生成报告</button>
             <button id="btnAppend" class="btn btn-outline">追加到当前任务</button>
           </div>
-          <div id="clarifyWrap" class="clarify-box" style="display:none">
-            <div class="clarify-header">📋 需要补充信息</div>
-            <div id="clarifyQuestions" class="clarify-questions"></div>
-            <textarea id="clarifyAnswers" class="input clarify-input" placeholder="逐条回答上述问题..."></textarea>
-            <div class="btn-row">
-              <button id="btnClarifySubmit" class="btn btn-primary btn-sm">提交并继续</button>
-              <button id="btnClarifySkip" class="btn btn-outline btn-sm">跳过</button>
-            </div>
-          </div>
         </section>
 
         <!-- Task Info Card -->
@@ -115,14 +106,26 @@
             <span class="kv-label">输出文件</span>
           </div>
           <ul id="downloadList" class="download-list"></ul>
-          <details class="mt">
-            <summary class="card-subtitle">📝 预览报告</summary>
+          <div class="mt">
+            <div class="field-row">
+              <span class="card-subtitle">📝 报告预览</span>
+              <button id="btnFullPreview" class="btn btn-outline btn-sm" title="在新窗口打开正文" style="display:none">全屏</button>
+            </div>
             <div class="tabs" id="previewTabs">
               <button class="tab active" data-tab="outline">大纲</button>
               <button class="tab" data-tab="content">正文</button>
+              <button class="tab" id="tabCompare" data-tab="compare" style="display:none">版本对比</button>
+            </div>
+            <div id="versionBar" class="version-bar" style="display:none">
+              <span class="kv-label">版本：</span>
+              <span id="versionTags"></span>
             </div>
             <div id="previewBox" class="preview-box"></div>
-          </details>
+            <div id="compareBox" class="compare-box tab-panel" id="tab-compare" style="display:none">
+              <div class="compare-left"><div class="compare-label">旧版本</div><div id="compareOld" class="preview-box" style="max-height:400px"></div><button id="btnSelectOld" class="btn btn-outline btn-sm mt">选择此版本</button></div>
+              <div class="compare-right"><div class="compare-label">新版本</div><div id="compareNew" class="preview-box" style="max-height:400px"></div><button id="btnSelectNew" class="btn btn-primary btn-sm mt">选择此版本</button></div>
+            </div>
+          </div>
         </section>
 
         <!-- KB Card -->
@@ -204,10 +207,28 @@
           </div>
         </section>
 
+        <!-- Satisfaction Preview Card -->
+        <section class="card" id="satisfactionPreviewCard" style="display:none">
+          <h2 class="card-title" id="satisfactionPreviewTitle">📝 请审阅生成结果</h2>
+          <div id="satisfactionPreviewContent" class="preview-box" style="max-height:500px"></div>
+        </section>
+
         <!-- A/B Eval Card -->
         <section class="card" id="abCard" style="display:none">
           <h2 class="card-title">🔬 A/B 评估结果</h2>
           <div id="abBox" class="ab-box"></div>
+        </section>
+
+        <!-- Eval Card -->
+        <section class="card" id="evalCard" style="display:none">
+          <h2 class="card-title">📊 文档质量评估</h2>
+          <div class="eval-tabs" id="evalTabs">
+            <button class="eval-tab active" data-eval="combined">综合</button>
+            <button class="eval-tab" data-eval="decomposed">规则评估</button>
+            <button class="eval-tab" data-eval="llm">LLM 评判</button>
+            <button class="eval-tab" data-eval="reasoning">评语</button>
+          </div>
+          <div id="evalContent" class="eval-content"></div>
         </section>
       </main>
     </div>

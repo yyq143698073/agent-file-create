@@ -56,3 +56,59 @@ task_chat_prompt = ChatPromptTemplate.from_messages(
         ("human", "{user_input}"),
     ]
 )
+
+# ── Utility prompts (summarization / rewriting / follow‑ups) ─────────────────
+
+SUMMARIZE_HISTORY_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "human",
+            "将以下对话历史压缩为一段不超过150字的摘要。必须保留：\n"
+            "1) 用户首次提出的实质性提问（即第一个非问候、非闲聊的问题）；\n"
+            "2) 双方达成的关键决策与偏好；\n"
+            "3) 用户明确表示满意/不满意的内容。\n"
+            "禁止编造未发生的对话。如果无法确定某项信息，就不要写入摘要。\n\n"
+            "{transcript}",
+        ),
+    ]
+)
+
+REWRITE_QUERY_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "human",
+            "将用户问题改写为一个适合知识库检索的查询短语，补充可能相关的关键词和同义词。"
+            "只输出改写后的查询，不要解释。\n\n"
+            "用户问题：{question}\n\n查询：",
+        ),
+    ]
+)
+
+CHECK_RELEVANCE_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "human",
+            "判断用户回复是否合理回答了澄清问题。\n\n"
+            "澄清问题：\n{clarify_question}\n\n"
+            "用户回复：{user_reply}\n\n"
+            "如果用户回复明显不相关（如闲聊、天气、完全无关的话题），回复 NO。\n"
+            "如果是对问题的合理回答（包括「跳过」「不用了」），回复 YES。\n"
+            "只回复 YES 或 NO。",
+        ),
+    ]
+)
+
+FOLLOWUPS_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "human",
+            "基于对话上下文，为用户推荐 2-3 个值得继续追问的问题。"
+            "每个问题一行，以 \"- \" 开头。问题要具体、可执行，不超过 50 字。"
+            "不要重复用户已经问过的内容。\n\n"
+            "用户问题：{question}\n\n"
+            "你的回复要点：{reply_summary}\n\n"
+            "报告主题：{report_topics}\n\n"
+            "追问推荐：",
+        ),
+    ]
+)

@@ -295,6 +295,116 @@ class TaskManager:
             )
         return out
 
+    # ── Version Management ─────────────────────────────────────────────
+
+    def _versions_dir(self, task_id: str) -> Path:
+        return self._result_dir / str(task_id) / "versions"
+
+    def _versions_meta_path(self, task_id: str) -> Path:
+        return self._versions_dir(task_id) / "versions.json"
+
+    def save_version(self, task_id: str, version_type: str, version_num: int, content: str, feedback: str = "") -> None:
+        """Save a version snapshot to result/<task_id>/versions/<type>_v<N>.md"""
+        vdir = self._versions_dir(task_id)
+        try:
+            vdir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        # Save content file
+        fname = f"{version_type}_v{version_num}.md"
+        try:
+            (vdir / fname).write_text(content or "", encoding="utf-8")
+        except Exception:
+            pass
+        # Update versions.json metadata
+        meta = self._read_versions_meta(task_id)
+        key = f"{version_type}_versions"
+        existing = list(meta.get(key) or [])
+        # Check if this version already recorded
+        found = False
+        for item in existing:
+            if item.get("version") == version_num:
+                item["feedback"] = feedback
+                item["ts"] = time.time()
+                found = True
+                break
+        if not found:
+            existing.append({
+                "version": version_num,
+                "feedback": feedback,
+                "ts": time.time(),
+                "selected": False,
+            })
+        meta[key] = existing
+        try:
+            self._versions_meta_path(task_id).write_text(
+                json.dumps(meta, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def _read_versions_meta(self, task_id: str) -> dict:
+        p = self._versions_meta_path(task_id)
+        if not p.exists():
+            return {}
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+
+    def list_versions(self, task_id: str, version_type: str) -> list[dict]:
+        """List all versions of a type with metadata and content."""
+        meta = self._read_versions_meta(task_id)
+        key = f"{version_type}_versions"
+        items = list(meta.get(key) or [])
+        vdir = self._versions_dir(task_id)
+        for item in items:
+            vnum = item.get("version", 0)
+            fname = f"{version_type}_v{vnum}.md"
+            fp = vdir / fname
+            if fp.exists():
+                try:
+                    item["content"] = fp.read_text(encoding="utf-8")
+                except Exception:
+                    item["content"] = ""
+            else:
+                item["content"] = ""
+        return sorted(items, key=lambda x: x.get("version", 0))
+
+    def select_version(self, task_id: str, version_type: str, version_num: int) -> bool:
+        """Mark a version as selected, and copy its content to the main file."""
+        vdir = self._versions_dir(task_id)
+        fname = f"{version_type}_v{version_num}.md"
+        fp = vdir / fname
+        if not fp.exists():
+            return False
+
+        # Update metadata
+        meta = self._read_versions_meta(task_id)
+        key = f"{version_type}_versions"
+        items = list(meta.get(key) or [])
+        for item in items:
+            item["selected"] = (item.get("version") == version_num)
+        meta[key] = items
+        try:
+            self._versions_meta_path(task_id).write_text(
+                json.dumps(meta, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+        # Copy content to main file
+        base = self._result_dir / str(task_id)
+        target = base / f"{version_type}.md"
+        try:
+            target.write_text(fp.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            return False
+        return True
+
+    # ── Control ────────────────────────────────────────────────────────
+
     def is_task_running(self, task_id: str) -> bool:
         return _task_running(task_id)
 
@@ -344,3 +454,22 @@ class TaskManager:
                 return "", True
             time.sleep(1.0)
         return "", True
+
+    def wait_for_satisfaction(self, task_id: str, stage: str, *, timeout_s: int = 1800) -> dict:
+        """Wait for user satisfaction response. Returns dict with satisfied/feedback/scope."""
+        t0 = time.time()
+        while time.time() - t0 <= float(timeout_s or 0):
+            st = self.read_status(task_id)
+            if str(st.get("status") or "") in {"canceled", "cancelled"}:
+                return {"satisfied": True, "feedback": "", "scope": "outline"}
+            # Check for satisfaction response keys
+            satisfied = st.get(f"{stage}_satisfied")
+            if satisfied is not None:
+                return {
+                    "satisfied": bool(satisfied),
+                    "feedback": str(st.get("satisfaction_feedback") or "").strip(),
+                    "scope": str(st.get("regeneration_scope") or "outline").strip(),
+                }
+            time.sleep(1.0)
+        # Timeout: assume satisfied
+        return {"satisfied": True, "feedback": "", "scope": "outline"}

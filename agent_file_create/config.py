@@ -57,7 +57,7 @@ PDF_OCR_THRESHOLD_X = float(os.getenv("PDF_OCR_THRESHOLD_X", "0.6"))
 PDF_OCR_THRESHOLD_Y = float(os.getenv("PDF_OCR_THRESHOLD_Y", "0.6"))
 PDF_MAX_PAGES_VISION = int(os.getenv("PDF_MAX_PAGES_VISION", "8"))
 
-MODEL_TIMEOUT = int(os.getenv("MODEL_TIMEOUT", "120"))
+MODEL_TIMEOUT = int(os.getenv("MODEL_TIMEOUT", "60"))
 MODEL_TIMEOUT_SHORT = int(os.getenv("MODEL_TIMEOUT_SHORT", "60"))
 MODEL_TIMEOUT_LONG = int(os.getenv("MODEL_TIMEOUT_LONG", "180"))
 

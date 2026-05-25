@@ -169,7 +169,7 @@ def _extract_from_file(p: Path, preprocess: bool) -> dict:
 
         # Plain text / unknown
         text = read_text_file(str(p))
-        prompt = build_extract_prompt(ct) + "\n\n" + preprocess_text(text)
+        prompt = build_extract_prompt(ct).invoke({"content": preprocess_text(text)}).to_string()
         raw = call_llm(prompt, timeout_s=120, api_style=EXTRACT_API_STYLE, api_endpoint=EXTRACT_API_ENDPOINT, api_key=EXTRACT_API_KEY, model_name=EXTRACT_MODEL_NAME)
         obj = _retry_json_parse(str(raw), prompt, ct, 120, EXTRACT_MODEL_NAME, EXTRACT_API_ENDPOINT, EXTRACT_API_KEY, EXTRACT_API_STYLE)
         obj["content_type"] = ct
@@ -202,7 +202,7 @@ def _extract_image(p: Path, preprocess: bool) -> dict:
     if OCR_ENABLED:
         ocr_text = ocr_image(img_bytes)
 
-    prompt = build_extract_prompt(ct, ocr_text=ocr_text if ocr_text else None)
+    prompt = build_extract_prompt(ct, ocr_text=ocr_text if ocr_text else None).invoke({"content": "请分析上传的图片"}).to_string()
     raw = call_llm(prompt, images_base64=[b64], timeout_s=120, api_style=EXTRACT_API_STYLE, model_name=VISION_MODEL_NAME)
 
     obj = _retry_json_parse(str(raw), prompt, ct, 120, VISION_MODEL_NAME, "", "", EXTRACT_API_STYLE)
@@ -238,7 +238,7 @@ def _extract_pdf(p: Path, preprocess: bool) -> dict:
             combined.append("--- 嵌入图片 OCR 结果 ---\n" + ocr_content)
         content = "\n\n".join(combined)
 
-        prompt = build_extract_prompt("pdf") + "\n\n" + content
+        prompt = build_extract_prompt("pdf").invoke({"content": content}).to_string()
         raw = call_llm(prompt, timeout_s=120, api_style=EXTRACT_API_STYLE, api_endpoint=EXTRACT_API_ENDPOINT, api_key=EXTRACT_API_KEY, model_name=EXTRACT_MODEL_NAME)
         obj = _retry_json_parse(str(raw), prompt, "pdf", 120, EXTRACT_MODEL_NAME, EXTRACT_API_ENDPOINT, EXTRACT_API_KEY, EXTRACT_API_STYLE)
         obj["content_type"] = "pdf"
@@ -263,8 +263,9 @@ def _extract_pdf(p: Path, preprocess: bool) -> dict:
                 ocr_parts.append(page_ocr)
 
     ocr_combined = "\n\n".join(ocr_parts) if ocr_parts else ""
-    prompt = build_extract_prompt("image", ocr_text=ocr_combined if ocr_combined else None)
-    prompt += "\n\n（PDF 无法抽取文本层，请基于页面截图和 OCR 预识别结果进行理解。）"
+    prompt = build_extract_prompt(
+        "image", ocr_text=ocr_combined if ocr_combined else None
+    ).invoke({"content": "（PDF 无法抽取文本层，请基于页面截图和 OCR 预识别结果进行理解。）"}).to_string()
 
     raw = call_llm(prompt, images_base64=b64s, timeout_s=180, api_style=EXTRACT_API_STYLE, model_name=VISION_MODEL_NAME)
     obj = _retry_json_parse(str(raw), prompt, "pdf", 180, VISION_MODEL_NAME, "", "", EXTRACT_API_STYLE)
@@ -285,7 +286,7 @@ def _extract_excel(p: Path) -> dict:
         import pandas as pd
     except Exception:
         txt = "（缺少 pandas，无法解析 excel）"
-        prompt = build_extract_prompt("excel") + "\n\n" + txt
+        prompt = build_extract_prompt("excel").invoke({"content": txt}).to_string()
         raw = call_llm(prompt, timeout_s=60, api_style=EXTRACT_API_STYLE, api_endpoint=EXTRACT_API_ENDPOINT, api_key=EXTRACT_API_KEY, model_name=EXTRACT_MODEL_NAME)
         obj = parse_model_json(str(raw))
         obj["content_type"] = "excel"
@@ -294,7 +295,7 @@ def _extract_excel(p: Path) -> dict:
     df = pd.read_excel(str(p))
     head = df.head(10).to_dict(orient="records")
     info = f"columns={list(df.columns)} rows={len(df)}"
-    prompt = build_extract_prompt("excel") + "\n\n" + info + "\n\ndata_preview:\n" + json.dumps(head, ensure_ascii=False)
+    prompt = build_extract_prompt("excel").invoke({"content": info + "\n\ndata_preview:\n" + json.dumps(head, ensure_ascii=False)}).to_string()
     raw = call_llm(prompt, timeout_s=120, api_style=EXTRACT_API_STYLE, api_endpoint=EXTRACT_API_ENDPOINT, api_key=EXTRACT_API_KEY, model_name=EXTRACT_MODEL_NAME)
     obj = _retry_json_parse(str(raw), prompt, "excel", 120, EXTRACT_MODEL_NAME, EXTRACT_API_ENDPOINT, EXTRACT_API_KEY, EXTRACT_API_STYLE)
     obj["content_type"] = "excel"
@@ -317,7 +318,7 @@ def _extract_docx_pptx(p: Path, ct: str) -> dict:
         # Fallback: read raw bytes as text
         text = read_text_file(str(p))
 
-    prompt = build_extract_prompt(ct) + "\n\n" + text
+    prompt = build_extract_prompt(ct).invoke({"content": text}).to_string()
     raw = call_llm(prompt, timeout_s=120, api_style=EXTRACT_API_STYLE, api_endpoint=EXTRACT_API_ENDPOINT, api_key=EXTRACT_API_KEY, model_name=EXTRACT_MODEL_NAME)
     obj = _retry_json_parse(str(raw), prompt, ct, 120, EXTRACT_MODEL_NAME, EXTRACT_API_ENDPOINT, EXTRACT_API_KEY, EXTRACT_API_STYLE)
     obj["content_type"] = ct

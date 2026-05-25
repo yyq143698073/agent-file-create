@@ -376,7 +376,7 @@ def call_llm_ex(
     endpoint_norm = _normalize_endpoint_for_cache(style=style, endpoint=endpoint)
 
     last_err: str = ""
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             llm = _get_chat_model_cached(
                 style=style,
@@ -403,7 +403,7 @@ def call_llm_ex(
         except Exception as e:
             last_err = str(e)[:240]
             # Fallback: if Ollama fails and OpenAI endpoint is configured, switch
-            if style == "ollama" and (attempt >= 1):
+            if style == "ollama" and (attempt >= 0):
                 oai_endpoint = (OPENAI_API_ENDPOINT or "").strip()
                 if oai_endpoint and oai_endpoint != (API_GENERATE_ENDPOINT or "").strip():
                     logger.info(f"llm_ollama_fallback switching to openai after {attempt + 1} attempts")

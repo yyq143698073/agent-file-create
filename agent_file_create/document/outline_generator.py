@@ -116,7 +116,7 @@ def _build_outline_prompt(user_req: str, digest: str, feedback: str) -> str:
     return "\n\n".join(rules).strip()
 
 
-def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str) -> str:
+def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str, feedback: str = "") -> str:
     digest = _multimodal_digest(multimodal_results)
     user_req = (user_prompt or "").strip() or "生成一份报告"
 
@@ -124,8 +124,17 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str) -> st
     best_outline = ""
     last_issues: list[str] = []
 
-    for attempt in range(3):
-        prompt = _build_outline_prompt(user_req, digest, "\n".join(last_issues) if last_issues else "")
+    for attempt in range(2):
+        validation_feedback = "\n".join(last_issues) if last_issues else ""
+        combined_feedback = ""
+        if feedback and validation_feedback:
+            combined_feedback = f"{feedback}\n此外，验证工具发现问题：{validation_feedback}"
+        elif feedback:
+            combined_feedback = feedback
+        elif validation_feedback:
+            combined_feedback = validation_feedback
+
+        prompt = _build_outline_prompt(user_req, digest, combined_feedback)
         text = call_llm(
             prompt,
             timeout_s=MODEL_TIMEOUT,

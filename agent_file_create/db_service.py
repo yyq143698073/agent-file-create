@@ -20,7 +20,7 @@ def get_db_connection():
     if _dialect() == "postgres":
         import psycopg2
 
-        return psycopg2.connect(DB_URL)
+        return psycopg2.connect(DB_URL, connect_timeout=3)
     base = Path(__file__).resolve().parent.parent
     db_path = base / str(DB_PATH or "result/app.db")
     try:
