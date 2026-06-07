@@ -82,7 +82,7 @@ def _clean_llm_output(text: str) -> str:
     return out
 
 
-def _build_outline_prompt(user_req: str, digest: str, feedback: str) -> str:
+def _build_outline_prompt(user_req: str, digest: str, feedback: str, target_words: int = 0, template_sections: list = None) -> str:
     rules = [
         "你是一个专业报告的大纲生成助手。请基于参考材料与用户需求输出 Markdown 大纲。",
         "",
@@ -102,6 +102,25 @@ def _build_outline_prompt(user_req: str, digest: str, feedback: str) -> str:
         "用户需求：",
         user_req,
         "",
+    ]
+    if template_sections:
+        sections_str = "、".join(template_sections)
+        rules += [
+            f"模板期望章节：{sections_str}",
+            "上述章节名称来自用户选用的输出模板，请以此为主要结构来组织 ## 二级标题：",
+            "• 措辞可以微调（如『局限性』→『现有方法的局限性分析』），但保持语义对应，确保最终渲染时模板占位符能匹配到内容；",
+            "• 相近章节可以合并（如『研究背景』与『研究目的』合为一个章节），但不能直接删除；",
+            "• 如果材料中有特别突出但模板未覆盖的主题，可额外增加 1~2 个章节；",
+            "• 只有在材料确实完全没有相关内容时，才允许省略某个章节。",
+            "• 若模板包含『局限性』『不足』『问题与挑战』类章节，请在大纲后半部分安排一个反思性章节，讨论本方法/框架自身的问题和不足，而非仅讨论前人工作的局限。",
+            "",
+        ]
+    if target_words and target_words > 0:
+        rules += [
+            f"目标总字数：约 {target_words} 字。请据此调整章节数量（建议 {max(3, target_words // 1500)}~{max(5, target_words // 800)} 个 ## 章节）和每个章节的子节深度。",
+            "字数越多，章节应越多、子节越深；字数越少，章节应精简、聚焦核心。",
+        ]
+    rules += [
         "参考材料摘要：",
         digest or "（无）",
     ]
@@ -116,9 +135,59 @@ def _build_outline_prompt(user_req: str, digest: str, feedback: str) -> str:
     return "\n\n".join(rules).strip()
 
 
-def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str, feedback: str = "") -> str:
+def _check_outline_coverage(outline: str, user_req: str, template_sections: list = None) -> list[str]:
+    """Lightweight LLM check: does the outline cover user requirements and template sections?
+
+    Returns a list of missing or inadequately covered section names (empty = all good).
+    """
+    sections_to_check = (template_sections or [])[:]
+    if not sections_to_check and not user_req:
+        return []
+
+    check_prompt = (
+        "你是一个大纲质量审查助手。请检查以下大纲是否覆盖了所有要求的主题。\n\n"
+        f"用户需求：{user_req[:500]}\n\n"
+    )
+    if sections_to_check:
+        check_prompt += f"必须覆盖的章节：{'、'.join(sections_to_check)}\n\n"
+    check_prompt += (
+        f"大纲：\n{outline[:1500]}\n\n"
+        '如果所有关键主题都已覆盖，回复"OK"。'
+        "如果有缺失或覆盖不足的主题，只回复缺失的主题名称（一行一个），不要任何解释。"
+    )
+
+    try:
+        text = call_llm(
+            check_prompt,
+            timeout_s=15,
+            temperature=0.0,
+            num_predict=120,
+            system="你是大纲质量审查助手，只输出缺失主题名或OK。",
+            api_style=OUTLINE_API_STYLE,
+            api_endpoint=OUTLINE_API_ENDPOINT,
+            api_key=OUTLINE_API_KEY,
+            model_name=OUTLINE_MODEL_NAME,
+        )
+        result = (text or "").strip()
+        if result.upper() in {"OK", "OK。", "无", "无缺失", "NONE"}:
+            return []
+        # Parse each line as a missing section
+        missing = [line.strip().lstrip("-•·1234567890. ") for line in result.splitlines()]
+        missing = [m for m in missing if m and len(m) > 1]
+        return missing[:8]  # cap
+    except Exception:
+        return []  # Don't block on check failure
+
+
+def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
+                     feedback: str = "", enriched_context: str = "",
+                     target_words: int = 0, template_sections: list = None) -> str:
     digest = _multimodal_digest(multimodal_results)
     user_req = (user_prompt or "").strip() or "生成一份报告"
+
+    # Prepend skill-enriched context to the digest if available
+    if enriched_context.strip():
+        digest = f"[技能搜集到的补充信息]\n{enriched_context.strip()}\n\n[文件内容摘要]\n{digest}"
 
     t0 = time.perf_counter()
     best_outline = ""
@@ -134,7 +203,7 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str, feedb
         elif validation_feedback:
             combined_feedback = validation_feedback
 
-        prompt = _build_outline_prompt(user_req, digest, combined_feedback)
+        prompt = _build_outline_prompt(user_req, digest, combined_feedback, target_words, template_sections)
         text = call_llm(
             prompt,
             timeout_s=MODEL_TIMEOUT,
@@ -154,12 +223,17 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str, feedb
         best_outline = out
         issues = _validate_outline(out)
         if not issues:
-            t1 = time.perf_counter()
-            logger.info(f"outline_done seconds={t1 - t0:.2f} prompt_chars={len(prompt)} outline_chars={len(out)} attempts={attempt + 1}")
-            return out
-
-        last_issues = issues
-        logger.warning(f"outline_validation_failed attempt={attempt + 1} issues={issues}")
+            # Format OK — check content coverage
+            coverage_issues = _check_outline_coverage(out, user_req, template_sections)
+            if not coverage_issues:
+                t1 = time.perf_counter()
+                logger.info(f"outline_done seconds={t1 - t0:.2f} prompt_chars={len(prompt)} outline_chars={len(out)} attempts={attempt + 1}")
+                return out
+            last_issues = [f"内容覆盖不足，缺失或需加强：{'、'.join(coverage_issues)}"]
+            logger.warning(f"outline_coverage_failed attempt={attempt + 1} missing={coverage_issues}")
+        else:
+            last_issues = issues
+            logger.warning(f"outline_validation_failed attempt={attempt + 1} issues={issues}")
 
     t1 = time.perf_counter()
     logger.warning(f"outline_done_with_issues seconds={t1 - t0:.2f} attempts=3 issues={last_issues}")

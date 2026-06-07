@@ -38,7 +38,7 @@ KB_HNSW_EF_SEARCH = int(os.getenv("KB_HNSW_EF_SEARCH", "64"))
 KB_IVFFLAT_PROBES = int(os.getenv("KB_IVFFLAT_PROBES", "10"))
 
 EMBED_API_STYLE = os.getenv("EMBED_API_STYLE", "ollama").strip()
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "bge-m3").strip()
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "nomic-embed-text").strip()
 EMBED_API_ENDPOINT = os.getenv("EMBED_API_ENDPOINT", "").strip()
 EMBED_API_KEY = os.getenv("EMBED_API_KEY", "").strip()
 
@@ -61,7 +61,7 @@ MODEL_TIMEOUT = int(os.getenv("MODEL_TIMEOUT", "60"))
 MODEL_TIMEOUT_SHORT = int(os.getenv("MODEL_TIMEOUT_SHORT", "60"))
 MODEL_TIMEOUT_LONG = int(os.getenv("MODEL_TIMEOUT_LONG", "180"))
 
-MAX_WORKERS_DEFAULT = int(os.getenv("MAX_WORKERS_DEFAULT", "4"))
+MAX_WORKERS_DEFAULT = int(os.getenv("MAX_WORKERS_DEFAULT", "8"))
 
 RERANK_ENABLED = str(os.getenv("RERANK_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "y", "on"}
 RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3").strip()

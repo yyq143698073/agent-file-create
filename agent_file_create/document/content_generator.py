@@ -32,6 +32,7 @@ def _notify_section_progress(task_id: str, done: int, total: int, section_title:
             "processing",
             stage="document",
             message=f"正在生成 {done}/{total} 章节：{section_title}",
+            extra={"sections_done": done, "sections_total": total, "section_title": section_title},
         )
     except Exception:
         pass
@@ -234,6 +235,39 @@ def _multimodal_summary(multimodal_results: Dict[str, Any], max_chars: int = 160
     return out
 
 
+# ── Section type classification ──────────────────────────────────────────
+
+_SECTION_TYPE_KEYWORDS: dict[str, list[str]] = {
+    "data": [
+        "实验", "数据", "结果", "性能", "评估", "测试", "指标", "统计",
+        "对比", "比较", "精度", "准确率", "召回率", "F1", "BLEU", "ROUGE",
+        "消融", "参数", "配置", "超参数", "训练", "推理", "延迟", "吞吐",
+        "baseline", "基线", "对比实验", "定量", "数值", "百分比",
+    ],
+    "analysis": [
+        "讨论", "分析", "展望", "启示", "建议", "未来", "趋势", "影响",
+        "意义", "价值", "优劣", "权衡", "局限", "不足", "改进方向",
+        "综合", "解读", "思考", "反思", "启示", "对策", "路径",
+    ],
+}
+
+def classify_section_type(section_title: str) -> str:
+    """Classify a section heading into data / analysis / review based on keywords.
+
+    - ``data``: experiments, metrics, quantitative results — strict sourcing, low temperature
+    - ``analysis``: discussion, implications, future work — more inference, higher temperature
+    - ``review``: background, definitions, frameworks — balanced (default)
+    """
+    title = (section_title or "").strip()
+    data_score = sum(1 for kw in _SECTION_TYPE_KEYWORDS["data"] if kw in title)
+    analysis_score = sum(1 for kw in _SECTION_TYPE_KEYWORDS["analysis"] if kw in title)
+    if data_score > analysis_score:
+        return "data"
+    elif analysis_score > data_score:
+        return "analysis"
+    return "review"
+
+
 def _build_section_prompt(
     *,
     section_title: str,
@@ -245,6 +279,7 @@ def _build_section_prompt(
     target_range: tuple[int, int],
     next_title: str = "",
     feedback: str = "",
+    section_type: str = "review",
 ) -> str:
     lo, hi = target_range
     parts = [
@@ -254,9 +289,31 @@ def _build_section_prompt(
         "1) 拒绝复读：严禁直接复制粘贴参考材料中的长句，用全新语言重构核心观点。",
         "2) 逻辑流与衔接：用因果、递进、转折等连接词建立段落间关系。开篇用1句话承接前文（如有），结尾用1句话自然过渡到下一节（如有），不要生硬地写「接下来我们将讨论……」。",
         "3) 场景化扩写：解释数据和结论的业务含义，但场景必须是材料中有线索支撑的，不要凭空想象。",
-        "4) 降低幻觉：不要编造具体的数字、机构名、人名、年份。材料中明确出现的数值可以引用，但要标注「据材料显示」等限定语。不确定就说「相关数据暂缺」。",
-        "5) 溯源要求：每个关键论断后，用「（据<材料简称>）」标注信息来源。如多个材料共同支撑，标注「（综合多份材料）」。无材料支撑的推论，标注「（分析推测）」。",
+        "4) 降低幻觉：不要编造具体的数字、机构名、人名、年份。材料中明确出现的数值可以引用，但要标注具体来源（如「据某论文实验数据」），禁止使用「据材料显示」「据资料记载」等笼统表述。不确定就说「相关数据暂缺」。",
+        "5) 溯源要求：每个关键论断后，用「（据+来源文件具体关键词）」标注——如引用自「RAG技术综述_张三.pdf」则标注为「（据RAG技术综述）」。多个材料支撑时标注「（综合多份材料）」。无任何材料支撑的推论标注「（分析推测）」。",
         "",
+    ]
+    # ── Type-specific instructions ──
+    if section_type == "data":
+        parts += [
+            "⚠️ 本节为「数据型」章节（含实验、性能、对比数据），特别要求：",
+            "• 必须逐条引用来源材料中的数据，不可笼统概括（如材料说「35.1%」不要写成「约三分之一」）。",
+            "• 每个数据点后必须标注出处：「（据<材料名>）」。",
+            "• 如果材料中数据不足，只写已有数据，禁止推测数值或编造比较对象。",
+            "• 温度极低：行文可以干练，但数据必须精确。",
+            "",
+        ]
+    elif section_type == "analysis":
+        parts += [
+            "💡 本节为「分析型」章节（含讨论、展望、建议、启示），特别要求：",
+            "• 可以在材料事实基础上做合理的推理和延伸判断，但需标注「（分析推测）」。",
+            "• 鼓励多材料综合对比——如果材料A和材料B的结论有冲突或互补，主动指出来。",
+            "• 可以提出材料本身未明确表述但经你推理得出的观点，但不可与材料事实矛盾。",
+            "• 温度较高：鼓励有洞察力的分析，不追求逐句引用。",
+            "",
+        ]
+    # review type uses defaults (no extra instructions)
+    parts += [
         "结构化内容处理：",
         "- 如果材料中包含表格数据，用小段落描述关键趋势，不要逐行罗列。",
         "- 如果涉及多方案对比，用「相比之下」「与之相反」等短语体现对比关系。",
@@ -296,11 +353,11 @@ def _build_section_prompt(
     return "\n\n".join(parts).strip()
 
 
-def _call_qwen_text(prompt: str, *, timeout_s: int, num_predict: int) -> str:
+def _call_qwen_text(prompt: str, *, timeout_s: int, num_predict: int, temperature: float = 0.4) -> str:
     text = call_llm(
         prompt,
         timeout_s=timeout_s,
-        temperature=0.4,
+        temperature=temperature,
         num_predict=num_predict,
         stop=["```"],
         system="你是一个中文助手，只输出中文正文段落。",
@@ -343,9 +400,18 @@ def generate_section_content(
     *,
     task_id: str = "",
     feedback: str = "",
+    target_words: int = 0,
+    section_type: str = "",
 ) -> str:
+    # Auto-classify if caller didn't specify
+    section_type = section_type or classify_section_type(section_title)
     multimodal_digest = _multimodal_summary(multimodal_results)
-    if level == 2:
+    if target_words and target_words > 0:
+        lo = max(80, target_words // 2)
+        hi = max(120, target_words)
+        target_range = (lo, hi)
+        num_predict = max(300, hi * 3)
+    elif level == 2:
         target_range = (120, 180)
         num_predict = 500
     else:
@@ -362,12 +428,18 @@ def generate_section_content(
         target_range=target_range,
         next_title=next_title,
         feedback=feedback,
+        section_type=section_type,
     )
+
+    # Temperature by section type: data=0.1, analysis=0.4, review=0.2
+    temp_map = {"data": 0.1, "analysis": 0.4, "review": 0.2}
+    gen_temp = temp_map.get(section_type, 0.2)
+    logger.info("section_type title=%s type=%s temp=%.2f", section_title[:40], section_type, gen_temp)
 
     for attempt in range(2):
         _check_cancel(task_id)
         t0 = time.perf_counter()
-        text = _call_qwen_text(prompt, timeout_s=MODEL_TIMEOUT, num_predict=num_predict)
+        text = _call_qwen_text(prompt, timeout_s=MODEL_TIMEOUT, num_predict=num_predict, temperature=gen_temp)
         t1 = time.perf_counter()
         if text:
             if t1 - t0 >= 8:
@@ -513,7 +585,9 @@ def _final_coherence_review(full_text: str, multimodal_digest: str) -> str:
     return corrected
 
 
-def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "", feedback: str = "") -> str:
+def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user_prompt: str,
+                          *, task_id: str = "", feedback: str = "", enriched_context: str = "",
+                          target_words: int = 0) -> str:
     flat = parse_outline_sections(outline)
     if not flat:
         return ""
@@ -526,10 +600,32 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
             next_ci = content_indices[idx + 1]
             next_title_map[ci] = str(flat[next_ci].get("title") or "").strip()
 
+    # Count total sections for progress tracking
+    total_sections = sum(1 for item in flat if int(item.get("level") or 0) >= 2)
+    per_section_words = max(80, target_words // max(total_sections, 1)) if target_words and target_words > 0 else 0
+    done_count = 0
+
+    def _flush_seq():
+        """Write current out_lines to content.md for frontend preview."""
+        if not task_id:
+            return
+        try:
+            from pathlib import Path as _Path
+            base = _Path(__file__).resolve().parent.parent.parent
+            p = base / "result" / str(task_id) / "content.md"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            raw = "\n".join(out_lines).strip() + "\n"
+            p.write_text(raw, encoding="utf-8")
+        except Exception:
+            pass
+
     previous_summary = ""
     out_lines: List[str] = []
     parent_stack: List[str] = []
     multimodal_digest = _multimodal_summary(multimodal_results)
+    # Prepend skill-enriched context if available
+    if enriched_context.strip():
+        multimodal_digest = f"[技能搜集到的补充信息]\n{enriched_context.strip()}\n\n{multimodal_digest}"
 
     for i, item in enumerate(flat):
         level = int(item.get("level") or 0)
@@ -553,30 +649,39 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
         if level == 2:
             out_lines.append("")
             out_lines.append(f"## {title}")
-            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback)
+            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words)
             out_lines.append("")
             out_lines.append(body)
             previous_summary = _llm_summarize_for_next(title, body)
             parent_stack.append(title)
+            done_count += 1
+            _notify_section_progress(task_id, done_count, total_sections, title)
+            _flush_seq()
             continue
 
         if level == 3:
             out_lines.append("")
             out_lines.append(f"### {title}")
-            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback)
+            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words)
             out_lines.append("")
             out_lines.append(body)
             previous_summary = _llm_summarize_for_next(title, body)
             parent_stack.append(title)
+            done_count += 1
+            _notify_section_progress(task_id, done_count, total_sections, title)
+            _flush_seq()
             continue
 
         out_lines.append("")
         out_lines.append("#" * level + " " + title)
-        body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback)
+        body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words)
         out_lines.append("")
         out_lines.append(body)
         previous_summary = _llm_summarize_for_next(title, body)
         parent_stack.append(title)
+        done_count += 1
+        _notify_section_progress(task_id, done_count, total_sections, title)
+        _flush_seq()
 
     raw = "\n".join(out_lines).strip() + "\n"
     return _final_coherence_review(raw, multimodal_digest)
@@ -606,7 +711,7 @@ def _prepare_section_tasks(flat: List[dict]) -> List[dict]:
     return tasks
 
 
-def _build_section_args(task: dict, multimodal_results: Dict[str, Any], user_prompt: str, parent_summary: str = "", *, task_id: str = "", feedback: str = "") -> dict:
+def _build_section_args(task: dict, multimodal_results: Dict[str, Any], user_prompt: str, parent_summary: str = "", *, task_id: str = "", feedback: str = "", target_words: int = 0) -> dict:
     return {
         "section_title": task["title"],
         "parent_title": task["parent_title"],
@@ -616,10 +721,11 @@ def _build_section_args(task: dict, multimodal_results: Dict[str, Any], user_pro
         "level": task["level"],
         "task_id": task_id,
         "feedback": feedback,
+        "target_words": target_words,
     }
 
 
-def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "", feedback: str = "") -> str:
+def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "", feedback: str = "", enriched_context: str = "", target_words: int = 0) -> str:
     flat = parse_outline_sections(outline)
     if not flat:
         return ""
@@ -629,9 +735,12 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
         return ""
 
     total_sections = len(tasks)
+    per_section_words = max(80, target_words // max(total_sections, 1)) if target_words and target_words > 0 else 0
     done_count = 0
 
     multimodal_digest = _multimodal_summary(multimodal_results)
+    if enriched_context.strip():
+        multimodal_digest = f"[技能搜集到的补充信息]\n{enriched_context.strip()}\n\n{multimodal_digest}"
 
     # Tag tasks with their parent h2 for grouping
     parent_stack: list[str] = []
@@ -688,12 +797,16 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
     # Phase 1: parallelize h2 sections
     h2_summaries: dict[int, str] = {}  # flat_index -> summary
     h2_tasks = [t for t in tasks if t["level"] == 2]
+
+    # Flush initial skeleton so frontend shows structure with placeholders immediately
+    _flush_partial()
+
     if h2_tasks:
         _check_cancel(task_id)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {}
             for t in h2_tasks:
-                args = _build_section_args(t, multimodal_results, user_prompt, task_id=task_id, feedback=feedback)
+                args = _build_section_args(t, multimodal_results, user_prompt, task_id=task_id, feedback=feedback, target_words=per_section_words)
                 futures[pool.submit(generate_section_content, **args)] = t["index"]
             for fut in as_completed(futures):
                 idx = futures[fut]
@@ -705,12 +818,12 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
                 done_count += 1
                 section_title = str(flat[idx].get("title") or "") if idx < len(flat) else ""
                 _notify_section_progress(task_id, done_count, total_sections, section_title)
+                _flush_partial()  # stream each section to frontend immediately
         # Compute summaries after all h2s complete
         for t in h2_tasks:
             idx = t["index"]
             body = results.get(idx, "")
             h2_summaries[idx] = _llm_summarize_for_next(t["title"], body)
-        _flush_partial()
 
     # Phase 2: parallelize h3+ sections under their parent h2 context
     sub_tasks = [t for t in tasks if t["level"] >= 3]
@@ -721,7 +834,7 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
             for t in sub_tasks:
                 parent_h2_idx = h2_index_map.get(t["index"], -1)
                 parent_summary = h2_summaries.get(parent_h2_idx, "") if parent_h2_idx >= 0 else ""
-                args = _build_section_args(t, multimodal_results, user_prompt, parent_summary=parent_summary, task_id=task_id, feedback=feedback)
+                args = _build_section_args(t, multimodal_results, user_prompt, parent_summary=parent_summary, task_id=task_id, feedback=feedback, target_words=per_section_words)
                 futures[pool.submit(generate_section_content, **args)] = t["index"]
             for fut in as_completed(futures):
                 idx = futures[fut]
@@ -733,7 +846,7 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
                 _check_cancel(task_id)
                 section_title = str(flat[idx].get("title") or "") if idx < len(flat) else ""
                 _notify_section_progress(task_id, done_count, total_sections, section_title)
-        _flush_partial()
+                _flush_partial()  # stream each section to frontend immediately
 
     parent_stack = []
     out_lines: list[str] = []
@@ -769,8 +882,14 @@ def regenerate_section(
     user_prompt: str,
     *,
     task_id: str = "",
+    guidance: str = "",
 ) -> str:
     """Regenerate a single section (and its children) in the content.
+
+    If *guidance* is provided (e.g. user-edited draft), it is injected as
+    strong preference into the generation prompt so the LLM preserves the
+    user's intent while polishing structure and coherence.
+
     Returns the full updated content string, or empty string if the section
     could not be found.
     """
@@ -852,6 +971,7 @@ def regenerate_section(
     new_body = generate_section_content(
         section_title, "", multimodal_results, user_prompt,
         parent_summary, target_level, task_id=task_id,
+        feedback=guidance,
     )
 
     # Regenerate children

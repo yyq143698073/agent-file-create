@@ -45,8 +45,18 @@ def _task_running(task_id: str) -> bool:
 
 
 class TaskManager:
+    _status_locks: dict[str, threading.Lock] = {}
+    _status_locks_lock = threading.Lock()
+
     def __init__(self, result_dir: Optional[Path] = None):
         self._result_dir = result_dir or Path(__file__).resolve().parent.parent.parent / "result"
+
+    @classmethod
+    def _get_status_lock(cls, task_id: str) -> threading.Lock:
+        with cls._status_locks_lock:
+            if task_id not in cls._status_locks:
+                cls._status_locks[task_id] = threading.Lock()
+            return cls._status_locks[task_id]
 
     def _status_path(self, task_id: str) -> Path:
         return self._result_dir / str(task_id) / "status.json"
@@ -91,37 +101,38 @@ class TaskManager:
         message: str = "",
         extra: Optional[dict] = None,
     ) -> None:
-        base = self._result_dir / str(task_id)
-        try:
-            base.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        payload: dict[str, Any] = {}
-        try:
-            p = self._status_path(task_id)
-            if p.exists():
-                old = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(old, dict):
-                    payload.update(old)
-        except Exception:
-            payload = {}
-        payload.update(
-            {
-                "task_id": str(task_id),
-                "status": str(status),
-                "stage": str(stage),
-                "message": str(message),
-                "updated_at": float(time.time()),
-            }
-        )
-        if extra:
-            payload.update(extra)
-        try:
-            self._status_path(task_id).write_text(
-                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        with self._get_status_lock(task_id):
+            base = self._result_dir / str(task_id)
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            payload: dict[str, Any] = {}
+            try:
+                p = self._status_path(task_id)
+                if p.exists():
+                    old = json.loads(p.read_text(encoding="utf-8"))
+                    if isinstance(old, dict):
+                        payload.update(old)
+            except Exception:
+                payload = {}
+            payload.update(
+                {
+                    "task_id": str(task_id),
+                    "status": str(status),
+                    "stage": str(stage),
+                    "message": str(message),
+                    "updated_at": float(time.time()),
+                }
             )
-        except Exception:
-            return
+            if extra:
+                payload.update(extra)
+            try:
+                self._status_path(task_id).write_text(
+                    json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+                )
+            except Exception:
+                return
 
     def read_status(self, task_id: str) -> dict:
         p = self._status_path(task_id)
@@ -371,6 +382,28 @@ class TaskManager:
             else:
                 item["content"] = ""
         return sorted(items, key=lambda x: x.get("version", 0))
+
+    def delete_version(self, task_id: str, version_type: str, version_num: int) -> bool:
+        """Delete a single version file and its metadata entry."""
+        vdir = self._versions_dir(task_id)
+        fname = f"{version_type}_v{version_num}.md"
+        fp = vdir / fname
+        try:
+            if fp.exists():
+                fp.unlink()
+        except Exception:
+            pass
+        meta = self._read_versions_meta(task_id)
+        key = f"{version_type}_versions"
+        items = list(meta.get(key) or [])
+        meta[key] = [it for it in items if it.get("version") != version_num]
+        try:
+            self._versions_meta_path(task_id).write_text(
+                json.dumps(meta, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
+        return True
 
     def select_version(self, task_id: str, version_type: str, version_num: int) -> bool:
         """Mark a version as selected, and copy its content to the main file."""

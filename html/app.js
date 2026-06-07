@@ -18,9 +18,28 @@ const S = {
   _waitingFeedback: false,         // user clicked "不满意", next chat msg is feedback
   _feedbackStage: "",              // "outline" | "content" — stage for feedback
   _satisfactionKey: "",            // "outline_v2" — prevents duplicate satisfaction msgs
+  _waitingRedo: false,             // user clicked "基于此版重做", next chat msg is redo feedback
+  _redoType: "",                   // "outline" | "content"
+  _redoBaseVersion: 0,             // base version number for redo
   _versions: { outline: [], content: [] },
   _selectedVersion: { outline: null, content: null },
   _compareData: null,            // { oldText, newText, type }
+  _compareSourceTab: "content",  // which tab was active when entering compare
+  _showDiff: true,               // toggle diff highlighting in compare view
+  _cachedDiff: null,             // cached diff result {oldText, newText, oldDiff, newDiff}
+  _lastSatisfactionStage: "",    // saved for "返回" from structured feedback
+  _lastSatisfactionPreview: "",
+  _lastSatisfactionVersion: 0,
+  _editingSection: null,         // { headingEl, toHide, editDiv, headingText } or null
+  _contentStreaming: false,      // true while content sections are being generated
+  _tplEditor: {                  // template editor state
+    currentName: "",             // currently loaded template name (without .md)
+    content: "",                 // current editor content
+    variables: [],               // cached variable list
+    dirty: false,                // unsaved changes flag
+  },
+  _historyDirty: false,          // pending chat history sync to backend
+  _satisfactionSubmitting: false, // guard against double-submit
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -266,6 +285,7 @@ async function uploadAndGenerate() {
   for (const t of ($("templates").files || [])) fd.append("templates", t, t.name);
   const up = $("userPrompt").value.trim();
   if (up) fd.append("user_prompt", up);
+  fd.append("target_words", $("targetWords").value || "0");
   if ($("abEval").checked) fd.append("ab_eval", "1");
   if ($("addToKb").checked) {
     fd.append("add_to_kb", "true");
@@ -276,6 +296,10 @@ async function uploadAndGenerate() {
   if (kbDocIds) fd.append("kb_doc_ids", kbDocIds);
 
   S.generating = true;
+  S._lastOperation = "generate";
+  S._contentStreaming = false;
+  S._satisfactionKey = "";
+  S._outlineDone = false;
   $("btnUpload").disabled = true;
   $("btnAppend").disabled = true;
   setStatus("上传中…", "busy");
@@ -319,6 +343,7 @@ async function appendToTask() {
   for (const t of templates) fd.append("templates", t, t.name);
   const up = $("userPrompt").value.trim();
   if (up) fd.append("user_prompt", up);
+  fd.append("target_words", $("targetWords").value || "0");
   if ($("abEval").checked) fd.append("ab_eval", "1");
   if ($("addToKb").checked) {
     fd.append("add_to_kb", "true");
@@ -329,6 +354,8 @@ async function appendToTask() {
   if (kbDocIds) fd.append("kb_doc_ids", kbDocIds);
 
   S.generating = true;
+  S._lastOperation = "generate";
+  S._contentStreaming = false;
   $("btnUpload").disabled = true;
   $("btnAppend").disabled = true;
   setStatus("追加中…", "busy");
@@ -356,12 +383,18 @@ async function appendToTask() {
    ═══════════════════════════════════════════════════════════════════════ */
 
 function startPolling() {
-  if (S.pollTimer) clearInterval(S.pollTimer);
-  S.pollTimer = setInterval(pollStatus, 2000);
+  if (S.pollTimer) clearTimeout(S.pollTimer);
+  function next() {
+    S.pollTimer = setTimeout(async () => {
+      await pollStatus();
+      next(); // Always schedule next, like setInterval
+    }, 2000);
+  }
+  next();
 }
 
 function stopPolling() {
-  if (S.pollTimer) { clearInterval(S.pollTimer); S.pollTimer = null; }
+  if (S.pollTimer) { clearTimeout(S.pollTimer); S.pollTimer = null; }
 }
 
 async function pollStatus() {
@@ -408,14 +441,30 @@ async function pollStatus() {
       }
     } else if (st === "processing") {
       setStatus(`生成中 (${stage || "处理中"})`, "busy");
-      hideSatisfaction();
-      S._satisfactionKey = "";
+      // Only hide satisfaction if we're genuinely past it (keyguard protects active prompts)
+      if (!S._satisfactionKey) {
+        hideSatisfaction();
+      }
       _clarifyMsgShown = false;
       // Load partial content preview during document generation
       if (stage === "document") {
         const content = await fetchText(`/result/${encodeURIComponent(S.taskId)}/content.md`);
         if (content && content.trim()) {
           S._content = content;
+          // Auto-switch to content tab once when streaming sections begin
+          if (!S._contentStreaming && content.includes("（生成中…）")) {
+            S._contentStreaming = true;
+            if (S.previewTab !== "content") {
+              S.previewTab = "content";
+              const container = $("previewTabs");
+              container.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+              const activeTab = container.querySelector('[data-tab="content"]');
+              if (activeTab) activeTab.classList.add("active");
+              $("compareBox").style.display = "none";
+              $("compareToolbar").style.display = "none";
+              $("previewBox").style.display = "";
+            }
+          }
           showPreview();
         }
       }
@@ -429,6 +478,7 @@ async function pollStatus() {
       hideSatisfaction();
       S._satisfactionKey = "";
       _clarifyMsgShown = false;
+      S._contentStreaming = false;
       stopPolling();
       // Load preview
       const outline = await fetchText(`/result/${encodeURIComponent(S.taskId)}/outline.md`);
@@ -439,15 +489,35 @@ async function pollStatus() {
       // Load versions
       await loadVersions("outline");
       await loadVersions("content");
-      // Show version bar and compare tab if multiple versions exist
+      // Show version bar for current tab and compare tab if any type has ≥2 versions
       const ov = S._versions.outline || [];
       const cv = S._versions.content || [];
-      if (ov.length > 1) { showVersionTags("outline"); $("tabCompare").style.display = ""; }
-      if (cv.length > 1) { showVersionTags("content"); $("tabCompare").style.display = ""; }
+      if (ov.length > 1 || cv.length > 1) {
+        $("tabCompare").style.display = "";
+      }
+      // Show version tags for the currently active preview tab
+      showVersionTags(S.previewTab === "compare" ? (ov.length > 1 ? "outline" : "content") : S.previewTab);
+      // Eval metrics bar (from generate_document pipeline)
+      if (data.eval_metrics && typeof data.eval_metrics === "object") {
+        renderEvalMetricsBar(data.eval_metrics);
+      }
       // Eval results
       if (data.eval && typeof data.eval === "object") {
         S._evalData = data.eval;
         renderEval();
+      }
+      // Chat notification on completion
+      if (S._lastOperation) {
+        const opMessages = {
+          generate: "报告已生成完成，请查看下方预览。",
+          regen_section: "章节已重新生成，请查看下方预览。",
+          edit_section: "章节已根据编辑内容重写完成，请查看下方预览。",
+          regenerate: "报告已重新生成，请查看下方预览。",
+          redo_version: "报告已基于选定版本重新生成，请查看下方预览。",
+        };
+        const notifMsg = opMessages[S._lastOperation];
+        if (notifMsg) { addMsg("assistant", notifMsg); S.history.push({ role: "assistant", content: notifMsg }); }
+        S._lastOperation = "";
       }
       S.generating = false;
       $("btnUpload").disabled = false;
@@ -457,6 +527,7 @@ async function pollStatus() {
       setStatus("失败", "err");
       hideSatisfaction();
       S._satisfactionKey = "";
+      S._contentStreaming = false;
       stopPolling();
       toast("生成失败: " + (data.error || msg || "未知"), "err");
       S.generating = false;
@@ -467,6 +538,7 @@ async function pollStatus() {
       setStatus("已取消", "ok");
       hideSatisfaction();
       S._satisfactionKey = "";
+      S._contentStreaming = false;
       stopPolling();
       S.generating = false;
       $("btnUpload").disabled = false;
@@ -504,12 +576,241 @@ async function fetchText(url) {
 }
 
 function showPreview() {
+  // Cancel any active section edit
+  if (S._editingSection) cancelSectionEdit();
   const tab = S.previewTab;
   const raw = tab === "outline" ? (S._outline || "（大纲尚未生成）") : (S._content || "（正文尚未生成）");
   $("previewBox").innerHTML = renderMD(raw);
+  attachSectionActions(tab);
   // Show/hide full-screen button when content exists
   const btn = $("btnFullPreview");
   if (btn) btn.style.display = (S._content && S._content.trim()) ? "" : "none";
+}
+
+/* ── Section-level interactive editing ────────────────────────────────── */
+
+function extractSectionBody(md, headingText) {
+  const lines = (md || "").split("\n");
+  const blocks = [];
+  let cur = null;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (m) {
+      if (cur) { cur.endIdx = i; blocks.push(cur); }
+      cur = { heading: m[2].trim(), level: m[1].length, startIdx: i, endIdx: lines.length };
+    }
+  }
+  if (cur) blocks.push(cur);
+
+  let idx = blocks.findIndex(b => b.heading === headingText);
+  if (idx < 0) {
+    idx = blocks.findIndex(b => b.heading.includes(headingText) || headingText.includes(b.heading));
+  }
+  if (idx < 0) return "";
+
+  const target = blocks[idx];
+  let end = target.endIdx;
+  for (let j = idx + 1; j < blocks.length; j++) {
+    if (blocks[j].level <= target.level) { end = blocks[j].startIdx; break; }
+  }
+  return lines.slice(target.startIdx + 1, end).join("\n").trim();
+}
+
+function attachSectionActions(tabType) {
+  const box = $("previewBox");
+  const headings = box.querySelectorAll("h2, h3");
+  headings.forEach(h => {
+    // Remove existing action buttons (in case of re-render)
+    const existing = h.querySelector(".sect-actions");
+    if (existing) existing.remove();
+
+    const headingText = h.textContent.trim();
+    const wrap = document.createElement("span");
+    wrap.className = "sect-actions";
+    wrap.style.cssText = "margin-left:8px;display:inline-flex;gap:4px;vertical-align:middle";
+
+    // Regenerate button (both tabs)
+    const regenBtn = document.createElement("button");
+    regenBtn.className = "btn btn-sm sect-regen-btn";
+    regenBtn.textContent = "重生成";
+    regenBtn.title = "重新生成此章节";
+    regenBtn.onclick = (e) => { e.stopPropagation(); regenSection(headingText); };
+    wrap.appendChild(regenBtn);
+
+    // Edit button (content tab only)
+    if (tabType === "content") {
+      const editBtn = document.createElement("button");
+      editBtn.className = "btn btn-sm sect-edit-btn";
+      editBtn.textContent = "编辑";
+      editBtn.title = "编辑此章节内容";
+      editBtn.onclick = (e) => { e.stopPropagation(); startSectionEdit(h, headingText); };
+      wrap.appendChild(editBtn);
+    }
+
+    h.appendChild(wrap);
+  });
+}
+
+const REGEN_OPTIONS = ["更详细", "更简短", "换种结构", "增加数据", "优化表达", "换个角度"];
+
+function regenSection(headingText) {
+  if (!S.taskId) { toast("请先生成或加载一个任务", "err"); return; }
+  if (S.generating) { toast("任务正在进行中，请等待完成", "info", 2000); return; }
+
+  S.generating = true;
+  $("btnUpload").disabled = true;
+  $("btnAppend").disabled = true;
+
+  // Cancel any active edit
+  if (S._editingSection) cancelSectionEdit();
+
+  // Show feedback prompt with quick-select chips
+  const safeHeading = headingText.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const chipsHTML = REGEN_OPTIONS.map(opt =>
+    `<span class="feedback-chip regen-chip" data-opt="${esc(opt)}">${esc(opt)}</span>`
+  ).join("");
+
+  const html = `<div id="regenFeedbackBubble">
+    <p>您希望在「<b>${safeHeading}</b>」章节进行哪些方面的更改？</p>
+    <p style="font-size:12px;color:var(--c-text2);margin:4px 0">可点选快捷选项（可多选），也可直接输入修改意见：</p>
+    <div class="feedback-chips">${chipsHTML}</div>
+    <p style="font-size:11px;color:var(--c-text3);margin-top:6px">输入意见后按回车发送，或输入"跳过"直接重生成。</p>
+  </div>`;
+
+  const msg = addActionMsg(html);
+
+  // Attach chip toggle handlers
+  msg.querySelectorAll(".regen-chip").forEach(chip => {
+    chip.addEventListener("click", function () { this.classList.toggle("active"); });
+  });
+
+  S._waitingRegenFeedback = { heading: headingText, msg: msg };
+}
+
+function startSectionEdit(headingEl, headingText) {
+  // Cancel any previous edit
+  if (S._editingSection) cancelSectionEdit();
+
+  const raw = S._content || "";
+  const body = extractSectionBody(raw, headingText);
+  if (!body && !raw) {
+    toast("无法提取章节内容", "err");
+    return;
+  }
+
+  const hLevel = parseInt(headingEl.tagName.charAt(1));
+  const toHide = [];
+  let el = headingEl.nextElementSibling;
+  while (el) {
+    const tagMatch = el.tagName && el.tagName.match(/^H([1-6])$/);
+    if (tagMatch) {
+      if (parseInt(tagMatch[1]) <= hLevel) break;
+    }
+    // Don't hide action buttons or edit wrappers
+    if (!el.classList.contains("sect-actions") && !el.classList.contains("section-edit-wrap")) {
+      toHide.push(el);
+    }
+    el = el.nextElementSibling;
+  }
+  toHide.forEach(e => { e._prevDisplay = e.style.display; e.style.display = "none"; });
+
+  const editDiv = document.createElement("div");
+  editDiv.className = "section-edit-wrap";
+  editDiv.innerHTML = `
+    <textarea class="section-edit-textarea" rows="12">${esc(body)}</textarea>
+    <div class="section-edit-actions">
+      <button class="btn btn-primary btn-sm sect-save-btn">保存并重写</button>
+      <button class="btn btn-outline btn-sm sect-save-direct-btn">直接保存</button>
+      <button class="btn btn-outline btn-sm sect-cancel-btn">取消</button>
+      <span class="sect-edit-hint">「保存并重写」由 AI 润色后写入；「直接保存」原样写入不经过 AI</span>
+    </div>
+  `;
+  headingEl.insertAdjacentElement("afterend", editDiv);
+
+  S._editingSection = { headingEl, toHide, editDiv, headingText };
+  editDiv.querySelector(".sect-cancel-btn").onclick = () => cancelSectionEdit();
+  editDiv.querySelector(".sect-save-btn").onclick = () => submitSectionEdit(headingText, editDiv.querySelector("textarea"));
+  editDiv.querySelector(".sect-save-direct-btn").onclick = () => saveSectionDirect(headingText, editDiv.querySelector("textarea"));
+
+  // Scroll to edit area
+  editDiv.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function cancelSectionEdit() {
+  if (!S._editingSection) return;
+  const s = S._editingSection;
+  s.toHide.forEach(e => { e.style.display = e._prevDisplay || ""; });
+  if (s.editDiv && s.editDiv.parentNode) s.editDiv.remove();
+  S._editingSection = null;
+}
+
+async function submitSectionEdit(headingText, textarea) {
+  const edited = textarea.value.trim();
+  if (!edited) { toast("编辑内容不能为空", "err"); return; }
+  if (!S.taskId) { toast("请先生成或加载一个任务", "err"); return; }
+
+  S.generating = true;
+  S._lastOperation = "edit_section";
+  $("btnUpload").disabled = true;
+  $("btnAppend").disabled = true;
+  setStatus(`重写章节「${headingText}」…`, "busy");
+
+  // Clean up edit UI
+  cancelSectionEdit();
+
+  try {
+    const data = await apiPost("/api/section/edit", {
+      task_id: S.taskId,
+      section_name: headingText,
+      edited_content: edited,
+    });
+    toast(data.message || "已启动编辑重写", "ok", 3000);
+    $("previewBox").textContent = "";
+    startPolling();
+  } catch (e) {
+    setStatus(e.message, "err");
+    toast("编辑重写失败: " + e.message, "err");
+    S.generating = false;
+    $("btnUpload").disabled = false;
+    $("btnAppend").disabled = false;
+  }
+}
+
+async function saveSectionDirect(headingText, textarea) {
+  const edited = textarea.value.trim();
+  if (!edited) { toast("编辑内容不能为空", "err"); return; }
+  if (!S.taskId) { toast("请先生成或加载一个任务", "err"); return; }
+
+  setStatus("直接保存中…", "busy");
+
+  // Clean up edit UI immediately
+  cancelSectionEdit();
+
+  try {
+    const data = await apiPost("/api/section/save", {
+      task_id: S.taskId,
+      section_name: headingText,
+      edited_content: edited,
+    });
+    if (data && data.ok) {
+      toast(data.message || "已保存", "ok", 3000);
+      // Reload content from disk
+      const content = await fetchText(`/result/${encodeURIComponent(S.taskId)}/content.md`);
+      if (content && content.trim()) {
+        S._content = content;
+        showPreview();
+      }
+      const notifMsg = "章节已直接保存，请查看下方预览。";
+      addMsg("assistant", notifMsg);
+      S.history.push({ role: "assistant", content: notifMsg });
+    } else {
+      toast(data.message || "保存失败", "err");
+    }
+    setStatus("已完成", "ok");
+  } catch (e) {
+    setStatus(e.message, "err");
+    toast("直接保存失败: " + e.message, "err");
+  }
 }
 
 function openFullPreview() {
@@ -581,6 +882,57 @@ function renderEvalPanel(scores) {
   return html;
 }
 
+function renderEvalMetricsBar(metrics) {
+  if (!metrics) return;
+  const bar = $("evalMetricsBar");
+  bar.style.display = "flex";
+
+  // Warn count
+  const warns = metrics.warns !== undefined ? metrics.warns :
+    (metrics.facts_total || 0) - (metrics.facts_verified || 0);
+  const warnBadge = $("evalWarns");
+  if (warns > 0) {
+    warnBadge.style.background = "#fef2f2"; warnBadge.style.color = "#dc2626";
+    warnBadge.textContent = `⚠️ ${warns} 条警告`;
+  } else {
+    warnBadge.style.background = "#f0fdf4"; warnBadge.style.color = "#16a34a";
+    warnBadge.textContent = "✅ 无警告";
+  }
+
+  // FActScore
+  const fs = metrics.factscore;
+  const fsBadge = $("evalFActScore");
+  if (fs != null && fs !== undefined) {
+    const pct = Math.round(fs * 100);
+    fsBadge.style.background = pct >= 70 ? "#f0fdf4" : pct >= 40 ? "#fffbeb" : "#fef2f2";
+    fsBadge.style.color = pct >= 70 ? "#16a34a" : pct >= 40 ? "#b45309" : "#dc2626";
+    fsBadge.textContent = `FAct: ${pct}%`;
+  } else {
+    fsBadge.textContent = "";
+  }
+
+  // Coverage
+  const cov = metrics.coverage;
+  const covBadge = $("evalCoverage");
+  if (cov != null && cov !== undefined) {
+    const pct = Math.round(cov * 100);
+    covBadge.style.background = pct >= 70 ? "#f0fdf4" : pct >= 40 ? "#fffbeb" : "#fef2f2";
+    covBadge.style.color = pct >= 70 ? "#16a34a" : pct >= 40 ? "#b45309" : "#dc2626";
+    covBadge.textContent = `覆盖: ${pct}%`;
+  } else {
+    covBadge.textContent = "";
+  }
+
+  // Citation estimate (from citation verification results if available)
+  const citeBadge = $("evalCiteAcc");
+  if (metrics.facts_verified != null && metrics.facts_total != null && metrics.facts_total > 0) {
+    citeBadge.style.background = "#f0fdf4"; citeBadge.style.color = "#16a34a";
+    citeBadge.textContent = `${metrics.facts_verified}/${metrics.facts_total} 事实已验证`;
+  } else {
+    citeBadge.textContent = "";
+  }
+}
+
 function renderEval() {
   const data = S._evalData;
   if (!data) {
@@ -625,6 +977,8 @@ function renderEval() {
 function setDownloads(data) {
   const list = $("downloadList");
   list.innerHTML = "";
+  let docxUrl = "";
+  let pdfUrl = "";
   for (const f of (data && data.files) || []) {
     const li = document.createElement("li");
     const a = document.createElement("a");
@@ -633,8 +987,23 @@ function setDownloads(data) {
     a.target = "_blank";
     li.appendChild(a);
     list.appendChild(li);
+    // Track first DOCX and PDF for download buttons
+    if (!docxUrl && /\.docx$/i.test(f.name)) docxUrl = f.url;
+    if (!pdfUrl && /\.pdf$/i.test(f.name)) pdfUrl = f.url;
   }
   if (!list.children.length) list.innerHTML = "<li style='color:var(--c-text3);font-size:12px'>暂无输出文件</li>";
+
+  // Update prominent download buttons
+  const btnDocx = $("btnDownloadDocx");
+  const btnPdf = $("btnDownloadPdf");
+  if (btnDocx) {
+    if (docxUrl) { btnDocx.href = docxUrl; btnDocx.style.display = ""; }
+    else btnDocx.style.display = "none";
+  }
+  if (btnPdf) {
+    if (pdfUrl) { btnPdf.href = pdfUrl; btnPdf.style.display = ""; }
+    else btnPdf.style.display = "none";
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -700,70 +1069,242 @@ let _satisfactionChatMsg = null;  // track the satisfaction message element
 function showSatisfactionInChat(stage, previewText, versionNum) {
   const key = stage + "_v" + (versionNum || 1);
   if (S._satisfactionKey === key) return;
-  S._satisfactionKey = key;
+  S._satisfactionSubmitting = false;
   S._feedbackStage = stage;
   S._waitingFeedback = false;
+  S._lastSatisfactionStage = stage;
+  S._lastSatisfactionPreview = previewText;
+  S._lastSatisfactionVersion = versionNum;
 
   const label = stage === "outline" ? "大纲" : "报告正文";
   const ver = versionNum || 1;
 
   // Show preview in right panel
-  const previewCard = $("satisfactionPreviewCard");
   const previewTitle = $("satisfactionPreviewTitle");
   const previewContent = $("satisfactionPreviewContent");
   previewTitle.textContent = `📝 ${label}已生成 — V${ver}`;
   const text = previewText || (stage === "outline" ? (S._outline || "") : (S._content || ""));
   previewContent.innerHTML = text ? renderMD(text) : "<p style='color:var(--c-text3)'>（内容加载中…）</p>";
-  previewCard.style.display = "";
 
-  // Add chat message with action buttons
-  _satisfactionChatMsg = addActionMsg(
-    `<p>📝 <strong>${label}已生成 — V${ver}</strong></p><p>请查看下方预览区的内容，然后选择：</p>`,
-    [
-      {
-        text: "满意，继续", cls: "btn btn-primary btn-sm",
-        onClick: function () {
-          const row = this.parentElement;
-          row.querySelectorAll("button").forEach(b => b.disabled = true);
-          $("satisfactionPreviewCard").style.display = "none";
-          submitSatisfactionChat(true, stage, "");
-        }
-      },
-      {
-        text: "不满意，重新生成", cls: "btn btn-outline btn-sm",
-        onClick: function () {
-          const row = this.parentElement;
-          row.querySelectorAll("button").forEach(b => b.disabled = true);
-          $("satisfactionPreviewCard").style.display = "none";
-          S._waitingFeedback = true;
-          S._feedbackStage = stage;
-          addActionMsg(
-            `<p>请描述<strong>为什么不满意</strong>以及<strong>新的要求</strong>。</p><p style="font-size:11px;color:var(--c-text3)">在聊天框输入反馈内容后发送。` +
-            (stage === "content" ? "<br>如需从大纲重来，请说明" : "") +
-            `</p>`
-          );
-        }
-      },
-    ]
-  );
+  // Clean up old UI before building new one
+  hideSatisfaction();
+
+  // Build buttons
+  _satisfactionChatMsg = _renderSatisfactionButtons(label, stage, ver);
+  // Set guard AFTER everything is built — prevents duplicate on next poll
+  S._satisfactionKey = key;
+}
+
+function _renderSatisfactionButtons(label, stage, ver) {
+  // Remove old DOM only (don't touch state flags — caller manages _satisfactionKey)
+  if (_satisfactionChatMsg && _satisfactionChatMsg.parentNode) {
+    _satisfactionChatMsg.remove();
+  }
+  document.querySelectorAll('[id^="satisfactionBubble_"]').forEach(el => {
+    const wrap = el.closest(".msg");
+    if (wrap) wrap.remove(); else el.remove();
+  });
+  _satisfactionChatMsg = null;
+
+  const bubbleId = "satisfactionBubble_" + stage;
+  const html = `<div id="${bubbleId}">
+    <p>📝 <strong>${label}已生成 — V${ver}</strong></p>
+    <p>请查看下方预览区的内容，然后选择：</p>
+    <div class="satisf-action-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+      <button class="btn btn-primary btn-sm satisf-satisfied-btn">满意，继续</button>
+      <button class="btn btn-outline btn-sm satisf-unsatisfied-btn">不满意，重新生成</button>
+    </div>
+  </div>`;
+
+  const msg = addActionMsg(html);
+
+  // Find buttons within the newly created wrapper (avoids global getElementById pollution)
+  const satisfiedBtn = msg.querySelector(".satisf-satisfied-btn");
+  const unsatisfiedBtn = msg.querySelector(".satisf-unsatisfied-btn");
+  if (satisfiedBtn) {
+    satisfiedBtn.addEventListener("click", function () {
+      if (S._satisfactionSubmitting) return; // prevent double-submit
+      S._satisfactionSubmitting = true;
+      satisfiedBtn.disabled = true;
+      if (unsatisfiedBtn) unsatisfiedBtn.disabled = true;
+      $("satisfactionPreviewCard").style.display = "none";
+      submitSatisfactionChat(true, stage, "");
+    });
+  }
+  if (unsatisfiedBtn) {
+    unsatisfiedBtn.addEventListener("click", function () {
+      if (S._satisfactionSubmitting) return;
+      S._satisfactionSubmitting = true;
+      satisfiedBtn.disabled = true;
+      unsatisfiedBtn.disabled = true;
+      var previewCard = $("satisfactionPreviewCard");
+      if (previewCard) previewCard.style.display = "none";
+      S._waitingFeedback = true;
+      S._feedbackStage = stage;
+      _showFeedbackChipsInPlace(stage);
+    });
+  }
+
+  // Show preview card
+  $("satisfactionPreviewCard").style.display = "";
+
+  return msg;
+}
+
+/* ── Inline feedback chips (replaces buttons inside satisfaction message) ─ */
+
+let _feedbackChips = new Set();
+
+const FEEDBACK_OPTIONS = [
+  "结构不合理", "数据太少/缺失", "语言太官方/生硬",
+  "内容偏题/不相关", "篇幅不合适", "逻辑不连贯",
+];
+
+function _showFeedbackChipsInPlace(stage) {
+  const label = stage === "outline" ? "大纲" : "报告正文";
+  _feedbackChips = new Set();
+  _selectedScope = "content_only";
+
+  // Find the bubble from the latest satisfaction message wrapper; fall back to global lookup
+  var bubble = _satisfactionChatMsg ? _satisfactionChatMsg.querySelector("#satisfactionBubble_" + stage) : null;
+  if (!bubble) bubble = document.getElementById("satisfactionBubble_" + stage);
+  if (!bubble) return;
+
+  const chipsHTML = FEEDBACK_OPTIONS.map(opt =>
+    `<span class="feedback-chip" data-opt="${esc(opt)}">${esc(opt)}</span>`
+  ).join("");
+
+  let html = `<p>📋 <strong>对 ${label} 不满意</strong></p>`;
+  html += `<p style="font-size:12px;margin:4px 0">请选择不满意的原因（可多选）：</p>`;
+  html += `<div class="feedback-chips">${chipsHTML}</div>`;
+  if (stage === "content") {
+    html += `<p style="font-size:12px;margin:8px 0 4px">重新生成范围：</p>`;
+    html += `<div class="feedback-chips">`;
+    html += `<span class="feedback-chip feedback-chip-scope active" data-scope="content_only">仅重做正文</span>`;
+    html += `<span class="feedback-chip feedback-chip-scope" data-scope="outline">从大纲重来</span>`;
+    html += `</div>`;
+  }
+  html += `<p style="font-size:11px;color:var(--c-text3);margin-top:6px">也可以在聊天框输入具体改进意见后按回车发送。</p>`;
+  html += `<div class="satisf-action-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+    <button class="btn btn-primary btn-sm satisf-submit-fb-btn">提交反馈，重新生成</button>
+    <button class="btn btn-outline btn-sm satisf-skip-fb-btn">跳过，直接重做</button>
+    <button class="btn btn-sm satisf-back-fb-btn">返回</button>
+  </div>`;
+
+  bubble.innerHTML = html;
+
+  // Attach click handlers to chips (within bubble only)
+  bubble.querySelectorAll(".feedback-chip:not(.feedback-chip-scope)").forEach(chip => {
+    chip.addEventListener("click", function () {
+      this.classList.toggle("active");
+      if (this.classList.contains("active")) {
+        _feedbackChips.add(this.dataset.opt);
+      } else {
+        _feedbackChips.delete(this.dataset.opt);
+      }
+    });
+  });
+
+  // Scope chips
+  bubble.querySelectorAll(".feedback-chip-scope").forEach(chip => {
+    chip.addEventListener("click", function () {
+      const row = this.parentElement;
+      row.querySelectorAll(".feedback-chip-scope").forEach(c => c.classList.remove("active"));
+      this.classList.add("active");
+      _selectedScope = this.dataset.scope;
+    });
+  });
+
+  // Submit button
+  const submitBtn = bubble.querySelector(".satisf-submit-fb-btn");
+  if (submitBtn) {
+    submitBtn.addEventListener("click", function () {
+      if (S._satisfactionSubmitting) return;
+      S._satisfactionSubmitting = true;
+      const activeChips = bubble.querySelectorAll(".feedback-chip.active:not(.feedback-chip-scope)");
+      const checkedOpts = Array.from(activeChips).map(c => c.dataset.opt).filter(Boolean);
+      const chatText = $("chatInput").value.trim();
+      $("chatInput").value = "";
+      const parts = [...checkedOpts];
+      if (chatText) parts.push(chatText);
+      const fb = parts.join("；");
+      S._waitingFeedback = false;
+      submitSatisfactionChat(false, stage, fb);
+    });
+  }
+
+  // Skip button
+  const skipBtn = bubble.querySelector(".satisf-skip-fb-btn");
+  if (skipBtn) {
+    skipBtn.addEventListener("click", function () {
+      if (S._satisfactionSubmitting) return;
+      S._satisfactionSubmitting = true;
+      S._waitingFeedback = false;
+      submitSatisfactionChat(false, stage, "");
+    });
+  }
+
+  // Back button — re-render satisfaction buttons without guard reset
+  const backBtn = bubble.querySelector(".satisf-back-fb-btn");
+  if (backBtn) {
+    backBtn.addEventListener("click", function () {
+      S._waitingFeedback = false;
+      $("satisfactionPreviewCard").style.display = "";
+      // Re-render buttons (guard still active from original showSatisfactionInChat call)
+      _satisfactionChatMsg = _renderSatisfactionButtons(label, stage, S._lastSatisfactionVersion || 1);
+    });
+  }
 }
 
 function hideSatisfaction() {
   $("satisfactionPreviewCard").style.display = "none";
+  S._satisfactionSubmitting = false;
   S._feedbackStage = "";
   S._waitingFeedback = false;
+  // Remove stale DOM nodes to prevent duplicate IDs
+  if (_satisfactionChatMsg && _satisfactionChatMsg.parentNode) {
+    _satisfactionChatMsg.remove();
+  }
+  document.querySelectorAll('[id^="satisfactionBubble_"]').forEach(el => {
+    const wrap = el.closest(".msg");
+    if (wrap) wrap.remove(); else el.remove();
+  });
   _satisfactionChatMsg = null;
-  // NOTE: _satisfactionKey is NOT cleared here — it persists so that
-  // pollStatus won't re-trigger showSatisfactionInChat for the same version.
+  _feedbackChips = new Set();
 }
+
+function toggleFeedbackChip(el) {
+  // Kept for backwards compatibility with any inline onclick handlers
+  el.classList.toggle("active");
+  if (el.classList.contains("active")) {
+    _feedbackChips.add(el.dataset.opt);
+  } else {
+    _feedbackChips.delete(el.dataset.opt);
+  }
+}
+
+function toggleScopeChip(el) {
+  const row = el.parentElement;
+  row.querySelectorAll(".feedback-chip-scope").forEach(c => c.classList.remove("active"));
+  el.classList.add("active");
+  _selectedScope = el.dataset.scope;
+}
+
+let _selectedScope = "content_only";
 
 async function submitSatisfactionChat(satisfied, stage, feedback) {
   const fb = (feedback || "").trim();
   let scope = stage === "outline" ? "outline" : "content_only";
-  // Detect scope from feedback keywords
-  if (!satisfied && fb && stage === "content") {
-    if (/从大纲|全部重|重新开始|重头/.test(fb)) scope = "outline";
+  // Use structured scope selection if available
+  if (!satisfied && stage === "content") {
+    if (_selectedScope === "outline") {
+      scope = "outline";
+    } else if (/从大纲|全部重|重新开始|重头/.test(fb)) {
+      scope = "outline";
+    }
   }
+  // Reset structured feedback state
+  _selectedScope = "content_only";
 
   // Save version before regenerating
   if (!satisfied && fb) {
@@ -798,6 +1339,7 @@ async function submitSatisfactionChat(satisfied, stage, feedback) {
     } else {
       setStatus("已提交反馈，重新生成中…", "busy");
       S._outlineDone = false;
+      S._lastOperation = "regenerate";
       $("previewBox").textContent = "";
       S._compareData = null;
       startPolling();
@@ -845,9 +1387,59 @@ function showVersionTags(type) {
     tag.className = "version-tag";
     if (v.selected) tag.classList.add("selected");
     if (S._selectedVersion[type] === vn) tag.classList.add("active");
-    tag.textContent = `V${vn}`;
-    tag.title = v.feedback ? `反馈: ${v.feedback}` : `版本 ${vn}`;
-    tag.onclick = () => switchVersion(type, vn);
+    const fbShort = (v.feedback || "").slice(0, 30);
+    tag.title = v.feedback ? `反馈: ${v.feedback}` : `版本 ${vn}` + (v.selected ? " (已选中)" : "");
+
+    // Version number (click to preview)
+    const vLabel = document.createElement("span");
+    vLabel.textContent = `V${vn}`;
+    vLabel.style.cursor = "pointer";
+    vLabel.onclick = () => {
+      switchVersion(type, vn);
+      if (S.previewTab === "compare") {
+        const selRight = $("compareVerRight");
+        if (selRight && vn) {
+          const options = Array.from(selRight.options).map(o => parseInt(o.value));
+          if (options.includes(vn)) {
+            selRight.value = vn;
+            S._cachedDiff = null;
+            refreshBothCompareSides();
+          }
+        }
+      } else {
+        showPreview();
+      }
+    };
+    tag.appendChild(vLabel);
+
+    // Delete button (×) — only if more than 1 version exists
+    if (versions.length > 1) {
+      const delBtn = document.createElement("span");
+      delBtn.className = "version-del-btn";
+      delBtn.textContent = "×";
+      delBtn.title = "删除此版本";
+      delBtn.onclick = async (e) => {
+        e.stopPropagation();
+        if (!confirm(`确定要删除 V${vn} 吗？此操作不可撤销。`)) return;
+        try {
+          const data = await apiPost("/api/versions/delete", {
+            task_id: S.taskId, type: type, version: vn,
+          });
+          if (data && data.ok) {
+            toast(`已删除 V${vn}`, "ok", 2000);
+            await loadVersions(type);
+            showVersionTags(type);
+            showPreview();
+          } else {
+            toast(data.message || "删除失败", "err");
+          }
+        } catch (e) {
+          toast("删除失败: " + e.message, "err");
+        }
+      };
+      tag.appendChild(delBtn);
+    }
+
     tags.appendChild(tag);
   }
 }
@@ -866,37 +1458,382 @@ function switchVersion(type, versionNum) {
     S._content = found.content;
   }
 
-  if (S.previewTab === type || (type === "outline" && S.previewTab === "compare")) {
+  if (S.previewTab === type) {
     showPreview();
+  } else if (S.previewTab === "compare") {
+    updateCompareFromSelection(type);
   }
 }
 
-function showCompare() {
-  const tab = $("tabCompare");
-  tab.style.display = "";
+/* ── Cross-version comparison ─────────────────────────────────────────── */
 
-  // Determine what to compare
-  const versions = S._versions[S.previewTab === "outline" ? "outline" : "content"] || [];
-  if (versions.length < 2) {
-    toast("至少需要 2 个版本才能对比", "info", 3000);
+function populateCompareSelectors() {
+  const type = (S.previewTab === "outline" || S.previewTab === "compare_outline") ? "outline" : "content";
+  const versions = S._versions[type] || [];
+  const selLeft = $("compareVerLeft");
+  const selRight = $("compareVerRight");
+
+  if (!selLeft || !selRight) return;
+
+  selLeft.innerHTML = "";
+  selRight.innerHTML = "";
+
+  for (const v of versions) {
+    const vn = v.version || 1;
+    const fbShort = (v.feedback || "").slice(0, 25);
+    const label = fbShort ? `V${vn} — ${fbShort}` : `V${vn}`;
+    const optL = document.createElement("option");
+    optL.value = vn;
+    optL.textContent = label;
+    selLeft.appendChild(optL);
+    const optR = document.createElement("option");
+    optR.value = vn;
+    optR.textContent = label;
+    selRight.appendChild(optR);
+  }
+
+  if (versions.length >= 2) {
+    selLeft.value = versions[versions.length - 2].version;
+    selRight.value = versions[versions.length - 1].version;
+    $("diffStats").textContent = "";
+  } else if (versions.length === 1) {
+    selLeft.value = versions[0].version;
+    selRight.value = versions[0].version;
+    $("diffStats").textContent = "（该类型仅有 1 个版本，无法对比差异）";
+  } else {
+    $("diffStats").textContent = "（该类型暂无版本）";
+  }
+}
+
+/* ── Line diff algorithm (LCS-based) ─────────────────────────────────── */
+
+function computeLineDiff(oldText, newText) {
+  const oldLines = (oldText || "").split("\n");
+  const newLines = (newText || "").split("\n");
+  const MAX = 400;
+  if (oldLines.length > MAX || newLines.length > MAX) {
+    // Fallback: simple line-by-line comparison within bounds
+    const minLen = Math.min(oldLines.length, newLines.length);
+    const result = { old: [], new: [] };
+    for (let i = 0; i < Math.max(oldLines.length, newLines.length); i++) {
+      if (i < minLen && oldLines[i] === newLines[i]) {
+        result.old.push({ type: "same", text: oldLines[i] });
+        result.new.push({ type: "same", text: newLines[i] });
+      } else {
+        if (i < oldLines.length) result.old.push({ type: "removed", text: oldLines[i] });
+        if (i < newLines.length) result.new.push({ type: "added", text: newLines[i] });
+      }
+    }
+    return result;
+  }
+
+  const m = oldLines.length, n = newLines.length;
+  // LCS DP with typed array for speed
+  const dp = new Uint16Array((m + 1) * (n + 1));
+  const idx = (i, j) => i * (n + 1) + j;
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (oldLines[i - 1] === newLines[j - 1]) {
+        dp[idx(i, j)] = dp[idx(i - 1, j - 1)] + 1;
+      } else {
+        dp[idx(i, j)] = Math.max(dp[idx(i - 1, j)], dp[idx(i, j - 1)]);
+      }
+    }
+  }
+
+  // Backtrack
+  const oldResult = [], newResult = [];
+  let i = m, j = n;
+  const stack = [];
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+      stack.push({ type: "same", text: oldLines[i - 1] });
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[idx(i, j - 1)] >= dp[idx(i - 1, j)])) {
+      stack.push({ type: "added", text: newLines[j - 1] });
+      j--;
+    } else {
+      stack.push({ type: "removed", text: oldLines[i - 1] });
+      i--;
+    }
+  }
+
+  // Build separate old/new line arrays by replaying the diff
+  for (const item of stack.reverse()) {
+    if (item.type === "same") {
+      oldResult.push({ type: "same", text: item.text });
+      newResult.push({ type: "same", text: item.text });
+    } else if (item.type === "removed") {
+      oldResult.push({ type: "removed", text: item.text });
+      // new: skip (was removed)
+    } else { // added
+      // old: skip
+      newResult.push({ type: "added", text: item.text });
+    }
+  }
+
+  return { old: oldResult, new: newResult };
+}
+
+/* ── Diff-aware markdown rendering ───────────────────────────────────── */
+
+function renderDiffContent(rawText, lineTypes, side) {
+  // Group consecutive lines of same display type, render as markdown blocks
+  const blocks = [];
+  let currentType = null;
+  let currentLines = [];
+
+  for (const dl of lineTypes) {
+    const show = (side === "old")
+      ? (dl.type === "added" ? "skip" : dl.type)   // old side: skip added lines
+      : (dl.type === "removed" ? "skip" : dl.type); // new side: skip removed lines
+
+    if (show === "skip") {
+      if (currentLines.length > 0) {
+        blocks.push({ type: currentType, text: currentLines.join("\n") });
+        currentLines = [];
+      }
+      currentType = null;
+      continue;
+    }
+
+    if (show !== currentType && currentLines.length > 0) {
+      blocks.push({ type: currentType, text: currentLines.join("\n") });
+      currentLines = [];
+    }
+    currentType = show;
+    currentLines.push(dl.text);
+  }
+  if (currentLines.length > 0) {
+    blocks.push({ type: currentType, text: currentLines.join("\n") });
+  }
+
+  // Render blocks with diff styling
+  let html = "";
+  for (const block of blocks) {
+    const rendered = renderMD(block.text);
+    if (block.type === "removed") {
+      html += `<div class="diff-removed">${rendered}</div>`;
+    } else if (block.type === "added") {
+      html += `<div class="diff-added">${rendered}</div>`;
+    } else {
+      html += rendered;
+    }
+  }
+  return html || "<p style='color:var(--c-text3)'>（无内容）</p>";
+}
+
+function updateDiffCache() {
+  // Recompute diff when either side changes
+  const type = getCompareType();
+  const versions = S._versions[type] || [];
+  const lv = parseInt($("compareVerLeft").value) || 1;
+  const rv = parseInt($("compareVerRight").value) || 1;
+  const oldVer = versions.find(v => v.version === lv);
+  const newVer = versions.find(v => v.version === rv);
+  const oldText = oldVer ? (oldVer.content || "") : "";
+  const newText = newVer ? (newVer.content || "") : "";
+
+  if (S._cachedDiff && S._cachedDiff.oldText === oldText && S._cachedDiff.newText === newText) {
+    return S._cachedDiff;
+  }
+
+  const diff = computeLineDiff(oldText, newText);
+  // Count stats
+  let added = 0, removed = 0;
+  for (const d of diff.old) { if (d.type === "removed") removed++; }
+  for (const d of diff.new) { if (d.type === "added") added++; }
+  diff.addedCount = added;
+  diff.removedCount = removed;
+
+  S._cachedDiff = { oldText, newText, diff };
+  return S._cachedDiff;
+}
+
+function onDiffToggle() {
+  S._showDiff = $("showDiff").checked;
+  $("diffStats").style.display = S._showDiff ? "" : "none";
+  S._cachedDiff = null;
+  refreshBothCompareSides();
+}
+
+function getCompareType() {
+  // Use the dropdown selector in the compare toolbar when in compare mode
+  if (S.previewTab === "compare") {
+    const sel = $("compareTypeSelect");
+    if (sel && sel.value) return sel.value;
+    // Fallback to stored source tab
+    return S._compareSourceTab === "outline" ? "outline" : "content";
+  }
+  return S.previewTab === "outline" ? "outline" : "content";
+}
+
+function updateCompareFromSelection(type) {
+  populateCompareSelectors();
+  refreshBothCompareSides();
+}
+
+function showCompare() {
+  // Auto-select type with most versions; prefer the source tab if both have ≥2
+  const ov = S._versions.outline || [];
+  const cv = S._versions.content || [];
+  let bestType = S._compareSourceTab || "outline";
+  if (ov.length > cv.length && ov.length >= 2) bestType = "outline";
+  else if (cv.length > ov.length && cv.length >= 2) bestType = "content";
+  else if (ov.length < 2 && cv.length >= 2) bestType = "content";
+  else if (cv.length < 2 && ov.length >= 2) bestType = "outline";
+
+  // Set the type selector
+  const typeSel = $("compareTypeSelect");
+  if (typeSel) {
+    typeSel.value = bestType;
+    // Show counts in dropdown
+    typeSel.querySelectorAll("option").forEach(opt => {
+      const cnt = opt.value === "outline" ? ov.length : cv.length;
+      opt.textContent = opt.value === "outline" ? `大纲 (${cnt}版)` : `正文 (${cnt}版)`;
+    });
+  }
+
+  const versions = S._versions[bestType] || [];
+  if (versions.length < 1) {
+    toast("暂无版本可对比", "info", 3000);
     return;
   }
 
-  // Get the last two versions
-  const sorted = [...versions].sort((a, b) => (b.version || 0) - (a.version || 0));
-  const newVer = sorted[0];
-  const oldVer = sorted[1];
+  // Show version bar for the current compare type
+  showVersionTags(bestType);
 
-  $("compareOld").innerHTML = renderMD(oldVer.content || "（无内容）");
-  $("compareNew").innerHTML = renderMD(newVer.content || "（无内容）");
+  populateCompareSelectors();
 
-  // Set select buttons
-  $("btnSelectOld").onclick = () => selectVersion(S.previewTab === "outline" ? "outline" : "content", oldVer.version);
-  $("btnSelectNew").onclick = () => selectVersion(S.previewTab === "outline" ? "outline" : "content", newVer.version);
+  // Show diff toolbar
+  $("compareToolbar").style.display = "flex";
+  $("showDiff").checked = S._showDiff;
+  $("showDiff").onchange = onDiffToggle;
+  $("diffStats").style.display = S._showDiff ? "" : "none";
+
+  // Set up change handlers — refresh both sides when either selector changes
+  $("compareVerLeft").onchange = () => refreshBothCompareSides();
+  $("compareVerRight").onchange = () => refreshBothCompareSides();
+
+  // Type selector change: reload versions and re-render compare view
+  if (typeSel) typeSel.onchange = () => { populateCompareSelectors(); refreshBothCompareSides(); showVersionTags(getCompareType()); };
+
+  // Load initial content
+  refreshBothCompareSides();
+
+  // Set up accept/redo buttons
+  $("btnAcceptLeft").onclick = () => acceptVersionFromCompare("left");
+  $("btnAcceptRight").onclick = () => acceptVersionFromCompare("right");
+  $("btnRedoLeft").onclick = () => redoVersionFromCompare("left");
+  $("btnRedoRight").onclick = () => redoVersionFromCompare("right");
 
   // Show compare view
   $("compareBox").style.display = "grid";
   $("previewBox").style.display = "none";
+}
+
+function refreshBothCompareSides() {
+  const type = getCompareType();
+  const versions = S._versions[type] || [];
+  const lv = parseInt($("compareVerLeft").value) || 1;
+  const rv = parseInt($("compareVerRight").value) || 1;
+
+  // Update labels
+  const lVer = versions.find(v => v.version === lv);
+  const rVer = versions.find(v => v.version === rv);
+  const lbl = (v, vn) => v ? `V${vn}${v.feedback ? " — " + v.feedback.slice(0, 30) : ""}` : `V${vn}`;
+  $("compareLabelLeft").textContent = lbl(lVer, lv);
+  $("compareLabelRight").textContent = lbl(rVer, rv);
+
+  // Invalidate diff cache
+  S._cachedDiff = null;
+
+  const oldText = lVer ? (lVer.content || "") : "";
+  const newText = rVer ? (rVer.content || "") : "";
+
+  if (S._showDiff && lv !== rv) {
+    const cached = updateDiffCache();
+    const diff = cached.diff;
+    $("diffStats").textContent = `+${diff.addedCount || 0} 行 −${diff.removedCount || 0} 行`;
+    $("compareOld").innerHTML = renderDiffContent(cached.oldText, diff.old, "old");
+    $("compareNew").innerHTML = renderDiffContent(cached.newText, diff.new, "new");
+  } else {
+    $("diffStats").textContent = lv === rv ? "（同一版本）" : "";
+    $("compareOld").innerHTML = renderMD(oldText || "（无内容）");
+    $("compareNew").innerHTML = renderMD(newText || "（无内容）");
+  }
+}
+
+function acceptVersionFromCompare(side) {
+  const type = getCompareType();
+  const sel = side === "left" ? $("compareVerLeft") : $("compareVerRight");
+  const versionNum = parseInt(sel.value) || 1;
+  selectVersion(type, versionNum);
+}
+
+function redoVersionFromCompare(side) {
+  const type = getCompareType();
+  const sel = side === "left" ? $("compareVerLeft") : $("compareVerRight");
+  const versionNum = parseInt(sel.value) || 1;
+
+  S._waitingRedo = true;
+  S._redoType = type;
+  S._redoBaseVersion = versionNum;
+
+  const label = type === "outline" ? "大纲" : "报告正文";
+  const versions = S._versions[type] || [];
+  const baseVer = versions.find(v => v.version === versionNum);
+  const labelExtra = baseVer && baseVer.feedback ? `（${baseVer.feedback.slice(0, 40)}）` : "";
+
+  addActionMsg(
+    `<p>🔄 <strong>基于 ${label} V${versionNum} 重新生成</strong> ${labelExtra}</p>
+     <p>请输入<strong>改进意见</strong>，例如：请增加数据分析章节、减少技术术语。</p>
+     <p style="font-size:11px;color:var(--c-text3)">在聊天框输入后发送</p>`,
+    [
+      {
+        text: "跳过，直接重做", cls: "btn btn-outline btn-sm",
+        onClick: function() {
+          const row = this.parentElement;
+          row.querySelectorAll("button").forEach(b => b.disabled = true);
+          doRedoVersion(type, versionNum, "");
+        }
+      }
+    ]
+  );
+}
+
+async function doRedoVersion(type, versionNum, feedback) {
+  const fb = (feedback || "").trim();
+  addMsg("assistant", `✅ 基于 ${type === "outline" ? "大纲" : "报告正文"} V${versionNum} 重新生成` + (fb ? `\n\n反馈：${fb}` : ""));
+
+  S._waitingRedo = false;
+
+  try {
+    await apiPost("/api/versions/redo", {
+      task_id: S.taskId,
+      type: type,
+      base_version: versionNum,
+      feedback: fb,
+    });
+    setStatus("重新生成中…", "busy");
+    S._outlineDone = false;
+    S.generating = true;
+    S._lastOperation = "redo_version";
+    $("previewBox").textContent = "";
+    $("compareBox").style.display = "none";
+    $("compareToolbar").style.display = "none";
+    $("previewBox").style.display = "";
+    $("btnUpload").disabled = true;
+    $("btnAppend").disabled = true;
+    S._satisfactionKey = "";
+    startPolling();
+  } catch (e) {
+    toast("重新生成失败: " + e.message, "err");
+    S.generating = false;
+    $("btnUpload").disabled = false;
+    $("btnAppend").disabled = false;
+  }
 }
 
 async function selectVersion(type, versionNum) {
@@ -916,20 +1853,24 @@ async function selectVersion(type, versionNum) {
     showVersionTags(type);
     toast(`已选择 V${versionNum} 作为最终版本`, "ok", 3000);
 
-    // Reload preview
-    if (type === "outline") {
-      const found = versions.find(v => v.version === versionNum);
-      if (found && found.content) {
+    // Reload preview with selected version content
+    const found = versions.find(v => v.version === versionNum);
+    if (found && found.content) {
+      if (type === "outline") {
         S._outline = found.content;
-      }
-    } else {
-      const found = versions.find(v => v.version === versionNum);
-      if (found && found.content) {
+      } else {
         S._content = found.content;
       }
     }
+    S.previewTab = type;
+    // Switch preview tab button
+    const container = $("previewTabs");
+    container.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    const activeTab = container.querySelector(`[data-tab="${type}"]`);
+    if (activeTab) activeTab.classList.add("active");
     showPreview();
     $("compareBox").style.display = "none";
+    $("compareToolbar").style.display = "none";
     $("previewBox").style.display = "";
   } catch (e) {
     toast("选择版本失败: " + e.message, "err");
@@ -980,6 +1921,32 @@ function addMsg(role, text) {
   wrap.appendChild(b);
   log.appendChild(wrap);
   log.scrollTop = log.scrollHeight;
+
+  // Persist to history
+  S.history.push({ role: role, content: text || "" });
+  S._historyDirty = true;
+  _debouncedSyncHistory();
+}
+
+let _syncTimer = null;
+function _debouncedSyncHistory() {
+  if (_syncTimer) clearTimeout(_syncTimer);
+  _syncTimer = setTimeout(_syncHistory, 800);
+}
+
+async function _syncHistory() {
+  _syncTimer = null;
+  if (!S._historyDirty || !S.taskId) return;
+  // Only sync the last unsaved message to avoid re-sending everything
+  const items = S.history;
+  if (!items.length) return;
+  const last = items[items.length - 1];
+  try {
+    await apiPost("/api/chat/history/save", {
+      task_id: S.taskId, role: last.role, content: last.content,
+    });
+    S._historyDirty = false;
+  } catch (e) { /* silently ignore save failures */ }
 }
 
 // Streaming helpers
@@ -1040,12 +2007,71 @@ async function sendChat() {
   $("chatInput").value = "";
   addMsg("user", msg);
 
+  // If waiting for section regen feedback, route to section regen
+  if (S._waitingRegenFeedback) {
+    const info = S._waitingRegenFeedback;
+    S._waitingRegenFeedback = null;
+
+    // Collect checked chips + typed message
+    const activeChips = document.querySelectorAll(".regen-chip.active");
+    const chipTexts = Array.from(activeChips).map(c => c.dataset.opt).filter(Boolean);
+    const parts = [...chipTexts];
+    if (msg && msg !== "跳过") parts.push(msg);
+    const feedback = parts.join("；");
+
+    // Remove the chips bubble
+    if (info.msg && info.msg.parentNode) info.msg.remove();
+
+    S._lastOperation = "regen_section";
+    $("btnSend").disabled = true;
+    setStatus(`重新生成章节「${info.heading}」…`, "busy");
+    $("previewBox").textContent = "";
+
+    const action = { type: "regenerate", scope: "section", section: info.heading, feedback: feedback };
+    S.history.push({ role: "user", content: msg || "（快捷选项：" + chipTexts.join("、") + "）" });
+
+    try {
+      const data = await apiPost("/api/chat", { task_id: S.taskId, message: msg, history: S.history, action: action });
+      if (data && data.reply) {
+        addMsg("assistant", data.reply);
+        S.history.push({ role: "assistant", content: data.reply });
+      }
+      startPolling();
+    } catch (e) {
+      setStatus(e.message, "err");
+      toast("重生成失败: " + e.message, "err");
+      S.generating = false;
+      $("btnUpload").disabled = false;
+      $("btnAppend").disabled = false;
+    }
+    S._sending = false;
+    $("btnSend").disabled = false;
+    return;
+  }
+
   // If waiting for satisfaction feedback, route to satisfaction
   if (S._waitingFeedback) {
     S._waitingFeedback = false;
+    // Collect checked feedback chips + typed message
+    const chips = document.querySelectorAll(".feedback-chip.active:not(.feedback-chip-scope)");
+    const checkedOpts = Array.from(chips).map(c => c.dataset.opt).filter(Boolean);
+    const parts = [...checkedOpts];
+    if (msg) parts.push(msg);
+    const fb = parts.join("；");
     $("btnSend").disabled = true;
     setStatus("提交反馈中…", "busy");
-    await submitSatisfactionChat(false, S._feedbackStage, msg);
+    await submitSatisfactionChat(false, S._feedbackStage, fb);
+    S._sending = false;
+    $("btnSend").disabled = false;
+    return;
+  }
+
+  // If waiting for redo feedback, route to redo
+  if (S._waitingRedo) {
+    S._waitingRedo = false;
+    $("btnSend").disabled = true;
+    setStatus("重新生成中…", "busy");
+    await doRedoVersion(S._redoType, S._redoBaseVersion, msg);
     S._sending = false;
     $("btnSend").disabled = false;
     return;
@@ -1385,10 +2411,335 @@ function renderKbCitations(items) {
    Init
    ═══════════════════════════════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════════════════════════════
+   Template Editor
+   ═══════════════════════════════════════════════════════════════════════ */
+
+async function loadTplList() {
+  try {
+    const data = await apiGet("/api/template/custom/list");
+    const items = Array.isArray(data.templates) ? data.templates : [];
+    // Populate editor dropdown
+    const sel = $("tplEditorSelect");
+    sel.innerHTML = '<option value="">— 新建模板 —</option>';
+    for (const it of items) {
+      const opt = document.createElement("option");
+      opt.value = it.stripped;
+      opt.textContent = `${it.stripped} (${it.variable_count || 0} 变量)`;
+      sel.appendChild(opt);
+    }
+    // Populate quick select
+    const qs = $("tplQuickSelect");
+    qs.innerHTML = '<option value="">— 或选择已保存的模板 —</option>';
+    for (const it of items) {
+      const opt = document.createElement("option");
+      opt.value = it.stripped;
+      opt.textContent = it.stripped;
+      qs.appendChild(opt);
+    }
+  } catch (e) {
+    // Silently ignore — template dir may not exist yet
+  }
+}
+
+async function loadTemplate(name) {
+  if (!name) return;
+  try {
+    const data = await apiGet(`/api/template/custom/${encodeURIComponent(name)}.md`);
+    $("tplEditorName").value = name;
+    $("tplEditorTextarea").value = data.content || "";
+    $("tplEditorSelect").value = name;
+    S._tplEditor.currentName = name;
+    S._tplEditor.content = data.content || "";
+    S._tplEditor.dirty = false;
+    refreshTplPreview();
+    toast("已加载模板: " + name, "ok", 2000);
+  } catch (e) {
+    toast("加载失败: " + e.message, "err");
+  }
+}
+
+async function saveTemplate() {
+  const name = $("tplEditorName").value.trim();
+  if (!name) { toast("请输入模板名称", "info"); return; }
+  const content = $("tplEditorTextarea").value;
+  try {
+    const res = await apiPost("/api/template/custom/save", { name: name, content: content });
+    $("tplEditorSelect").value = name;
+    S._tplEditor.currentName = name;
+    S._tplEditor.content = content;
+    S._tplEditor.dirty = false;
+    toast("已保存: " + res.name, "ok", 2000);
+    loadTplList();
+  } catch (e) {
+    toast("保存失败: " + e.message, "err");
+  }
+}
+
+async function deleteTemplate() {
+  let name = $("tplEditorSelect").value;
+  if (!name) { toast("请选择要删除的模板", "info"); return; }
+  if (!confirm("确定要删除模板「" + name + "」吗？此操作不可撤销。")) return;
+  try {
+    await apiDelete(`/api/template/custom/${encodeURIComponent(name)}.md`);
+    toast("已删除: " + name, "ok", 2000);
+    if (S._tplEditor.currentName === name) newTemplate();
+    loadTplList();
+  } catch (e) {
+    toast("删除失败: " + e.message, "err");
+  }
+}
+
+const TPL_FULL_PRESETS = {
+  blank: {
+    label: "空白模板",
+    content: "# {{title}}\n\n{{document_outline}}\n\n{{document_content}}\n\n---\n任务ID：{{task_id}}",
+  },
+  academic: {
+    label: "学术论文",
+    content: "# {{title}}\n\n## 摘要\n{{摘要}}\n\n## 引言\n{{引言}}\n\n## 研究背景\n{{研究背景}}\n\n## 文献综述\n{{文献综述}}\n\n## 研究目的与意义\n{{研究目的与意义}}\n\n## 研究方法\n{{研究方法}}\n\n## 实验设计与数据采集\n{{实验设计与数据采集}}\n\n## 结果分析\n{{结果分析}}\n\n## 讨论\n{{讨论}}\n\n## 局限性\n{{局限性}}\n\n## 结论\n{{结论}}\n\n## 未来研究方向\n{{未来研究方向}}\n\n---\n任务ID：{{task_id}}",
+  },
+  tech: {
+    label: "技术报告",
+    content: "# {{title}}\n\n## 项目概述\n{{项目概述}}\n\n## 需求分析\n{{需求分析}}\n\n## 技术方案\n{{技术方案}}\n\n## 系统架构\n{{系统架构}}\n\n## 核心模块设计\n{{核心模块设计}}\n\n## 性能评估\n{{性能评估}}\n\n## 安全设计\n{{安全设计}}\n\n## 部署方案\n{{部署方案}}\n\n## 风险评估\n{{风险评估}}\n\n## 运维建议\n{{运维建议}}\n\n## 总结\n{{总结}}\n\n---\n任务ID：{{task_id}}",
+  },
+  business: {
+    label: "商业计划",
+    content: "# {{title}}\n\n## 执行摘要\n{{执行摘要}}\n\n## 市场分析\n{{市场分析}}\n\n## 目标用户\n{{目标用户}}\n\n## 竞争分析\n{{竞争分析}}\n\n## 产品介绍\n{{产品介绍}}\n\n## 商业模式\n{{商业模式}}\n\n## 营销策略\n{{营销策略}}\n\n## 运营计划\n{{运营计划}}\n\n## 团队介绍\n{{团队介绍}}\n\n## 财务预测\n{{财务预测}}\n\n## 融资需求\n{{融资需求}}\n\n## 风险与对策\n{{风险与对策}}\n\n---\n任务ID：{{task_id}}",
+  },
+};
+
+function newTemplate() {
+  const presetKey = ($("tplNewPreset").value) || "blank";
+  const preset = TPL_FULL_PRESETS[presetKey] || TPL_FULL_PRESETS.blank;
+  $("tplEditorName").value = presetKey === "blank" ? "" : preset.label;
+  $("tplEditorTextarea").value = preset.content;
+  $("tplEditorSelect").value = "";
+  S._tplEditor.currentName = presetKey === "blank" ? "" : preset.label;
+  S._tplEditor.content = preset.content;
+  S._tplEditor.dirty = presetKey !== "blank";
+  refreshTplPreview();
+}
+
+async function loadVariables() {
+  try {
+    const data = await apiGet("/api/template/variables");
+    S._tplEditor.variables = data.system_variables || [];
+    renderVarList(data.system_variables || [], data.section_variables_note || "");
+  } catch (e) {
+    $("tplVarList").innerHTML = "<span style='font-size:10px;color:var(--c-text3)'>加载失败</span>";
+  }
+}
+
+function renderVarList(sysVars, note) {
+  const list = $("tplVarList");
+  list.innerHTML = "";
+  for (const v of sysVars) {
+    const chip = document.createElement("div");
+    chip.className = "tpl-var-chip";
+    chip.textContent = `{{${v.key}}}`;
+    chip.title = v.description || v.label;
+    chip.innerHTML = `{{<b>${esc(v.key)}</b>}}<span class="var-desc">${esc(v.label)}</span>`;
+    chip.addEventListener("click", () => insertVariableAtCursor(v.key));
+    list.appendChild(chip);
+  }
+  $("tplVarNote").textContent = note || "";
+}
+
+function insertVariableAtCursor(key) {
+  const ta = $("tplEditorTextarea");
+  const token = `{{${key}}}`;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  ta.value = ta.value.substring(0, start) + token + ta.value.substring(end);
+  ta.selectionStart = ta.selectionEnd = start + token.length;
+  ta.focus();
+  S._tplEditor.dirty = true;
+  S._tplEditor.content = ta.value;
+  refreshTplPreview();
+}
+
+const TPL_PRESETS = {
+  academic: {
+    label: "学术论文",
+    sections: ["摘要", "引言", "研究背景", "文献综述", "研究目的与意义",
+               "研究方法", "实验设计", "数据采集", "结果分析", "讨论",
+               "局限性", "结论", "未来研究方向"],
+  },
+  tech: {
+    label: "技术报告",
+    sections: ["项目概述", "需求分析", "技术方案", "系统架构",
+               "核心模块设计", "性能评估", "安全设计", "部署方案",
+               "测试报告", "风险评估", "运维建议", "总结"],
+  },
+  business: {
+    label: "商业计划",
+    sections: ["执行摘要", "市场分析", "目标用户", "竞争分析",
+               "产品介绍", "商业模式", "营销策略", "运营计划",
+               "团队介绍", "财务预测", "融资需求", "风险与对策"],
+  },
+};
+
+function insertPresetSection(sectionName) {
+  const ta = $("tplEditorTextarea");
+  const token = `## ${sectionName}\n{{${sectionName}}}\n\n`;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  ta.value = ta.value.substring(0, start) + token + ta.value.substring(end);
+  ta.selectionStart = ta.selectionEnd = start + token.length;
+  ta.focus();
+  S._tplEditor.dirty = true;
+  S._tplEditor.content = ta.value;
+  refreshTplPreview();
+}
+
+function renderPresetList() {
+  const cat = ($("tplPresetCat").value) || "academic";
+  const preset = TPL_PRESETS[cat] || TPL_PRESETS.academic;
+  const list = $("tplPresetList");
+  list.innerHTML = "";
+  for (const s of preset.sections) {
+    const chip = document.createElement("div");
+    chip.className = "tpl-var-chip tpl-preset-chip";
+    chip.textContent = "📋 " + s;
+    chip.title = "点击插入章节：## " + s;
+    chip.addEventListener("click", () => insertPresetSection(s));
+    list.appendChild(chip);
+  }
+}
+
+function refreshTplPreview() {
+  const raw = $("tplEditorTextarea").value;
+  // Highlight placeholders before markdown rendering
+  const highlighted = raw.replace(
+    /\{\{(.+?)\}\}/g,
+    '<span class="tpl-placeholder">{{$1}}</span>'
+  );
+  $("tplPreviewBox").innerHTML = renderMD(highlighted);
+}
+
+async function useTemplateForTask(name) {
+  if (!name) { toast("请先选择或保存模板", "info"); return; }
+  if (!S.taskId) { toast("请先生成一个任务或加载已有任务", "info"); return; }
+  try {
+    const res = await apiPost("/api/template/custom/use", { name: name, task_id: S.taskId });
+    toast("已复制到任务: " + res.name, "ok", 2500);
+    // Refresh the file list display in the upload card
+    const tplList = $("tplList");
+    const existing = tplList.querySelectorAll(".file-tag");
+    let found = false;
+    for (const tag of existing) {
+      if (tag.textContent.replace("×", "").trim() === res.name) found = true;
+    }
+    if (!found) {
+      const tag = document.createElement("span");
+      tag.className = "file-tag";
+      tag.textContent = res.name;
+      tplList.appendChild(tag);
+    }
+  } catch (e) {
+    toast("使用失败: " + e.message, "err");
+  }
+}
+
+async function quickUseTemplate() {
+  const name = $("tplQuickSelect").value;
+  if (!name) { toast("请选择一个模板", "info"); return; }
+  if (!S.taskId) {
+    toast("请先上传文件生成任务，或加载已有任务", "info");
+    return;
+  }
+  await useTemplateForTask(name);
+}
+
+function initTemplateEditor() {
+  loadTplList();
+  loadVariables();
+
+  // Tab switching inside the editor card
+  $("tplEditorTabBar").addEventListener("click", (e) => {
+    const tab = e.target.closest(".tab");
+    if (!tab) return;
+    const tabName = tab.dataset.tab;
+    $("tplEditorTabBar").querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    tab.classList.add("active");
+    const parent = $("tplEditorTabBar").parentElement;
+    parent.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+    const panel = document.getElementById("tab-" + tabName);
+    if (panel) {
+      panel.classList.add("active");
+      if (tabName === "tpl-preview") refreshTplPreview();
+    }
+  });
+
+  // Editor textarea changes
+  $("tplEditorTextarea").addEventListener("input", () => {
+    S._tplEditor.dirty = true;
+    S._tplEditor.content = $("tplEditorTextarea").value;
+    // Update preview in real-time if visible
+    if ($("tab-tpl-preview").classList.contains("active")) {
+      refreshTplPreview();
+    }
+  });
+
+  // CRUD buttons
+  $("btnTplLoad").addEventListener("click", () => {
+    const name = $("tplEditorSelect").value;
+    if (name) loadTemplate(name);
+  });
+  $("btnTplSave").addEventListener("click", saveTemplate);
+  $("btnTplDelete").addEventListener("click", deleteTemplate);
+  $("btnTplNew").addEventListener("click", newTemplate);
+
+  // Import local .md file into editor
+  $("btnTplImport").addEventListener("click", () => $("tplImportFile").click());
+  $("tplImportFile").addEventListener("change", () => {
+    const file = $("tplImportFile").files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      $("tplEditorTextarea").value = reader.result || "";
+      const baseName = file.name.replace(/\.(md|txt|markdown)$/i, "");
+      $("tplEditorName").value = baseName;
+      S._tplEditor.currentName = baseName;
+      S._tplEditor.content = reader.result || "";
+      S._tplEditor.dirty = false;
+      refreshTplPreview();
+      toast("已导入: " + file.name, "ok", 2000);
+    };
+    reader.readAsText(file);
+    $("tplImportFile").value = "";
+  });
+  $("btnTplUse").addEventListener("click", () => {
+    const name = S._tplEditor.currentName || $("tplEditorSelect").value;
+    if (name) useTemplateForTask(name);
+    else toast("请先选择或保存一个模板", "info");
+  });
+  $("btnTplQuickUse").addEventListener("click", quickUseTemplate);
+
+  // Template name input changed — update currentName
+  $("tplEditorName").addEventListener("input", () => {
+    S._tplEditor.currentName = $("tplEditorName").value.trim();
+  });
+}
+
+// Simple DELETE wrapper (not in the original helpers)
+async function apiDelete(url) {
+  const r = await fetch(url, { method: "DELETE" });
+  const data = await r.json();
+  if (!r.ok) throw new Error((data && data.detail) || r.statusText);
+  return data;
+}
+
+
 function init() {
   setupDropZone();
   setupTabs("previewTabs");
   setupTabs("kbTabs");
+
+  // Template preset sections
+  $("tplPresetCat").addEventListener("change", renderPresetList);
+  renderPresetList();
 
   // Eval tabs
   $("evalTabs").addEventListener("click", (e) => {
@@ -1416,12 +2767,17 @@ function init() {
     if (!tab) return;
     const tabName = tab.dataset.tab;
     if (tabName === "compare") {
-      S.previewTab = S.previewTab; // keep current tab for compare context
+      // Keep track of source type for compare
+      if (S.previewTab !== "compare") {
+        S._compareSourceTab = S.previewTab;
+      }
+      S.previewTab = "compare";
       showCompare();
       return;
     }
     S.previewTab = tabName;
     $("compareBox").style.display = "none";
+    $("compareToolbar").style.display = "none";
     $("previewBox").style.display = "";
     showPreview();
     // Update version tags for this tab
@@ -1468,6 +2824,7 @@ function init() {
   });
 
   // Startup
+  initTemplateEditor();
   setKbCurrent("default");
   loadKbList();
   loadTaskList();

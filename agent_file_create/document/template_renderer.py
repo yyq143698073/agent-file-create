@@ -1,12 +1,135 @@
+import hashlib
+import json
 import logging
 import re
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
 
-def build_content_dict(markdown_content: str) -> Dict[str, str]:
+# ── Section hash cache ──────────────────────────────────────────────────────
+
+def _section_hashes(content_dict: Dict[str, str]) -> Dict[str, str]:
+    """Return md5 hex for each section in *content_dict*."""
+    return {
+        k: hashlib.md5((v or "").encode()).hexdigest()
+        for k, v in (content_dict or {}).items()
+    }
+
+
+def _load_render_cache(output_dir: str) -> Dict[str, str]:
+    """Load previous section→hash map from *output_dir/_render_cache.json*."""
+    p = Path(output_dir) / "_render_cache.json"
+    try:
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_render_cache(output_dir: str, hashes: Dict[str, str]) -> None:
+    """Persist section→hash map."""
+    p = Path(output_dir) / "_render_cache.json"
+    try:
+        p.write_text(json.dumps(hashes, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"render_cache_write_failed err={str(e)[:160]}")
+
+
+def _changed_sections(
+    content_dict: Dict[str, str], output_dir: str
+) -> Set[str]:
+    """Return set of section keys whose content changed since last render."""
+    current = _section_hashes(content_dict)
+    cached = _load_render_cache(output_dir)
+    changed: set[str] = set()
+    for k, h in current.items():
+        if cached.get(k) != h:
+            changed.add(k)
+    for k in cached:
+        if k not in current:
+            changed.add(k)
+    return changed
+
+
+# ── Template placeholder scanning ───────────────────────────────────────────
+
+def _scan_md_placeholders(template_path: str) -> Set[str]:
+    """Extract placeholder names from a markdown template."""
+    try:
+        text = Path(template_path).read_text(encoding="utf-8")
+        return set(re.findall(r"\{\{(.+?)\}\}", text))
+    except Exception:
+        return set()
+
+
+def _scan_docx_placeholders(template_path: str) -> Set[str]:
+    """Extract placeholder names from a DOCX template."""
+    keys: set[str] = set()
+    try:
+        from docx import Document
+        doc = Document(template_path)
+        for para in doc.paragraphs:
+            keys.update(re.findall(r"\{\{(.+?)\}\}", para.text))
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        keys.update(re.findall(r"\{\{(.+?)\}\}", para.text))
+    except Exception:
+        pass
+    return keys
+
+
+_TEMPLATE_PLACEHOLDER_CACHE: Dict[str, Set[str]] = {}
+
+
+def _get_template_placeholders(template_path: str) -> Set[str]:
+    """Return cached set of placeholder names referenced by *template_path*."""
+    tp = str(template_path)
+    if tp not in _TEMPLATE_PLACEHOLDER_CACHE:
+        suf = Path(tp).suffix.lower()
+        if suf == ".docx":
+            _TEMPLATE_PLACEHOLDER_CACHE[tp] = _scan_docx_placeholders(tp)
+        elif suf == ".md":
+            _TEMPLATE_PLACEHOLDER_CACHE[tp] = _scan_md_placeholders(tp)
+        else:
+            _TEMPLATE_PLACEHOLDER_CACHE[tp] = set()
+    return _TEMPLATE_PLACEHOLDER_CACHE[tp]
+
+
+def should_skip_render(
+    template_path: str, changed: Set[str], *, is_pdf: bool = False
+) -> bool:
+    """Return True if *template_path* does NOT reference any *changed* section.
+
+    PDF templates are programmatic (reportlab draws all sections), so they are
+    only skipped when *changed* is completely empty.
+    """
+    if not changed:
+        return True
+    if is_pdf:
+        return False  # PDF always references all sections
+    refs = _get_template_placeholders(template_path)
+    if not refs:
+        # Template has no detectable placeholders — render anyway (safety)
+        return False
+    return not bool(refs & changed)
+
+
+def build_content_dict(markdown_content: str, template_keys: list = None) -> Dict[str, str]:
+    """Parse markdown content into a dict keyed by ``##`` heading text.
+
+    If *template_keys* is provided, any key that does not have an exact
+    heading match will be resolved via fuzzy matching against the actual
+    headings in the document (using SequenceMatcher).
+    """
+    from difflib import SequenceMatcher
+
     lines = (markdown_content or "").splitlines()
     out: Dict[str, str] = {}
     cur = None
@@ -52,6 +175,40 @@ def build_content_dict(markdown_content: str) -> Dict[str, str]:
             break
     if title:
         out["title"] = title
+
+    # ── Fuzzy match: map template keys → nearest actual heading ──
+    match_info = {"exact": [], "fuzzy": [], "unmatched": []}
+    if template_keys:
+        system_keys = {"title", "task_id", "document_outline", "document_content"}
+        headings = [k for k in out if k not in system_keys]
+        for tk in template_keys:
+            if tk in system_keys:
+                continue
+            if tk in out and out[tk]:
+                # Already has content from exact match
+                match_info["exact"].append(tk)
+                continue
+            if tk in out:
+                # Key exists but content is empty — try fuzzy
+                pass
+            if headings:
+                best_h, best_s = None, 0.0
+                for h in headings:
+                    s = SequenceMatcher(None, tk, h).ratio()
+                    if tk in h or h in tk:
+                        s += 0.3
+                    if s > best_s:
+                        best_s, best_h = s, h
+                if best_h and best_s >= 0.35:
+                    out[tk] = out[best_h]
+                    match_info["fuzzy"].append(f"{tk} → {best_h}")
+                    logger.debug("build_content_dict fuzzy: %r → %r (score=%.2f)", tk, best_h, best_s)
+                else:
+                    match_info["unmatched"].append(tk)
+            else:
+                match_info["unmatched"].append(tk)
+
+    out["_template_match_info"] = match_info
     return out
 
 
@@ -159,3 +316,79 @@ def render_template(template_path: str, content_dict: Dict[str, str], output_pat
         render_pdf_template(template_path, content_dict, output_path)
     else:
         render_markdown_template(template_path, content_dict, output_path)
+
+
+def _render_markdown_to_docx(content: str, outline: str, output_path: str) -> None:
+    """Generate a DOCX directly from markdown content (no template needed).
+
+    Converts headings (# ## ###), lists (- * 1.), tables (|...|), and
+    inline formatting (**bold** *italic*) to python-docx elements.
+    """
+    from docx import Document
+
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "SimSun"
+    style.font.size = 140000  # 14pt
+
+    lines = (content or "").splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+
+        if line.startswith("# ") and len(line) > 2:
+            doc.add_heading(line[2:], level=1)
+        elif line.startswith("## ") and len(line) > 3:
+            doc.add_heading(line[3:], level=2)
+        elif line.startswith("### ") and len(line) > 4:
+            doc.add_heading(line[4:], level=3)
+        elif line.startswith("- ") or line.startswith("* "):
+            p = doc.add_paragraph(style="List Bullet")
+            _add_formatted_run(p, line[2:])
+        elif re.match(r"^\d+[.)]\s", line):
+            p = doc.add_paragraph(style="List Number")
+            _add_formatted_run(p, re.sub(r"^\d+[.)]\s*", "", line))
+        elif line.startswith("|") and line.endswith("|"):
+            rows: list[list[str]] = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+                i += 1
+            if rows:
+                data = [r for r in rows if not all(re.match(r"^[-:]+$", c) for c in r if c)]
+                if data:
+                    t = doc.add_table(rows=len(data), cols=max(len(r) for r in data), style="Table Grid")
+                    for ri, rd in enumerate(data):
+                        for ci, ct in enumerate(rd):
+                            if ci < max(len(r) for r in data):
+                                t.cell(ri, ci).text = ct
+                                if ri == 0:
+                                    for pa in t.cell(ri, ci).paragraphs:
+                                        for ru in pa.runs:
+                                            ru.bold = True
+        elif not line:
+            continue
+        else:
+            p = doc.add_paragraph()
+            _add_formatted_run(p, line)
+
+    doc.save(output_path)
+
+
+def _add_formatted_run(para, text: str) -> None:
+    """Add text with **bold** and *italic* markers to a paragraph."""
+    import re as _re
+    segments = _re.split(r"(\*\*\*.*?\*\*\*|\*\*.*?\*\*|\*[^*\n]+\*)", text)
+    for seg in segments:
+        if seg.startswith("***") and seg.endswith("***"):
+            run = para.add_run(seg[3:-3])
+            run.bold = True
+            run.italic = True
+        elif seg.startswith("**") and seg.endswith("**"):
+            run = para.add_run(seg[2:-2])
+            run.bold = True
+        elif seg.startswith("*") and seg.endswith("*"):
+            run = para.add_run(seg[1:-1])
+            run.italic = True
+        else:
+            para.add_run(seg)

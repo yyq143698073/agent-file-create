@@ -10,7 +10,6 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 
 from agent_file_create.chat.history import TaskChatMessageHistory
 from agent_file_create.chat.prompts import (
-    CHECK_RELEVANCE_PROMPT,
     FOLLOWUPS_PROMPT,
     REWRITE_QUERY_PROMPT,
     SUMMARIZE_HISTORY_PROMPT,
@@ -261,14 +260,17 @@ class ChatHandler:
             if cmd in {"cancel", "stop"}:
                 return {"type": "cancel"}
             if cmd in {"regen", "regenerate"}:
-                arg = parts[1].strip().lower() if len(parts) >= 2 else ""
-                if arg in {"all", "full", ""}:
-                    scope = "all" if arg in {"all", "full"} else "doc"
-                    return {"type": "regenerate", "scope": scope}
+                if len(parts) >= 2:
+                    arg = parts[1].strip().lower()
+                    # Only treat "all"/"full" as scope when they are the ONLY argument
+                    if len(parts) == 2 and arg in {"all", "full"}:
+                        return {"type": "regenerate", "scope": "all"}
+                    else:
+                        # Section name — join all remaining parts preserving original casing
+                        section_name = " ".join(parts[1:]).strip()
+                        return {"type": "regenerate", "scope": "section", "section": section_name}
                 else:
-                    # Section name — join all remaining parts preserving original casing
-                    section_name = " ".join(parts[1:]).strip()
-                    return {"type": "regenerate", "scope": "section", "section": section_name}
+                    return {"type": "regenerate", "scope": "doc"}
             if cmd in {"prompt", "prompt!"}:
                 t = rest.strip()
                 if not t:
@@ -467,8 +469,9 @@ class ChatHandler:
                 return "任务正在运行，无法重新生成。可先 /pause 或 /cancel。"
             scope = str(action.get("scope") or "doc").strip().lower()
             section_name = str(action.get("section") or "").strip()
+            feedback = str(action.get("feedback") or "").strip()
             if self._regenerate_fn:
-                ok, msg = self._regenerate_fn(task_id, scope if scope else "doc", section_name=section_name)
+                ok, msg = self._regenerate_fn(task_id, scope if scope else "doc", section_name=section_name, feedback=feedback)
                 return msg
             return "重新生成功能未启用，请通过 Web 界面操作（点击「追加到当前任务」）。"
         return self._help_text()
@@ -506,26 +509,6 @@ class ChatHandler:
         # Heuristic: if very short answer shares keywords with questions, accept
         overlap = sum(1 for ch in m if ch in q_chars)
         if overlap >= 3:
-            return True, ""
-
-        # For very short, potentially irrelevant answers, use quick LLM check
-        qtext = "\n".join([f"- {q}" for q in (questions or [])[:4] if q.strip()])
-        if not qtext:
-            qtext = "（未提供具体问题）"
-        try:
-            chain = CHECK_RELEVANCE_PROMPT | self._shared_llm | StrOutputParser()
-            result = (
-                chain.invoke({
-                    "clarify_question": qtext,
-                    "user_reply": m,
-                }) or ""
-            ).strip().upper()
-            if result and "NO" in result and "YES" not in result:
-                return False, (
-                    f"你的回复似乎与当前问题不太相关。请针对以下问题提供补充信息：\n{qtext}\n\n"
-                    "如果不需要补充，回复：跳过"
-                )
-        except Exception:
             return True, ""
 
         return True, ""

@@ -52,6 +52,7 @@ class Hit:
     content: str
     score: float
     meta: dict
+    parent_chunk_id: str = ""
 
 
 class SQLiteVectorStore:
@@ -86,12 +87,18 @@ class SQLiteVectorStore:
                   content text,
                   embedding_json text,
                   meta_json text,
+                  parent_chunk_id text,
                   created_at real
                 )
                 """
             )
+            try:
+                cur.execute("alter table kb_chunks add column parent_chunk_id text")
+            except Exception:
+                pass
             cur.execute("create index if not exists idx_kb_chunks_kb on kb_chunks(kb)")
             cur.execute("create index if not exists idx_kb_chunks_doc on kb_chunks(kb, doc_id)")
+            cur.execute("create index if not exists idx_kb_chunks_section on kb_chunks(kb, section_path)")
             cur.execute(
                 """
                 create table if not exists kb_docs(
@@ -160,6 +167,32 @@ class SQLiteVectorStore:
             conn.commit()
         finally:
             conn.close()
+
+    def get_chunks_by_doc_id(self, *, kb: str, doc_id: str) -> list[Hit]:
+        """Fetch all chunks for a document by doc_id (no embedding needed)."""
+        kb = str(kb or "").strip() or "default"
+        did = str(doc_id or "").strip()
+        if not did:
+            return []
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "select id,kb,doc_id,chunk_index,section_path,content,meta_json from kb_chunks where kb=? and doc_id=? order by chunk_index",
+                (kb, did),
+            )
+            rows = cur.fetchall() or []
+        finally:
+            conn.close()
+        hits: list[Hit] = []
+        for r in rows:
+            meta = _safe_json_obj(r[6])
+            hits.append(Hit(
+                kb=str(r[1] or ""), doc_id=str(r[2] or ""), chunk_id=str(r[0] or ""),
+                chunk_index=int(r[3] or 0), section_path=str(r[4] or ""),
+                content=str(r[5] or ""), score=0.0, meta=meta or {},
+            ))
+        return hits
 
     def list_docs(self, *, kb: str) -> list[dict]:
         conn = self._conn()
@@ -486,12 +519,18 @@ class PostgresVectorStore:
               title text,
               doc_type text,
               meta jsonb,
+              parent_chunk_id text,
               created_at timestamptz default now()
             )
             """
         )
+        try:
+            self._exec("alter table kb_chunks add column if not exists parent_chunk_id text")
+        except Exception:
+            pass
         self._exec("create index if not exists idx_kb_chunks_kb on kb_chunks(kb)")
         self._exec("create index if not exists idx_kb_chunks_doc on kb_chunks(kb, doc_id)")
+        self._exec("create index if not exists idx_kb_chunks_section on kb_chunks(kb, section_path)")
         self._exec("create index if not exists idx_kb_chunks_source on kb_chunks(kb, source)")
 
         idx = self.index_type
@@ -584,6 +623,32 @@ class PostgresVectorStore:
             conn.commit()
         finally:
             conn.close()
+
+    def get_chunks_by_doc_id(self, *, kb: str, doc_id: str) -> list[Hit]:
+        """Fetch all chunks for a document by doc_id (no embedding needed)."""
+        kb = str(kb or "").strip() or "default"
+        did = str(doc_id or "").strip()
+        if not did:
+            return []
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "select id,kb,doc_id,chunk_index,section_path,content,meta from kb_chunks where kb=%s and doc_id=%s order by chunk_index",
+                (kb, did),
+            )
+            rows = cur.fetchall() or []
+        finally:
+            conn.close()
+        hits: list[Hit] = []
+        for r in rows:
+            meta = r[6] if isinstance(r[6], dict) else {}
+            hits.append(Hit(
+                kb=str(r[1] or ""), doc_id=str(r[2] or ""), chunk_id=str(r[0] or ""),
+                chunk_index=int(r[3] or 0), section_path=str(r[4] or ""),
+                content=str(r[5] or ""), score=0.0, meta=meta,
+            ))
+        return hits
 
     def list_docs(self, *, kb: str) -> list[dict]:
         kb = str(kb or "").strip() or "default"
@@ -734,7 +799,17 @@ class PostgresVectorStore:
             cur = conn.cursor()
             try:
                 if self.index_type in {"hnsw", "both"}:
-                    cur.execute("set local hnsw.ef_search = %s", (int(KB_HNSW_EF_SEARCH or 40),))
+                    # Adaptive ef_search: scale with requested top_k
+                    # Rule of thumb: ef_search ≥ top_k; higher values trade speed for recall
+                    if int(top_k) <= 10:
+                        ef = 30
+                    elif int(top_k) <= 50:
+                        ef = int(KB_HNSW_EF_SEARCH or 64)
+                    elif int(top_k) <= 160:
+                        ef = 120
+                    else:
+                        ef = max(200, int(top_k) * 3 // 2)
+                    cur.execute("set local hnsw.ef_search = %s", (ef,))
             except Exception:
                 pass
             try:

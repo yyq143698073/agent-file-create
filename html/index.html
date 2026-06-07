@@ -42,10 +42,27 @@
             <label class="field-label">模板（可选）</label>
             <input type="file" id="templates" class="file-in-sm" multiple />
             <div id="tplList" class="file-list"></div>
+            <div class="field-row" style="margin-top:6px">
+              <select id="tplQuickSelect" class="select" style="flex:1;max-width:none">
+                <option value="">— 或选择已保存的模板 —</option>
+              </select>
+              <button id="btnTplQuickUse" class="btn btn-outline btn-sm">使用</button>
+            </div>
           </div>
           <div class="field mt">
             <label class="field-label">需求描述</label>
             <input id="userPrompt" type="text" class="input" placeholder="例如：生成一份 AI 行业分析报告" />
+          </div>
+          <div class="field mt">
+            <label class="field-label">目标字数</label>
+            <select id="targetWords" class="select" style="max-width:100%">
+              <option value="0">自动（不限制）</option>
+              <option value="3000">约 3,000 字（精简）</option>
+              <option value="5000" selected>约 5,000 字（标准）</option>
+              <option value="8000">约 8,000 字（详尽）</option>
+              <option value="12000">约 12,000 字（深度）</option>
+              <option value="20000">约 20,000 字（全面）</option>
+            </select>
           </div>
           <div class="field mt">
             <label class="check-label">
@@ -83,6 +100,61 @@
           </div>
         </section>
 
+        <!-- Template Editor Card -->
+        <section class="card" id="tplEditorCard">
+          <h2 class="card-title">📝 模板编辑器</h2>
+          <div class="field-row" style="margin-bottom:6px">
+            <select id="tplEditorSelect" class="select" style="flex:1;max-width:none">
+              <option value="">— 新建模板 —</option>
+            </select>
+            <button id="btnTplLoad" class="btn btn-outline btn-sm">加载</button>
+            <button id="btnTplImport" class="btn btn-outline btn-sm">导入本地</button>
+            <button id="btnTplDelete" class="btn btn-outline btn-sm" style="color:var(--c-red)">删除</button>
+            <input type="file" id="tplImportFile" accept=".md,.txt,.markdown" style="display:none" />
+          </div>
+          <div class="field" style="margin-bottom:6px">
+            <input id="tplEditorName" type="text" class="input" placeholder="模板名称（如：我的报告模板）" />
+          </div>
+          <div class="tpl-editor-layout">
+            <div class="tpl-var-panel">
+              <div class="tpl-var-title">可用变量</div>
+              <div id="tplVarList" class="tpl-var-list"></div>
+              <div id="tplVarNote" class="tpl-var-note"></div>
+              <div class="tpl-preset-title">预设章节</div>
+              <select id="tplPresetCat" class="select" style="width:100%;margin-bottom:4px;font-size:11px">
+                <option value="academic">学术论文</option>
+                <option value="tech">技术报告</option>
+                <option value="business">商业计划</option>
+              </select>
+              <div id="tplPresetList" class="tpl-var-list"></div>
+            </div>
+            <div class="tpl-edit-area">
+              <div class="tabs" id="tplEditorTabBar">
+                <button class="tab active" data-tab="tpl-edit">编辑</button>
+                <button class="tab" data-tab="tpl-preview">预览</button>
+              </div>
+              <div class="tab-panel active" id="tab-tpl-edit">
+                <textarea id="tplEditorTextarea" class="tpl-editor-textarea"
+                  placeholder="# {{title}}&#10;&#10;## 摘要&#10;{{摘要}}&#10;&#10;## 正文&#10;{{document_content}}&#10;&#10;---&#10;任务ID：{{task_id}}"></textarea>
+              </div>
+              <div class="tab-panel" id="tab-tpl-preview">
+                <div id="tplPreviewBox" class="preview-box tpl-preview-box"></div>
+              </div>
+            </div>
+          </div>
+          <div class="btn-row mt">
+            <button id="btnTplSave" class="btn btn-primary btn-sm">保存模板</button>
+            <button id="btnTplUse" class="btn btn-outline btn-sm">用于当前任务</button>
+            <select id="tplNewPreset" class="select" style="width:auto;min-width:110px;font-size:11px">
+              <option value="blank">空白模板</option>
+              <option value="academic">学术论文模板</option>
+              <option value="tech">技术报告模板</option>
+              <option value="business">商业计划书模板</option>
+            </select>
+            <button id="btnTplNew" class="btn btn-outline btn-sm">新建</button>
+          </div>
+        </section>
+
         <!-- Task Info Card -->
         <section class="card">
           <h2 class="card-title">📋 任务信息</h2>
@@ -106,26 +178,6 @@
             <span class="kv-label">输出文件</span>
           </div>
           <ul id="downloadList" class="download-list"></ul>
-          <div class="mt">
-            <div class="field-row">
-              <span class="card-subtitle">📝 报告预览</span>
-              <button id="btnFullPreview" class="btn btn-outline btn-sm" title="在新窗口打开正文" style="display:none">全屏</button>
-            </div>
-            <div class="tabs" id="previewTabs">
-              <button class="tab active" data-tab="outline">大纲</button>
-              <button class="tab" data-tab="content">正文</button>
-              <button class="tab" id="tabCompare" data-tab="compare" style="display:none">版本对比</button>
-            </div>
-            <div id="versionBar" class="version-bar" style="display:none">
-              <span class="kv-label">版本：</span>
-              <span id="versionTags"></span>
-            </div>
-            <div id="previewBox" class="preview-box"></div>
-            <div id="compareBox" class="compare-box tab-panel" id="tab-compare" style="display:none">
-              <div class="compare-left"><div class="compare-label">旧版本</div><div id="compareOld" class="preview-box" style="max-height:400px"></div><button id="btnSelectOld" class="btn btn-outline btn-sm mt">选择此版本</button></div>
-              <div class="compare-right"><div class="compare-label">新版本</div><div id="compareNew" class="preview-box" style="max-height:400px"></div><button id="btnSelectNew" class="btn btn-primary btn-sm mt">选择此版本</button></div>
-            </div>
-          </div>
         </section>
 
         <!-- KB Card -->
@@ -204,6 +256,68 @@
           <div class="chat-bar">
             <input id="chatInput" type="text" class="input" placeholder="输入消息，Enter 发送..." />
             <button id="btnSend" class="btn btn-primary">发送</button>
+          </div>
+        </section>
+
+        <!-- Preview Card -->
+        <section class="card card-preview">
+          <h2 class="card-title">📝 报告预览</h2>
+          <div class="field-row" style="margin-bottom:4px;gap:6px">
+            <button id="btnFullPreview" class="btn btn-outline btn-sm" title="在新窗口打开正文" style="display:none">全屏</button>
+            <a id="btnDownloadDocx" class="btn btn-primary btn-sm" title="下载 Word 文档" style="display:none" download>📥 DOCX</a>
+            <a id="btnDownloadPdf" class="btn btn-outline btn-sm" title="下载 PDF 文档" style="display:none" download>📥 PDF</a>
+          </div>
+          <div class="tabs" id="previewTabs">
+            <button class="tab active" data-tab="outline">大纲</button>
+            <button class="tab" data-tab="content">正文</button>
+            <button class="tab" id="tabCompare" data-tab="compare" style="display:none">版本对比</button>
+          </div>
+          <div id="evalMetricsBar" style="display:none; padding:6px 10px; margin:4px 0; background:#f8f9fa; border-radius:6px; font-size:12px; display:none; flex-wrap:wrap; gap:8px; align-items:center">
+            <span style="font-weight:700; color:#374151">📊 报告质量：</span>
+            <span id="evalWarns" style="padding:2px 8px; border-radius:4px;"></span>
+            <span id="evalFActScore" style="padding:2px 8px; border-radius:4px;"></span>
+            <span id="evalCoverage" style="padding:2px 8px; border-radius:4px;"></span>
+            <span id="evalCiteAcc" style="padding:2px 8px; border-radius:4px;"></span>
+          </div>
+          <div id="versionBar" class="version-bar" style="display:none">
+            <span class="kv-label">版本：</span>
+            <span id="versionTags"></span>
+          </div>
+          <div id="previewBox" class="preview-box"></div>
+          <div class="compare-toolbar" id="compareToolbar" style="display:none">
+            <select id="compareTypeSelect" class="input input-sm" style="width:auto;min-width:70px">
+              <option value="outline">大纲</option>
+              <option value="content">正文</option>
+            </select>
+            <label class="check-label">
+              <input id="showDiff" type="checkbox" checked />
+              <span>差异标注</span>
+            </label>
+            <span id="diffStats" style="font-size:10px;color:var(--c-text3)"></span>
+          </div>
+          <div id="compareBox" class="compare-box tab-panel" style="display:none">
+            <div class="compare-left">
+              <div class="compare-header">
+                <span class="compare-label" id="compareLabelLeft">版本 A</span>
+                <select id="compareVerLeft" class="input input-sm" style="width:auto;min-width:100px"></select>
+              </div>
+              <div id="compareOld" class="preview-box"></div>
+              <div class="compare-actions">
+                <button id="btnAcceptLeft" class="btn btn-primary btn-sm">接受此版本</button>
+                <button id="btnRedoLeft" class="btn btn-outline btn-sm">基于此版重做</button>
+              </div>
+            </div>
+            <div class="compare-right">
+              <div class="compare-header">
+                <span class="compare-label" id="compareLabelRight">版本 B</span>
+                <select id="compareVerRight" class="input input-sm" style="width:auto;min-width:100px"></select>
+              </div>
+              <div id="compareNew" class="preview-box"></div>
+              <div class="compare-actions">
+                <button id="btnAcceptRight" class="btn btn-primary btn-sm">接受此版本</button>
+                <button id="btnRedoRight" class="btn btn-outline btn-sm">基于此版重做</button>
+              </div>
+            </div>
           </div>
         </section>
 

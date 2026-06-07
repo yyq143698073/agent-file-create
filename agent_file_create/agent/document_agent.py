@@ -6,6 +6,7 @@ human-in-the-loop, SqliteSaver checkpointing, and modular prompts.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -87,6 +88,18 @@ class DocumentAgent:
     # ── LLM helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
+    def _run_async(coro):
+        """Run an async coroutine safely in both sync and async contexts."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        # Already in async context — use thread to avoid nested loop
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+
+    @staticmethod
     def _build_llm(timeout_s: int = MODEL_TIMEOUT_SHORT):
         """Lightweight LLM for clarification / routing (not content generation)."""
         style = (
@@ -116,8 +129,10 @@ class DocumentAgent:
         builder.add_node("extract", self._node_extract)
         builder.add_node("assess", self._node_assess)
         builder.add_node("clarify", self._node_clarify)
+        builder.add_node("enrich", self._node_enrich)
         builder.add_node("outline", self._node_outline)
         builder.add_node("satisfaction_outline", self._node_satisfaction_outline)
+        builder.add_node("research", self._node_research)
         builder.add_node("content", self._node_content)
         builder.add_node("satisfaction_content", self._node_satisfaction_content)
         builder.add_node("render", self._node_render)
@@ -130,17 +145,21 @@ class DocumentAgent:
         builder.add_conditional_edges(
             "assess",
             self._route_after_assess,
-            {"clarify": "clarify", "outline": "outline"},
+            {"clarify": "clarify", "enrich": "enrich"},
         )
-        builder.add_edge("clarify", "outline")
+        builder.add_edge("clarify", "enrich")
+        builder.add_edge("enrich", "outline")
 
         # outline -> satisfaction_outline (then conditional)
         builder.add_edge("outline", "satisfaction_outline")
         builder.add_conditional_edges(
             "satisfaction_outline",
             self._route_after_satisfaction_outline,
-            {"outline": "outline", "content": "content", "error": "handle_error"},
+            {"outline": "outline", "research": "research", "content": "content", "error": "handle_error"},
         )
+
+        # research -> content
+        builder.add_edge("research", "content")
 
         # content -> satisfaction_content (then conditional)
         builder.add_edge("content", "satisfaction_content")
@@ -167,9 +186,9 @@ class DocumentAgent:
     def _route_after_assess(state: AgentState) -> str:
         """Skip clarification if the user has already provided preferences."""
         if state.get("force_regen"):
-            return "outline"
+            return "enrich"
         if (state.get("user_clarifications") or "").strip():
-            return "outline"
+            return "enrich"
         return "clarify"
 
     @staticmethod
@@ -194,7 +213,8 @@ class DocumentAgent:
         if state.get("error"):
             return "error"
         if state.get("outline_satisfied"):
-            return "content"
+            # Run research skills before generating full content
+            return "research"
         # Not satisfied — check regeneration scope
         scope = state.get("regeneration_scope", "outline")
         if scope == "content_only":
@@ -222,12 +242,27 @@ class DocumentAgent:
             return {}
 
         from agent_file_create.document.extractor import extract_from_file
+        from agent_file_create.config import MAX_WORKERS_DEFAULT
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        results: List[dict] = []
-        for fp in state.get("file_paths", self.file_paths):
-            res = retry_call(extract_from_file, fp, preprocess=True)
-            res["_file"] = Path(fp).name
-            results.append(res)
+        fps = state.get("file_paths", self.file_paths)
+        results: List[dict] = [{}] * len(fps)
+        max_workers = max(1, min(int(MAX_WORKERS_DEFAULT), len(fps)))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(retry_call, extract_from_file, fp, preprocess=True): i
+                for i, fp in enumerate(fps)
+            }
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {"error": str(e), "_file": Path(fps[idx]).name}
+                if isinstance(res, dict):
+                    res["_file"] = Path(fps[idx]).name
+                results[idx] = res
 
         logger.info("extract done   task=%s files=%d", self.task_id, len(results))
         return {"analysis_results": results, "force_regen": False}
@@ -272,6 +307,197 @@ class DocumentAgent:
         assessment = "\n".join(lines).strip() or "（暂无抽取结果）"
         logger.info("assess  done   task=%s", self.task_id)
         return {"last_output": assessment}
+
+    # ── Node: enrich (skill invocation before outline) ───────────────────────
+
+    def _node_enrich(self, state: AgentState) -> dict:
+        """Invoke skills to enrich material before generating the outline.
+
+        1. Ask LLM which skills to call (based on user_prompt + files)
+        2. Execute selected skills in parallel
+        3. Collect results into enriched_context
+        """
+        logger.info("enrich  start  task=%s", self.task_id)
+        if state.get("enriched_context") and state.get("skills_used"):
+            logger.info("enrich  skip   task=%s (already done)", self.task_id)
+            return {}
+
+        try:
+            from agent_file_create.skills import get_registry
+
+            registry = get_registry()
+            registry.discover()
+        except Exception as exc:
+            logger.warning("enrich  registry_failed task=%s err=%s", self.task_id, exc)
+            return {"skills_used": [], "enriched_context": "", "skill_results": []}
+
+        # Build prompt for LLM to select skills
+        tools_prompt = registry.build_tools_prompt("enrich")
+        user_prompt = state.get("user_prompt", self.user_prompt)
+        analysis_results = state.get("analysis_results") or []
+        file_list = "\n".join(
+            f"  - {r.get('_file', '?')}" for r in analysis_results[:10]
+            if isinstance(r, dict)
+        )
+
+        selection_prompt = (
+            "你是一个报告撰写助手。在生成大纲之前，你可以选择性调用以下技能来"
+            "获取更多信息，提升报告质量。\n\n"
+            f"用户需求：{user_prompt[:500]}\n\n"
+            f"已上传文件列表：\n{file_list or '（无）'}\n\n"
+            + tools_prompt
+        )
+
+        # Ask LLM to select skills
+        llm = self._build_llm(timeout_s=40)
+        try:
+            import asyncio
+            response = llm.invoke(selection_prompt)
+            raw = (
+                response.content
+                if hasattr(response, "content")
+                else str(response)
+            ).strip()
+        except Exception as exc:
+            logger.warning("enrich  llm_failed task=%s err=%s", self.task_id, exc)
+            return {"skills_used": [], "enriched_context": "", "skill_results": [],
+                    "skill_prompt": selection_prompt, "skill_calls_raw": ""}
+
+        calls = registry.parse_skill_calls(raw)
+        logger.info("enrich  llm_selected=%s task=%s", [c.skill_name for c in calls], self.task_id)
+
+        if not calls:
+            return {"skills_used": [], "enriched_context": "", "skill_results": [],
+                    "skill_prompt": selection_prompt, "skill_calls_raw": raw}
+
+        # Execute skills
+        try:
+            results = self._run_async(registry.execute_calls(calls))
+        except Exception as exc:
+            logger.warning("enrich  exec_failed task=%s err=%s", self.task_id, exc)
+            return {"skills_used": [], "enriched_context": "", "skill_results": [],
+                    "skill_prompt": selection_prompt, "skill_calls_raw": raw}
+
+        # Collect results
+        skill_results: list[dict] = []
+        context_parts: list[str] = []
+        skills_used: list[str] = []
+
+        for call, result in results:
+            skills_used.append(call.skill_name)
+            skill_results.append({
+                "skill": call.skill_name,
+                "params": call.params,
+                "success": result.success,
+                "summary": result.summary,
+                "data": result.data,
+                "error": result.error,
+            })
+            ctx = result.to_context()
+            if ctx:
+                context_parts.append(f"### {call.skill_name}\n{ctx}")
+
+        enriched = "\n\n".join(context_parts) if context_parts else ""
+        logger.info("enrich  done   task=%s skills=%s chunks=%d chars=%d",
+                     self.task_id, skills_used, len(context_parts), len(enriched))
+
+        return {
+            "skills_used": skills_used,
+            "enriched_context": enriched,
+            "skill_results": skill_results,
+            "skill_prompt": selection_prompt,
+            "skill_calls_raw": raw,
+        }
+
+    # ── Node: research (skill invocation before content) ──────────────────────
+
+    def _node_research(self, state: AgentState) -> dict:
+        """Invoke research skills before generating full content.
+
+        Called after the user approves the outline. Uses research-stage skills
+        (e.g. web_search) to fetch up-to-date data for the content.
+        """
+        logger.info("research start  task=%s", self.task_id)
+
+        try:
+            from agent_file_create.skills import get_registry
+
+            registry = get_registry()
+            registry.discover()
+        except Exception as exc:
+            logger.warning("research registry_failed task=%s err=%s", self.task_id, exc)
+            return {}
+
+        outline = state.get("outline", "")
+        user_prompt = state.get("user_prompt", self.user_prompt)
+
+        # Combine previous enrich context with new research stage
+        existing_context = state.get("enriched_context", "")
+
+        tools_prompt = registry.build_tools_prompt("research")
+        selection_prompt = (
+            "你是一个报告撰写助手。即将开始撰写正文。大纲已经确定，你可以"
+            "选择性调用以下技能来获取最新数据或补充信息。\n\n"
+            f"用户需求：{user_prompt[:500]}\n\n"
+            f"大纲要点：\n{outline[:600]}\n\n"
+            + tools_prompt
+        )
+
+        llm = self._build_llm(timeout_s=40)
+        try:
+            import asyncio
+            response = llm.invoke(selection_prompt)
+            raw = (
+                response.content
+                if hasattr(response, "content")
+                else str(response)
+            ).strip()
+        except Exception as exc:
+            logger.warning("research llm_failed task=%s err=%s", self.task_id, exc)
+            return {}
+
+        calls = registry.parse_skill_calls(raw)
+        logger.info("research llm_selected=%s task=%s", [c.skill_name for c in calls], self.task_id)
+
+        if not calls:
+            return {}
+
+        # Execute skills
+        try:
+            results = self._run_async(registry.execute_calls(calls))
+        except Exception as exc:
+            logger.warning("research exec_failed task=%s err=%s", self.task_id, exc)
+            return {}
+
+        # Collect results, merge with existing context
+        skill_results = list(state.get("skill_results") or [])
+        context_parts = [existing_context] if existing_context else []
+        skills_used = list(state.get("skills_used") or [])
+
+        for call, result in results:
+            if call.skill_name not in skills_used:
+                skills_used.append(call.skill_name)
+            skill_results.append({
+                "skill": call.skill_name,
+                "params": call.params,
+                "success": result.success,
+                "summary": result.summary,
+                "data": result.data,
+                "error": result.error,
+            })
+            ctx = result.to_context()
+            if ctx:
+                context_parts.append(f"### {call.skill_name}\n{ctx}")
+
+        enriched = "\n\n".join(context_parts) if context_parts else existing_context
+        logger.info("research done   task=%s skills=%s chars=%d",
+                     self.task_id, skills_used, len(enriched))
+
+        return {
+            "skills_used": skills_used,
+            "enriched_context": enriched,
+            "skill_results": skill_results,
+        }
 
     # ── Node: clarify ────────────────────────────────────────────────────────
 
@@ -437,11 +663,31 @@ class DocumentAgent:
                 generate_outline as _gen,
             )
 
+            # Extract section-level placeholders from user templates
+            template_sections: list[str] = []
+            tpl_dir = self.template_dir_override or state.get("template_dir_override") or ""
+            if tpl_dir:
+                td = Path(tpl_dir)
+                if td.exists() and td.is_dir():
+                    from agent_file_create.document.template_renderer import _scan_md_placeholders
+                    SYSTEM_VARS = {"title", "task_id", "document_outline", "document_content"}
+                    all_sections: set[str] = set()
+                    for tp in sorted(td.glob("*.md")):
+                        all_sections.update(_scan_md_placeholders(str(tp)))
+                    template_sections = sorted(all_sections - SYSTEM_VARS)
+                    if template_sections:
+                        logger.info("outline_template_sections task=%s sections=%s",
+                                    self.task_id, template_sections)
+
             ar = state.get("analysis_results") or []
             multimodal = {f"source_{i}": r for i, r in enumerate(ar)}
             user_prompt = state.get("user_prompt", self.user_prompt)
             feedback = state.get("satisfaction_feedback", "")
-            outline = _gen(multimodal, user_prompt, feedback=feedback)
+            enriched = state.get("enriched_context", "")
+            target_words = int(state.get("target_words") or 0)
+            outline = _gen(multimodal, user_prompt, feedback=feedback,
+                          enriched_context=enriched, target_words=target_words,
+                          template_sections=template_sections or None)
 
             # Version management
             versions = list(state.get("outline_versions") or [])
@@ -454,6 +700,13 @@ class DocumentAgent:
                 "selected": False,
                 "ts": time.time(),
             })
+
+            # Persist version to disk
+            try:
+                from agent_file_create.task.manager import TaskManager
+                TaskManager().save_version(self.task_id, "outline", current_ver, outline, feedback)
+            except Exception:
+                pass
 
             logger.info("outline done   task=%s chars=%d ver=%d", self.task_id, len(outline or ""), current_ver)
             return {
@@ -489,7 +742,11 @@ class DocumentAgent:
             outline = str(state.get("outline") or "")
             user_prompt = state.get("user_prompt", self.user_prompt)
             feedback = state.get("satisfaction_feedback", "")
-            content = _gen(outline, multimodal, user_prompt, task_id=self.task_id, feedback=feedback)
+            enriched = state.get("enriched_context", "")
+            target_words = int(state.get("target_words") or 0)
+            content = _gen(outline, multimodal, user_prompt, task_id=self.task_id,
+                          feedback=feedback, enriched_context=enriched,
+                          target_words=target_words)
 
             # Version management
             versions = list(state.get("content_versions") or [])
@@ -502,6 +759,13 @@ class DocumentAgent:
                 "selected": False,
                 "ts": time.time(),
             })
+
+            # Persist version to disk
+            try:
+                from agent_file_create.task.manager import TaskManager
+                TaskManager().save_version(self.task_id, "content", current_ver, content, feedback)
+            except Exception:
+                pass
 
             logger.info("content done   task=%s chars=%d ver=%d", self.task_id, len(content or ""), current_ver)
             return {
@@ -524,6 +788,13 @@ class DocumentAgent:
             from agent_file_create.document_service import generate_document
 
             ar = state.get("analysis_results") or []
+            # Fallback: load from disk if state is empty (e.g. task reload)
+            if not ar:
+                try:
+                    from agent_file_create.task.manager import TaskManager
+                    ar = TaskManager().read_analysis_results(self.task_id) or []
+                except Exception:
+                    pass
             user_prompt = state.get("user_prompt", self.user_prompt)
             result = retry_call(
                 generate_document,
@@ -543,6 +814,15 @@ class DocumentAgent:
                 "outline": result.get("document_outline") or state.get("outline") or "",
                 "content": result.get("document_content") or state.get("content") or "",
                 "finished": True,
+                "eval_metrics": {
+                    "factscore": result.get("factscore"),
+                    "coverage": result.get("coverage"),
+                    "facts_verified": result.get("facts_verified", 0),
+                    "facts_total": result.get("facts_total", 0),
+                    "aspects_covered": result.get("aspects_covered", 0),
+                    "aspects_total": result.get("aspects_total", 0),
+                    "uncovered_aspects": result.get("uncovered_aspects", []),
+                },
             }
         except Exception as exc:
             logger.warning("render failed   task=%s err=%s", self.task_id, exc)
@@ -644,6 +924,7 @@ class DocumentAgent:
             "file_paths": list(self.file_paths),
             "template_dir_override": str(self.template_dir_override or ""),
             "force_regen": bool(external.get("force_regen", False)),
+            "target_words": int(external.get("target_words") or 0),
             "user_clarifications": str(external.get("user_clarifications", "")),
             "eval_enabled": bool(external.get("eval_enabled", True)),
             "messages": [],
@@ -656,6 +937,10 @@ class DocumentAgent:
             "satisfaction_feedback": str(external.get("satisfaction_feedback") or ""),
             "regeneration_scope": str(external.get("regeneration_scope") or ""),
             "waiting_satisfaction": str(external.get("waiting_satisfaction") or ""),
+            # Skill system
+            "skill_results": list(external.get("skill_results") or []),
+            "enriched_context": str(external.get("enriched_context") or ""),
+            "skills_used": list(external.get("skills_used") or []),
         }
         # If caller pre‑populated analysis_results (e.g. from a previous run
         # or external extractor), carry them forward to skip extraction.

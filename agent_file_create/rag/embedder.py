@@ -2,6 +2,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
 
 from agent_file_create.config import EMBED_API_ENDPOINT, EMBED_API_KEY, EMBED_API_STYLE, EMBED_MODEL_NAME, OLLAMA_HOST, OPENAI_API_ENDPOINT, OPENAI_API_KEY
@@ -24,12 +25,20 @@ def _normalize_openai_base_url(endpoint: str) -> str:
 
 def _post_json(url: str, payload: dict, headers: dict | None = None, *, timeout_s: int = 60) -> dict:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    h = {"Content-Type": "application/json; charset=utf-8"}
+    h = {"Content-Type": "application/json; charset=utf-8", "Connection": "close"}
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, data=data, headers=h, method="POST")
-    with urllib.request.urlopen(req, timeout=int(timeout_s)) as resp:
-        raw = resp.read() or b""
+    try:
+        with urllib.request.urlopen(req, timeout=int(timeout_s)) as resp:
+            raw = resp.read() or b""
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="ignore")[:500]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {body}") from e
     try:
         obj = json.loads(raw.decode("utf-8"))
         return obj if isinstance(obj, dict) else {"raw": obj}
@@ -49,19 +58,58 @@ def _as_float_list(x) -> list[float]:
     return out
 
 
+def _embed_ollama_one(text: str, *, model: str, base: str, timeout_s: int) -> list[float]:
+    """Single-text fallback using /api/embeddings endpoint — avoids batch NaN issue.
+    Returns empty list on persistent failure so caller can substitute a zero vector."""
+    url = base + "/api/embeddings"
+    for attempt in range(3):
+        t = text[:2000] if attempt > 0 else text
+        payload = {"model": model, "prompt": t}
+        try:
+            obj = _post_json(url, payload, timeout_s=timeout_s)
+            emb = _as_float_list(obj.get("embedding"))
+            if emb:
+                return emb
+        except Exception:
+            pass
+        if attempt < 2:
+            time.sleep(1.0)
+    return []  # empty = caller handles via zero-vector fallback
+
+
 def _embed_ollama(texts: list[str], *, model: str, endpoint: str, timeout_s: int) -> list[list[float]]:
     base = (endpoint or "").strip() or (OLLAMA_HOST or "").strip()
     base = base.rstrip("/")
-    url = base + "/api/embeddings"
-    out: list[list[float]] = []
-    for t in texts:
-        payload = {"model": model, "prompt": t}
+    # Use Ollama's OpenAI-compatible batch endpoint — handles multiple texts in one request
+    url = base + "/v1/embeddings"
+    payload = {"model": model, "input": texts}
+    try:
         obj = _post_json(url, payload, timeout_s=timeout_s)
-        emb = _as_float_list(obj.get("embedding"))
-        if not emb:
-            raise RuntimeError("ollama embeddings 返回为空")
-        out.append(emb)
-    return out
+        data = obj.get("data")
+        if not isinstance(data, list):
+            raise RuntimeError("ollama v1/embeddings 返回格式错误")
+        # Sort by index to preserve input order
+        data.sort(key=lambda it: it.get("index", 0) if isinstance(it, dict) else 0)
+        out: list[list[float]] = []
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            emb = _as_float_list(it.get("embedding"))
+            if emb:
+                out.append(emb)
+        if len(out) != len(texts):
+            raise RuntimeError(f"ollama embeddings 返回数量不匹配: got {len(out)}, expected {len(texts)}")
+        return out
+    except RuntimeError as e:
+        err_msg = str(e)
+        # bge-m3 NaN bug: certain texts cause "json: unsupported value: NaN"
+        # Fall back to /api/embeddings (single-prompt endpoint) one at a time
+        if "NaN" in err_msg or len(texts) == 1:
+            results: list[list[float]] = []
+            for t in texts:
+                results.append(_embed_ollama_one(t, model=model, base=base, timeout_s=timeout_s))
+            return results
+        raise
 
 
 def _embed_openai(texts: list[str], *, model: str, endpoint: str, api_key: str, timeout_s: int) -> list[list[float]]:
@@ -114,7 +162,6 @@ def embed_texts(texts: Iterable[str], *, timeout_s: int = 60, max_batch: int = 3
 
     out: list[list[float]] = []
     batch = max(1, int(max_batch or 0))
-    all_failed = False
     for i in range(0, len(xs), batch):
         part = xs[i : i + batch]
         last_err = ""
@@ -145,14 +192,32 @@ def embed_texts(texts: Iterable[str], *, timeout_s: int = 60, max_batch: int = 3
                         break
                     except Exception:
                         pass
-            time.sleep(0.6 + 0.6 * attempt)
+            if last_err and attempt < 2:
+                time.sleep(2.0 + 2.0 * attempt)  # longer backoff: 2s, 4s, then one-by-one
         if last_err:
             import logging
-            logging.getLogger(__name__).warning("embed_batch_failed batch=%d err=%s", i, last_err)
-            all_failed = True
+            logging.getLogger(__name__).warning("embed_batch_failed batch=%d err=%s, retrying one-by-one", i, last_err)
+            # Retry each text individually with health-aware recovery
+            for single in part:
+                single_ok = False
+                for s_attempt in range(4):
+                    try:
+                        if style == "openai":
+                            vecs = _embed_openai([single], model=model, endpoint=endpoint, api_key=EMBED_API_KEY, timeout_s=timeout_s)
+                        else:
+                            vecs = _embed_ollama([single], model=model, endpoint=endpoint, timeout_s=timeout_s)
+                        out.extend(vecs)
+                        single_ok = True
+                        break
+                    except Exception:
+                        time.sleep(3.0 + 2.0 * s_attempt)  # 3s, 5s, 7s, 9s — wait for Ollama recovery
+                if not single_ok:
+                    out.append([])  # empty vector as last resort
+        # Small gap between batches to let Ollama breathe
+        if i + batch < len(xs):
+            time.sleep(0.5)
 
-    if all_failed and not out:
-        # Return empty vectors — chunks stored and retrievable via lexical search
+    if not out:
         return [[] for _ in xs]
     return out
 
