@@ -85,21 +85,20 @@ def _scan_docx_placeholders(template_path: str) -> Set[str]:
     return keys
 
 
-_TEMPLATE_PLACEHOLDER_CACHE: Dict[str, Set[str]] = {}
+from functools import lru_cache
 
 
+@lru_cache(maxsize=64)
 def _get_template_placeholders(template_path: str) -> Set[str]:
     """Return cached set of placeholder names referenced by *template_path*."""
     tp = str(template_path)
-    if tp not in _TEMPLATE_PLACEHOLDER_CACHE:
-        suf = Path(tp).suffix.lower()
-        if suf == ".docx":
-            _TEMPLATE_PLACEHOLDER_CACHE[tp] = _scan_docx_placeholders(tp)
-        elif suf == ".md":
-            _TEMPLATE_PLACEHOLDER_CACHE[tp] = _scan_md_placeholders(tp)
-        else:
-            _TEMPLATE_PLACEHOLDER_CACHE[tp] = set()
-    return _TEMPLATE_PLACEHOLDER_CACHE[tp]
+    suf = Path(tp).suffix.lower()
+    if suf == ".docx":
+        return _scan_docx_placeholders(tp)
+    elif suf == ".md":
+        return _scan_md_placeholders(tp)
+    else:
+        return set()
 
 
 def should_skip_render(

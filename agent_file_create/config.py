@@ -38,7 +38,7 @@ KB_HNSW_EF_SEARCH = int(os.getenv("KB_HNSW_EF_SEARCH", "64"))
 KB_IVFFLAT_PROBES = int(os.getenv("KB_IVFFLAT_PROBES", "10"))
 
 EMBED_API_STYLE = os.getenv("EMBED_API_STYLE", "ollama").strip()
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "nomic-embed-text").strip()
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "bge-m3:latest").strip()
 EMBED_API_ENDPOINT = os.getenv("EMBED_API_ENDPOINT", "").strip()
 EMBED_API_KEY = os.getenv("EMBED_API_KEY", "").strip()
 

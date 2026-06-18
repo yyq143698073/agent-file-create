@@ -82,6 +82,54 @@ def _clean_llm_output(text: str) -> str:
     return out
 
 
+def _add_outline_numbering(outline: str) -> str:
+    """Add hierarchical numbering to markdown outline headings.
+
+    Transforms::
+
+        # 报告标题
+        ## 背景分析
+        ### 行业现状
+        ## 数据解读
+
+    into::
+
+        # 1. 报告标题
+        ## 1.1 背景分析
+        ### 1.1.1 行业现状
+        ## 1.2 数据解读
+    """
+    lines = (outline or "").splitlines()
+    result: list[str] = []
+    # counters[i] = current count at heading level i (1-indexed: counters[1] for #, counters[2] for ##, ...)
+    counters: list[int] = [0] * 10
+
+    for line in lines:
+        stripped = line.strip()
+        m = re.match(r"^(#{1,6})\s+(.+?)\s*$", stripped)
+        if not m:
+            result.append(line)
+            continue
+
+        level = len(m.group(1))
+        title = m.group(2).strip()
+
+        # Increment counter at this level, reset all deeper levels
+        counters[level] += 1
+        for lv in range(level + 1, len(counters)):
+            counters[lv] = 0
+
+        # Build hierarchical number: e.g. "1.1.2" for level 3
+        number_parts = [str(counters[lv]) for lv in range(1, level + 1) if counters[lv] > 0]
+        number = ".".join(number_parts) + "."
+
+        # Preserve original indentation
+        indent = line[:len(line) - len(line.lstrip())]
+        result.append(f"{indent}{'#' * level} {number} {title}")
+
+    return "\n".join(result)
+
+
 def _build_outline_prompt(user_req: str, digest: str, feedback: str, target_words: int = 0, template_sections: list = None) -> str:
     rules = [
         "你是一个专业报告的大纲生成助手。请基于参考材料与用户需求输出 Markdown 大纲。",
@@ -162,7 +210,7 @@ def _check_outline_coverage(outline: str, user_req: str, template_sections: list
             timeout_s=15,
             temperature=0.0,
             num_predict=120,
-            system="你是大纲质量审查助手，只输出缺失主题名或OK。",
+            system="你是一个中文文档处理助手。",
             api_style=OUTLINE_API_STYLE,
             api_endpoint=OUTLINE_API_ENDPOINT,
             api_key=OUTLINE_API_KEY,
@@ -209,7 +257,7 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
             timeout_s=MODEL_TIMEOUT,
             temperature=0.2,
             num_predict=900,
-            system="你是一个中文报告助手，只输出 Markdown 大纲。",
+            system="你是一个中文文档处理助手。",
             api_style=OUTLINE_API_STYLE,
             api_endpoint=OUTLINE_API_ENDPOINT,
             api_key=OUTLINE_API_KEY,
@@ -228,7 +276,7 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
             if not coverage_issues:
                 t1 = time.perf_counter()
                 logger.info(f"outline_done seconds={t1 - t0:.2f} prompt_chars={len(prompt)} outline_chars={len(out)} attempts={attempt + 1}")
-                return out
+                return _add_outline_numbering(out)
             last_issues = [f"内容覆盖不足，缺失或需加强：{'、'.join(coverage_issues)}"]
             logger.warning(f"outline_coverage_failed attempt={attempt + 1} missing={coverage_issues}")
         else:
@@ -237,4 +285,4 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
 
     t1 = time.perf_counter()
     logger.warning(f"outline_done_with_issues seconds={t1 - t0:.2f} attempts=3 issues={last_issues}")
-    return best_outline
+    return _add_outline_numbering(best_outline)

@@ -84,6 +84,17 @@
             </div>
           </div>
           <details class="mt">
+            <summary class="card-subtitle">🔎 选择知识库用于检索（可选）</summary>
+            <div class="field mt">
+              <label class="field-label">选择要用于检索的知识库</label>
+              <div class="field-row">
+                <select id="retrievalKbSelect" class="input input-sm"></select>
+                <button id="btnRefreshRetrievalKb" class="btn btn-outline btn-sm">刷新列表</button>
+              </div>
+              <div class="kv-value" style="margin-top:4px;font-size:11px">生成报告时，将在此知识库中检索相关资料</div>
+            </div>
+          </details>
+          <details class="mt">
             <summary class="card-subtitle">📚 从知识库选择文件（可选）</summary>
             <div class="field mt">
               <div class="field-row">
@@ -145,12 +156,6 @@
           <div class="btn-row mt">
             <button id="btnTplSave" class="btn btn-primary btn-sm">保存模板</button>
             <button id="btnTplUse" class="btn btn-outline btn-sm">用于当前任务</button>
-            <select id="tplNewPreset" class="select" style="width:auto;min-width:110px;font-size:11px">
-              <option value="blank">空白模板</option>
-              <option value="academic">学术论文模板</option>
-              <option value="tech">技术报告模板</option>
-              <option value="business">商业计划书模板</option>
-            </select>
             <button id="btnTplNew" class="btn btn-outline btn-sm">新建</button>
           </div>
         </section>
@@ -193,6 +198,7 @@
             <div class="field-row mt">
               <select id="kbSelect" class="input input-sm"></select>
               <button id="btnKbRefresh" class="btn btn-outline btn-sm">刷新</button>
+              <button id="btnKbDelete" class="btn btn-outline btn-sm" style="color:var(--c-red)">删除KB</button>
             </div>
             <div class="field mt">
               <label class="field-label">查询问题</label>
@@ -272,13 +278,6 @@
             <button class="tab" data-tab="content">正文</button>
             <button class="tab" id="tabCompare" data-tab="compare" style="display:none">版本对比</button>
           </div>
-          <div id="evalMetricsBar" style="display:none; padding:6px 10px; margin:4px 0; background:#f8f9fa; border-radius:6px; font-size:12px; display:none; flex-wrap:wrap; gap:8px; align-items:center">
-            <span style="font-weight:700; color:#374151">📊 报告质量：</span>
-            <span id="evalWarns" style="padding:2px 8px; border-radius:4px;"></span>
-            <span id="evalFActScore" style="padding:2px 8px; border-radius:4px;"></span>
-            <span id="evalCoverage" style="padding:2px 8px; border-radius:4px;"></span>
-            <span id="evalCiteAcc" style="padding:2px 8px; border-radius:4px;"></span>
-          </div>
           <div id="versionBar" class="version-bar" style="display:none">
             <span class="kv-label">版本：</span>
             <span id="versionTags"></span>
@@ -333,16 +332,23 @@
           <div id="abBox" class="ab-box"></div>
         </section>
 
+        <!-- Warnings Card -->
+        <section class="card" id="warningsCard" style="display:none">
+          <h2 class="card-title">⚠️ 待核实问题 <span id="warningsCount" class="badge-warn">0</span></h2>
+          <div id="warningsList" class="warnings-list"></div>
+        </section>
+
         <!-- Eval Card -->
         <section class="card" id="evalCard" style="display:none">
-          <h2 class="card-title">📊 文档质量评估</h2>
-          <div class="eval-tabs" id="evalTabs">
-            <button class="eval-tab active" data-eval="combined">综合</button>
-            <button class="eval-tab" data-eval="decomposed">规则评估</button>
-            <button class="eval-tab" data-eval="llm">LLM 评判</button>
-            <button class="eval-tab" data-eval="reasoning">评语</button>
+          <h2 class="card-title">📊 报告质量评估</h2>
+          <div id="evalMetricsBar" style="display:flex; flex-wrap:wrap; gap:6px; align-items:center; font-size:12px; margin-bottom:10px">
+            <span id="evalWarns" style="padding:3px 10px; border-radius:4px;"></span>
+            <span id="evalFActScore" style="padding:3px 10px; border-radius:4px;"></span>
+            <span id="evalCoverage" style="padding:3px 10px; border-radius:4px;"></span>
+            <span id="evalConsistency" style="padding:3px 10px; border-radius:4px;"></span>
           </div>
-          <div id="evalContent" class="eval-content"></div>
+          <div id="evalBars"></div>
+          <div id="evalContent" class="eval-content" style="margin-top:6px;font-size:11px;color:var(--c-text2)"></div>
         </section>
       </main>
     </div>

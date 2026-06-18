@@ -134,7 +134,7 @@ def _llm_listwise_core(query: str, hits: list[Hit], top_k: int) -> list[Hit]:
             timeout_s=40,
             temperature=0.0,
             num_predict=200,
-            system="你是一个专业的检索排序助手。只输出逗号分隔的数字编号，不输出其他内容。",
+            system="你是一个中文文档处理助手。只输出逗号分隔的数字编号。",
             api_style=CONTENT_API_STYLE,
             api_endpoint=CONTENT_API_ENDPOINT,
             api_key=CONTENT_API_KEY,

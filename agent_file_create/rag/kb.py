@@ -1,14 +1,13 @@
 import hashlib
 import json
+import logging
 import math
 import re
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-import jieba
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -24,596 +23,51 @@ from agent_file_create.rag.chunker import chunk_text
 from agent_file_create.rag.embedder import embed_texts
 from agent_file_create.rag.reranker import rerank
 from agent_file_create.rag.store import Hit, default_store
-from agent_file_create.preprocessor import extract_pdf_text_fast, read_text_file, extract_docx_structured, extract_pptx_structured, ocr_image
 
-# Simple LRU query-embedding cache to avoid re-embedding identical queries
-_QUERY_CACHE: OrderedDict[str, list[float]] = OrderedDict()
-_QUERY_CACHE_MAX = 128
-
-# LRU cache for HyDE expanded queries to avoid redundant LLM calls
-_HYDE_CACHE: OrderedDict[str, str] = OrderedDict()
-_HYDE_CACHE_MAX = 64
-
-# Content-hash → embedding cache to avoid re-embedding identical chunks across docs
-_CONTENT_EMBED_CACHE: OrderedDict[str, list[float]] = OrderedDict()
-_CONTENT_EMBED_CACHE_MAX = 512
-
-_ANSWER_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", "你是一个中文助手，只输出中文。"),
-        (
-            "human",
-            """\
-你是企业知识库问答助手。请基于给定的检索片段回答问题。
-规则：
-1) 只根据检索片段回答；不要编造。
-2) 如果片段不足以回答，明确说不确定，并提出 1-3 个澄清问题或建议补充哪些文档。
-3) 输出尽量简洁，必要时 3-6 条要点。
-4) 末尾追加一行：依据：<引用编号或doc_id/section（最多3条）>；若无法定位写"依据：未命中"。
-
-知识库：
-{kb}
-
-检索片段：
-{context}
-
-用户问题：
-{question}
-
-回答：""",
-        ),
-    ]
+# ── Extracted sub-modules ────────────────────────────────────────────────────
+from agent_file_create.rag._utils import (     # noqa: E402
+    safe_json as _safe_json,
+    normalize_kb as _normalize_kb,
+    guess_is_markdown as _guess_is_markdown,
+    tokenize as _tokenize,
+    bm25_scores as _bm25_scores,
+    rrf_ranks as _rrf_ranks,
+    query_has_numbers as _query_has_numbers,
+    query_has_technical_terms as _query_has_technical_terms,
+    query_has_specialized_terms as _query_has_specialized_terms,
+    query_concreteness as _query_concreteness,
+    title_keyword_boost as _title_keyword_boost,
+    mmr_rerank as _mmr_rerank,
+    extract_entities as _extract_entities,
+    split_sentences as _split_sentences,
+    read_any_text as _read_any_text,
+)
+from agent_file_create.rag._prompts import (   # noqa: E402
+    Citation,
+    Answer,
+    ANSWER_PROMPT as _ANSWER_PROMPT,
+    ANSWER_COT_PROMPT as _ANSWER_COT_PROMPT,
+    HYDE_PROMPT as _HYDE_PROMPT,
+    DECOMPOSE_PROMPT as _DECOMPOSE_PROMPT,
+    QUERY_REWRITE_PROMPT as _QUERY_REWRITE_PROMPT,
+    MULTI_QUERY_PROMPT as _MULTI_QUERY_PROMPT,
+    STEPBACK_PROMPT as _STEPBACK_PROMPT,
+    QUERY_ROUTE_PROMPT as _QUERY_ROUTE_PROMPT,
+    METADATA_FILTER_PROMPT as _METADATA_FILTER_PROMPT,
 )
 
-# ── Chain-of-thought answer prompt ─────────────────────────────────────────
+logger = logging.getLogger
 
-_ANSWER_COT_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", "你是一个中文助手，擅长逐步推理和严谨分析。"),
-        (
-            "human",
-            """\
-你是企业知识库问答助手。请基于给定的检索片段，通过逐步推理回答问题。
-
-推理步骤：
-1) 问题理解：用自己的话复述问题的核心要点和隐含假设。
-2) 证据梳理：从检索片段中逐条列出相关证据，标注来源编号（如 [1] [2]）。
-3) 推理链条：基于证据进行逐步推理。若多个证据之间存在关联（因果、对比、递进等），请明确说明推理路径。
-4) 最终回答：给出简洁的最终答案（3-6 条要点）。
-5) 自我检查：逐条核查最终回答中的每个论断——是否有对应的检索片段支撑？无支撑的推断请明确标注为「（推测）」或「（材料未覆盖）」。
-
-规则：
-- 只根据检索片段回答；不要编造。
-- 如果片段不足以回答，在步骤 4 明确说不确定，并在步骤 5 建议补充哪些文档。
-- 末尾追加一行：依据：<引用编号（最多3条）>；若无法定位写"依据：未命中"。
-
-知识库：
-{kb}
-
-检索片段：
-{context}
-
-用户问题：
-{question}
-
-推理过程：""",
-        ),
-    ]
-)
-
-# ── HyDE (Hypothetical Document Embeddings) prompt ─────────────────────────
-
-_HYDE_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", "你是一个中文技术文档撰写助手。"),
-        (
-            "human",
-            """\
-请用3-5句话编写一段可能回答以下问题的文本段落。要求：
-- 使用专业、正式的语气
-- 包含可能的关键术语和概念
-- 模拟知识库文档的风格
-- 只输出文本段落，不要解释或标注
-
-问题：{question}
-
-假设回答：""",
-        ),
-    ]
-)
-
-# ── Question decomposition prompt ──────────────────────────────────────────
-
-_DECOMPOSE_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", "你是一个中文问答系统分析师。"),
-        (
-            "human",
-            """\
-判断以下问题是否需要分解为子问题来回答。如果需要，请分解为2-4个子问题，每个子问题一行。
-如果问题本身很简单、不需要分解，只回复：SIMPLE
-
-问题：{question}
-
-分解结果：""",
-        ),
-    ]
-)
-
-# ── Query Rewriting prompt ──────────────────────────────────────────────
-
-_QUERY_REWRITE_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", "你是一个搜索查询优化专家。"),
-        (
-            "human",
-            """\
-将以下用户口语化问题改写为一个更精确、更适合知识库检索的查询。
-
-规则：
-- 补全代词和省略的主语，例如"那个政策"→指明具体政策名
-- 将口语化表达转为书面语，例如"咋报销"→"费用报销流程"
-- 保留所有关键信息，不添加用户未提及的内容
-- 只输出改写后的查询，不要任何解释
-
-原始问题：{question}
-
-改写查询：""",
-        ),
-    ]
-)
-
-# ── Multi-Query expansion prompt ────────────────────────────────────────
-
-_MULTI_QUERY_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", "你是一个搜索查询多样化专家。"),
-        (
-            "human",
-            """\
-为以下问题生成 {n} 个不同角度的检索查询，提高从知识库中找到相关文档的概率。
-
-规则：
-- 从不同表述方式、不同关键词组合、不同粒度（宏观/微观）生成变体
-- 包含同义词替换，例如"预算"可替换为"资金分配""财务计划"
-- 每个查询一行，不要编号，不要解释
-
-原始问题：{question}
-
-{n}个查询变体：""",
-        ),
-    ]
-)
-
-# ── Step-Back prompting ─────────────────────────────────────────────────
-
-_STEPBACK_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", "你是一个知识推理专家。"),
-        (
-            "human",
-            """\
-为以下具体问题生成一个更高层次、更宽泛的背景问题，用于检索广泛的背景知识。
-
-规则：
-- 从具体细节中抽象出更高层的概念或原则
-- 背景问题应帮助理解原始问题所处的上下文
-- 只输出一个背景问题，不要解释
-
-具体问题：{question}
-
-背景问题：""",
-        ),
-    ]
-)
-
-# ── Query Routing / Classification prompt ───────────────────────────────
-
-_QUERY_ROUTE_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", "你是一个查询分类专家。只输出一个分类标签。"),
-        (
-            "human",
-            """\
-将以下问题分类为以下之一：
-- fact_lookup：查找单个事实、数字、定义
-- comparison：比较两个或多个事物的异同
-- summary：要求总结某个主题或文档的要点
-- multi_document：需要综合多份文档的信息才能回答
-- how_to：询问操作步骤或方法
-
-只输出标签名称，不要解释。
-
-问题：{question}
-
-分类：""",
-        ),
-    ]
-)
-
-# ── Metadata filter extraction prompt ───────────────────────────────────
-
-_METADATA_FILTER_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", "你是一个查询分析专家。只输出JSON。"),
-        (
-            "human",
-            """\
-从用户问题中提取隐含的过滤条件，用于缩小知识库检索范围。
-
-可提取的字段：
-- doc_type：文档类型，如"制度""规范""报告""FAQ""合同"
-- source：文档来源关键词，如文件名或部门名
-- time_range：时间范围，如"2024""2023-2024""近三年"
-
-只输出JSON，如果没有可提取的条件输出空对象{{}}。
-
-问题：{question}
-
-JSON过滤条件：""",
-        ),
-    ]
-)
-
-
-def _safe_json(obj: Any, max_len: int) -> str:
-    try:
-        s = json.dumps(obj, ensure_ascii=False)
-    except Exception:
-        s = str(obj)
-    s = s.strip()
-    if len(s) > max_len:
-        return s[:max_len] + "…"
-    return s
-
-
-def _normalize_kb(name: str) -> str:
-    n = (name or "").strip()
-    n = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", n).strip("._")
-    return n or "default"
-
-
-def _guess_is_markdown(path: str) -> bool:
-    suf = Path(path).suffix.lower()
-    return suf in {".md", ".markdown"}
-
-
-def _tokenize(text: str, *, max_terms: int = 80) -> list[str]:
-    s = str(text or "").strip()
-    if not s:
-        return []
-    tokens = jieba.lcut(s)
-    out: list[str] = []
-    for t in tokens:
-        t = t.strip()
-        if not t:
-            continue
-        k = t.lower()
-        if len(k) > 32:
-            k = k[:32]
-        out.append(k)
-        if len(out) >= int(max_terms or 0):
-            break
-    return out
-
-
-def _bm25_scores(query_terms: list[str], docs_terms: list[list[str]]) -> list[float]:
-    qs = [str(x or "").strip().lower() for x in (query_terms or []) if str(x or "").strip()]
-    if not qs or not docs_terms:
-        return [0.0 for _ in docs_terms]
-    uniq: list[str] = []
-    seen = set()
-    for t in qs:
-        if t in seen:
-            continue
-        seen.add(t)
-        uniq.append(t)
-        if len(uniq) >= 24:
-            break
-    if not uniq:
-        return [0.0 for _ in docs_terms]
-
-    N = float(len(docs_terms))
-    dl = [float(len(x) or 1) for x in docs_terms]
-    avgdl = sum(dl) / float(len(dl) or 1)
-    df = {t: 0 for t in uniq}
-    tfs: list[dict[str, int]] = []
-    for terms in docs_terms:
-        m: dict[str, int] = {}
-        st = set()
-        for w in terms:
-            if w in df:
-                m[w] = m.get(w, 0) + 1
-                st.add(w)
-        for w in st:
-            df[w] += 1
-        tfs.append(m)
-
-    k1 = 1.2
-    b = 0.75
-    scores: list[float] = []
-    for i, m in enumerate(tfs):
-        s = 0.0
-        dli = dl[i]
-        for t in uniq:
-            f = float(m.get(t, 0))
-            if f <= 0.0:
-                continue
-            dft = float(df.get(t, 0))
-            idf = math.log((N - dft + 0.5) / (dft + 0.5) + 1.0)
-            denom = f + k1 * (1.0 - b + b * dli / float(avgdl or 1.0))
-            s += idf * (f * (k1 + 1.0) / float(denom or 1.0))
-        scores.append(float(s))
-    return scores
-
-
-def _rrf_ranks(items: list[tuple[str, float]]) -> dict[str, int]:
-    xs = [(k, float(v)) for k, v in (items or []) if str(k or "").strip()]
-    xs.sort(key=lambda x: x[1], reverse=True)
-    out: dict[str, int] = {}
-    rank = 1
-    for k, _ in xs:
-        if k in out:
-            continue
-        out[k] = rank
-        rank += 1
-    return out
-
-
-# ── Recall-layer: query analysis helpers ────────────────────────────────
-
-def _query_has_numbers(q: str) -> bool:
-    return bool(re.search(r"\d+", q))
-
-
-def _query_has_technical_terms(q: str) -> bool:
-    """Heuristic: check for technical/code-like patterns that vector search may miss."""
-    return bool(re.search(r"[A-Z]{2,}|\b(?:GB|TB|API|SDK|ID|URL|PDF|ISO|GDPR)\b|[A-Z]+/[A-Z]+", q))
-
-
-def _query_has_specialized_terms(q: str) -> bool:
-    """Detect compound Chinese technical terms: 2-4 char specific nouns.
-
-    Queries with specialized terms benefit more from vector search because
-    embedding captures conceptual similarity even when exact term doesn't match.
-    """
-    try:
-        tokens = jieba.lcut(q)
-    except Exception:
-        return False
-    # Count 2-4 char tokens that look like compound technical terms
-    # (not common stopwords/particles)
-    stop_chars = set("的了吗呢吧啊嗯是都在和与或对从到用把被让给为以而因但")
-    specialized = 0
-    for t in tokens:
-        t = t.strip()
-        if 2 <= len(t) <= 6 and not any(c in stop_chars for c in t):
-            # Check it contains at least one non-trivial character pair
-            specialized += 1
-    return specialized >= 3  # at least 3 specialized compound terms
-
-
-def _query_concreteness(q: str) -> float:
-    """0-1 score: how concrete/specific the query is (vs abstract/conversational)."""
-    abstract_kw = ["为什么", "原因", "影响", "趋势", "发展", "前景", "意义", "作用",
-                   "分析", "评估", "判断", "看法", "观点", "理解", "解释"]
-    concrete_kw = ["多少", "什么时间", "在哪里", "谁", "哪个", "编号", "日期",
-                   "金额", "比例", "百分比", "步骤", "流程", "定义"]
-    abstract_hits = sum(1 for kw in abstract_kw if kw in q)
-    concrete_hits = sum(1 for kw in concrete_kw if kw in q)
-    if abstract_hits + concrete_hits == 0:
-        return 0.5  # neutral
-    return concrete_hits / (abstract_hits + concrete_hits)
-
-
-def _title_keyword_boost(hits: list[Hit], query: str, *, boost_factor: float = 0.10) -> list[Hit]:
-    """Boost chunks whose document title contains query keywords.
-
-    Title match is a strong relevance signal: if a query mentions "RAG超参数调优"
-    and the document title is "基于贝叶斯优化的RAG系统超参数调优", that document
-    should be ranked higher regardless of chunk content match.
-    """
-    if not hits or not query:
-        return hits
-    q_terms = _tokenize(query, max_terms=20)
-    if not q_terms:
-        return hits
-    q_lower = str(query).lower()
-    for h in hits:
-        title = str(h.meta.get("title") or "").lower()
-        if not title:
-            continue
-        # Count query terms appearing in title (more matches = stronger signal)
-        matched = sum(1 for t in q_terms if t.lower() in title)
-        # Also check if the full query or a substantial substring appears
-        if matched == 0 and len(query) >= 4:
-            # Try bigram overlap: any 2-char sequence from query appearing in title
-            for i in range(len(q_lower) - 1):
-                if q_lower[i:i+2] in title:
-                    matched += 0.5
-        if matched > 0:
-            boost = 1.0 + boost_factor * min(float(matched), 4.0)
-            object.__setattr__(h, "score", float(h.score) * boost)
-    # Re-sort by boosted score
-    hits.sort(key=lambda x: float(x.score), reverse=True)
-    return hits
-
-
-def _mmr_rerank(hits: list[Hit], *, lambda_param: float = 0.7, top_k: int = 8) -> list[Hit]:
-    """Maximal Marginal Relevance: balance relevance with section/doc diversity.
-
-    lambda=1.0 → pure relevance ranking; lambda=0.0 → pure diversity.
-    lambda=0.7 → 70% relevance, 30% diversity.
-    """
-    if not hits or len(hits) <= 1:
-        return hits[:top_k]
-
-    selected: list[Hit] = [hits[0]]
-    remaining = hits[1:]
-
-    while remaining and len(selected) < top_k:
-        best_idx = 0
-        best_score = -1.0
-        for i, h in enumerate(remaining):
-            # Relevance component
-            rel = float(h.score)
-            # Diversity component: max similarity to any already-selected hit
-            max_sim = 0.0
-            for s in selected:
-                # Doc-level diversity: same doc → penalty
-                if str(h.doc_id or "") == str(s.doc_id or ""):
-                    max_sim = max(max_sim, 0.5)
-                # Section-level diversity: same top-level section → small penalty
-                h_sec = (str(h.section_path or "").split("/")[0] if h.section_path else "").strip()
-                s_sec = (str(s.section_path or "").split("/")[0] if s.section_path else "").strip()
-                if h_sec and s_sec and h_sec == s_sec:
-                    max_sim = max(max_sim, 0.3)
-            mmr = lambda_param * rel - (1.0 - lambda_param) * max_sim
-            if mmr > best_score:
-                best_score = mmr
-                best_idx = i
-        selected.append(remaining.pop(best_idx))
-
-    return selected
-
-
-def _extract_entities(q: str) -> list[str]:
-    """Extract key entities from query for exact-match boosting.
-
-    Handles Chinese text via jieba POS tagging + regex for structured patterns.
-    """
-    entities: list[str] = []
-    seen: set[str] = set()
-
-    # 1) Regex: dates, numbers, percentages, amounts, codes
-    patterns = [
-        (r"\d{4}年\d{1,2}月\d{1,2}日", "date_full"),
-        (r"\d{4}年(?:\d{1,2}月)?", "date_year"),
-        (r"\d+\.?\d*%", "percentage"),
-        (r"(?:USD|RMB|EUR|JPY|CNY)\s*\d+\.?\d*", "currency_code"),
-        (r"\d+\.?\d*\s*(?:元|万元|亿美元|万元人民币)", "currency_cn"),
-        (r"[A-Z]{2,}[-一-鿿]*\d*[A-Z]*", "code"),
-        (r"[A-Z]+/[A-Z]+(?:\d+\.?\d*)?", "technical_id"),
-        (r"第[一二三四五六七八九十\d]+[章节条款项]", "section_ref"),
-    ]
-    for pat, _ in patterns:
-        for m in re.finditer(pat, q):
-            ent = m.group(0).strip()
-            if ent and ent not in seen and len(ent) >= 2:
-                entities.append(ent)
-                seen.add(ent)
-
-    # 2) Jieba: extract nouns (nr/ns/nz/nt/n - named entities, nouns)
-    try:
-        import jieba.posseg as pseg
-        words = pseg.lcut(q)
-    except Exception:
-        words = [(w, "") for w in jieba.lcut(q)]
-    for word, flag in words:
-        w = word.strip()
-        if len(w) < 2 or w in seen:
-            continue
-        if flag and flag[0] in ("n",):  # noun-class: n, nr, ns, nz, nt
-            entities.append(w)
-            seen.add(w)
-        elif not flag and len(w) >= 3:  # fallback: treat longer words as potential entities
-            if w not in entities:
-                entities.append(w)
-                seen.add(w)
-
-    # 3) Also capture quoted strings
-    for m in re.finditer(r"[“”「」『』「」『』\"‘’'](.+?)[“”「」『』「」『』\"‘’']", q):
-        ent = m.group(1).strip()
-        if ent and ent not in seen and len(ent) >= 2:
-            entities.append(ent)
-            seen.add(ent)
-
-    return entities
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split Chinese/English text into sentences."""
-    if not text or not str(text).strip():
-        return []
-    # Sentence boundary patterns for Chinese + English
-    sents = re.split(r"(?<=[。！？；\n])\s*|(?<=[.!?;])\s+(?=[A-Z一-鿿])", str(text))
-    out = [s.strip() for s in sents if s.strip() and len(s.strip()) >= 3]
-    return out
-
-
-def _read_any_text(path: str) -> str:
-    p = Path(path)
-    suf = p.suffix.lower().lstrip(".")
-    if suf == "pdf":
-        t = extract_pdf_text_fast(str(p))
-        if t:
-            return t.replace("\x00", "")
-    # Binary / structured formats: use proper extractors
-    if suf in {"xlsx", "xls"}:
-        try:
-            import pandas as pd
-            df = pd.read_excel(str(p))
-            cols = list(df.columns)
-            rows = min(len(df), 200)
-            lines = [f"columns={cols}", f"rows={len(df)}"]
-            for _, row in df.head(rows).iterrows():
-                lines.append(" | ".join([str(v) for v in row.values if str(v).strip()]))
-            return "\n".join(lines).replace("\x00", "")
-        except Exception:
-            pass
-    if suf in {"docx"}:
-        try:
-            t = extract_docx_structured(str(p))
-            if t:
-                return t.replace("\x00", "")
-        except Exception:
-            pass
-    if suf in {"pptx", "ppt"}:
-        try:
-            t = extract_pptx_structured(str(p))
-            if t:
-                return t.replace("\x00", "")
-        except Exception:
-            pass
-    if suf in {"png", "jpg", "jpeg", "webp", "gif", "bmp"}:
-        try:
-            ocr_text = ocr_image(Path(p).read_bytes())
-            if ocr_text:
-                return "图片OCR文字：\n" + ocr_text.replace("\x00", "").strip()
-        except Exception:
-            pass
-        return f"[图片文件] {p.name} (无可提取文字，建议启用OCR)"
-
-    try:
-        return read_text_file(str(p)).replace("\x00", "")
-    except Exception:
-        try:
-            data = p.read_bytes()
-            return data.decode("utf-8", errors="ignore").replace("\x00", "")
-        except Exception:
-            return ""
-
-
-@dataclass(frozen=True)
-class Citation:
-    doc_id: str
-    chunk_id: str
-    section_path: str
-    score: float
-    snippet: str
-
-
-@dataclass(frozen=True)
-class Answer:
-    kb: str
-    question: str
-    answer: str
-    citations: list[Citation]
-
+# All standalone helper functions moved to rag._utils
+# All prompt templates and dataclasses moved to rag._prompts
 
 class KnowledgeBase:
     def __init__(self, *, store=None) -> None:
         self.store = store or default_store()
+        # Per-instance LRU caches (were module-level globals before)
+        self._query_cache: "OrderedDict[str, list[float]]" = __import__('collections').OrderedDict()
+        self._hyde_cache: "OrderedDict[str, str]" = __import__('collections').OrderedDict()
+        self._content_embed_cache: "OrderedDict[str, list[float]]" = __import__('collections').OrderedDict()
 
     def list_kb(self) -> list[str]:
         return self.store.list_kb()
@@ -874,9 +328,9 @@ class KnowledgeBase:
         for i, (raw, aug) in enumerate(zip(chunk_contents_raw, chunk_contents)):
             ch = hashlib.md5(aug.encode("utf-8")).hexdigest()
             content_hashes.append(ch)
-            if ch in _CONTENT_EMBED_CACHE:
-                _CONTENT_EMBED_CACHE.move_to_end(ch)
-                vecs.append(list(_CONTENT_EMBED_CACHE[ch]))
+            if ch in self._content_embed_cache:
+                self._content_embed_cache.move_to_end(ch)
+                vecs.append(list(self._content_embed_cache[ch]))
             else:
                 vecs.append([])
                 uncached_idxs.append(i)
@@ -884,15 +338,15 @@ class KnowledgeBase:
         embedding_ok = True
         if uncached_idxs:
             try:
-                fresh_vecs = embed_texts([chunk_contents[i] for i in uncached_idxs], timeout_s=60, max_batch=8)
+                fresh_vecs = embed_texts([chunk_contents[i] for i in uncached_idxs], timeout_s=90, max_batch=4)
                 if len(fresh_vecs) == len(uncached_idxs):
                     for j, idx in enumerate(uncached_idxs):
                         v = fresh_vecs[j]
                         vecs[idx] = v
-                        _CONTENT_EMBED_CACHE[content_hashes[idx]] = list(v)
-                        _CONTENT_EMBED_CACHE.move_to_end(content_hashes[idx])
-                        while len(_CONTENT_EMBED_CACHE) > _CONTENT_EMBED_CACHE_MAX:
-                            _CONTENT_EMBED_CACHE.popitem(last=False)
+                        self._content_embed_cache[content_hashes[idx]] = list(v)
+                        self._content_embed_cache.move_to_end(content_hashes[idx])
+                        while len(self._content_embed_cache) > self._content_embed_cache_MAX:
+                            self._content_embed_cache.popitem(last=False)
                 else:
                     embedding_ok = False
             except Exception:
@@ -927,21 +381,19 @@ class KnowledgeBase:
             return {"kb": kb2, "doc_id": did, "ok": False, "error": "db_failed:" + str(e)[:180]}
         return {"kb": kb2, "doc_id": did, "ok": True, "chunks": n}
 
-    @staticmethod
-    def _cached_embed_query(query: str) -> Optional[list[float]]:
+    def _cached_embed_query(self, query: str) -> Optional[list[float]]:
         key = hashlib.md5(query.encode("utf-8")).hexdigest()
-        if key in _QUERY_CACHE:
-            _QUERY_CACHE.move_to_end(key)
-            return list(_QUERY_CACHE[key])
+        if key in self._query_cache:
+            self._query_cache.move_to_end(key)
+            return list(self._query_cache[key])
         return None
 
-    @staticmethod
-    def _set_cached_embed_query(query: str, vec: list[float]) -> None:
+    def _set_cached_embed_query(self, query: str, vec: list[float]) -> None:
         key = hashlib.md5(query.encode("utf-8")).hexdigest()
-        _QUERY_CACHE[key] = list(vec)
-        _QUERY_CACHE.move_to_end(key)
-        while len(_QUERY_CACHE) > _QUERY_CACHE_MAX:
-            _QUERY_CACHE.popitem(last=False)
+        self._query_cache[key] = list(vec)
+        self._query_cache.move_to_end(key)
+        while len(self._query_cache) > 128:
+            self._query_cache.popitem(last=False)
 
     # ── Recall-layer: adaptive, entity-aware, diversity, time-decay ────────
 
@@ -1128,7 +580,7 @@ class KnowledgeBase:
                 timeout_s=30,
                 temperature=0.0,
                 num_predict=qe_count * 100,
-                system="你是一个专业的查询扩展助手。只输出子查询，每行一个。",
+                system="你是一个中文文档处理助手。只输出子查询，每行一个。",
                 api_style=CONTENT_API_STYLE,
                 api_endpoint=CONTENT_API_ENDPOINT,
                 api_key=CONTENT_API_KEY,
@@ -1205,7 +657,7 @@ class KnowledgeBase:
                 timeout_s=30,
                 temperature=0.3,
                 num_predict=hyde_tokens,
-                system="你是一个学术论文作者，用专业术语撰写摘要片段。",
+                system="你是一个中文文档处理助手。用专业术语撰写摘要片段。",
                 api_style=CONTENT_API_STYLE,
                 api_endpoint=CONTENT_API_ENDPOINT,
                 api_key=CONTENT_API_KEY,
@@ -1712,6 +1164,70 @@ class KnowledgeBase:
         scored = sorted(merged.values(), key=lambda x: x[1], reverse=True)
         return [h for h, _ in scored[:max(1, int(top_k or 0))]]
 
+    # ── Context Compression (CRAG-style) ──────────────────────────────────────
+
+    def compress_context(self, *, kb: str, query: str, top_k: int = 15,
+                          max_chars: int = 1500) -> str:
+        """Search → decompose chunks into sentences → filter irrelevant → recompose.
+
+        Reduces noise from retrieved chunks before passing to the LLM, improving
+        answer quality and reducing hallucinations from irrelevant content.
+        """
+        kb2 = _normalize_kb(kb)
+        q = str(query or "").strip()
+        if not q:
+            return ""
+
+        # Step 1: Retrieve a larger candidate pool
+        hits = self.search_adaptive(kb=kb2, query=q, top_k=top_k)
+        if not hits:
+            hits = self.search(kb=kb2, query=q, top_k=top_k)
+        if not hits:
+            return ""
+
+        # Step 2: Decompose — collect all sentences from hits
+        all_sentences: list[str] = []
+        for h in hits:
+            content = str(h.content or "").strip()
+            if not content:
+                continue
+            for sent in re.split(r"[。！？.!?\n]+", content):
+                sent = sent.strip()
+                if len(sent) >= 8:
+                    all_sentences.append(sent)
+
+        if not all_sentences:
+            return "\n\n".join(str(h.content or "") for h in hits[:3])
+
+        # Step 3: LLM picks relevant sentences (1 LLM call)
+        sentences_text = "\n".join(
+            f"[S{i+1}] {s}" for i, s in enumerate(all_sentences[:30]))
+        prompt = (
+            "从以下检索到的句子中筛选出与问题相关的句子，过滤无关内容。\n\n"
+            f"问题：{q[:300]}\n\n候选句子：\n{sentences_text[:3000]}\n\n"
+            "输出相关句子序号(逗号分隔,如S1,S3,S5)。无相关回复NONE。"
+        )
+        raw = call_llm(prompt, timeout_s=15, temperature=0.0, num_predict=100,
+                       system="你是一个中文文档处理助手。只输出相关句子序号。")
+        indices: set[int] = set()
+        for m in re.findall(r"S?(\d+)", raw or ""):
+            idx = int(m) - 1
+            if 0 <= idx < len(all_sentences):
+                indices.add(idx)
+
+        if not indices:
+            # Fallback: return raw top-3 hits
+            return "\n\n".join(str(h.content or "") for h in hits[:3])
+
+        # Step 4: Recompose — join relevant sentences
+        refined = ""
+        for i in sorted(indices):
+            s = all_sentences[i]
+            if len(refined) + len(s) + 2 > max_chars:
+                break
+            refined += s + "。"
+        return refined.strip()
+
     def answer_smart(
         self,
         *,
@@ -1969,9 +1485,9 @@ class KnowledgeBase:
         if len(q) < 10:
             return q
         key = hashlib.md5(q.encode("utf-8")).hexdigest()
-        if key in _HYDE_CACHE:
-            _HYDE_CACHE.move_to_end(key)
-            return _HYDE_CACHE[key]
+        if key in self._hyde_cache:
+            self._hyde_cache.move_to_end(key)
+            return self._hyde_cache[key]
         try:
             chain = _HYDE_PROMPT | self._get_answer_llm() | StrOutputParser()
             hypothetical = (chain.invoke({"question": q}) or "").strip()
@@ -1981,10 +1497,10 @@ class KnowledgeBase:
                 result = q
         except Exception:
             result = q
-        _HYDE_CACHE[key] = result
-        _HYDE_CACHE.move_to_end(key)
-        while len(_HYDE_CACHE) > _HYDE_CACHE_MAX:
-            _HYDE_CACHE.popitem(last=False)
+        self._hyde_cache[key] = result
+        self._hyde_cache.move_to_end(key)
+        while len(self._hyde_cache) > self._hyde_cache_MAX:
+            self._hyde_cache.popitem(last=False)
         return result
 
     def answer_with_reasoning(
@@ -2113,7 +1629,7 @@ class KnowledgeBase:
         synthesis_context = "\n\n".join(parts)
 
         synth_prompt = ChatPromptTemplate.from_messages([
-            ("system", "你是一个中文助手，擅长综合多角度信息。"),
+            ("system", "你是一个中文文档处理助手。擅长综合多角度信息。"),
             ("human", """\
 基于以下子问题的分析结果，综合回答原始问题。要求：
 1) 融合各子问题的关键发现，给出连贯的整体回答

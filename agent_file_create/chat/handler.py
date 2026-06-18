@@ -29,7 +29,14 @@ from agent_file_create.task.manager import TaskManager
 
 logger = logging.getLogger(__name__)
 
-_KB = KnowledgeBase()
+_kb_instance = None
+
+def _get_kb():
+    """Lazy-initialize KnowledgeBase singleton (replaces module-level global)."""
+    global _kb_instance
+    if _kb_instance is None:
+        _kb_instance = KnowledgeBase()
+    return _kb_instance
 
 
 class ChatHandler:
@@ -356,7 +363,7 @@ class ChatHandler:
             return self._format_status(task_id)
 
         if typ == "kb_list":
-            items = _KB.list_kb()
+            items = _get_kb().list_kb()
             if not items:
                 return "暂无知识库。可调用 /api/kb/upload 上传文件入库。"
             return "知识库列表：\n" + "\n".join(["- " + str(x) for x in items[:50]])
@@ -372,7 +379,7 @@ class ChatHandler:
         if typ == "kb_stats":
             kb = str(action.get("kb") or "").strip() or "default"
             try:
-                st = _KB.kb_stats(kb=kb)
+                st = _get_kb().kb_stats(kb=kb)
                 return f"知识库 {kb}：文档数={st.get('doc_count',0)} chunk数={st.get('chunk_count',0)}"
             except Exception as e:
                 return f"获取统计失败：{str(e)[:180]}"
@@ -383,12 +390,12 @@ class ChatHandler:
                 return "用法：/kb delete <kb> [doc_id]"
             try:
                 if doc_id:
-                    r = _KB.delete_doc(kb=kb, doc_id=doc_id)
+                    r = _get_kb().delete_doc(kb=kb, doc_id=doc_id)
                     if r.get("ok"):
                         return f"已从知识库 {kb} 中删除文档 {doc_id}。"
                     return f"删除失败：{r.get('error', 'unknown')[:180]}"
                 else:
-                    r = _KB.delete_kb(kb=kb)
+                    r = _get_kb().delete_kb(kb=kb)
                     if r.get("ok"):
                         return f"已删除知识库 {kb}。"
                     return f"删除失败：{r.get('error', 'unknown')[:180]}"
@@ -755,11 +762,11 @@ class ChatHandler:
                     msg = str(message or "")
                     # For reasoning questions, expand via HyDE before retrieval
                     if self._should_use_hyde(msg):
-                        search_query = _KB._hyde_expand(msg)
+                        search_query = _get_kb()._hyde_expand(msg)
                     else:
                         search_query = self._rewrite_query(msg)
                     retriever = KnowledgeBaseRetriever(
-                        kb=active_kb, knowledge_base=_KB, top_k=6, context_window=2
+                        kb=active_kb, knowledge_base=_get_kb(), top_k=6, context_window=2
                     )
                     docs = retriever.invoke(search_query)
                     blocks: list[str] = []
@@ -869,11 +876,11 @@ class ChatHandler:
                 msg = str(message or "")
                 # For complex questions, expand via HyDE before retrieval
                 if self._is_complex_question(msg):
-                    search_query = _KB._hyde_expand(msg)
+                    search_query = _get_kb()._hyde_expand(msg)
                 else:
                     search_query = self._rewrite_query(msg)
                 retriever = KnowledgeBaseRetriever(
-                    kb=active_kb, knowledge_base=_KB, top_k=6, context_window=2
+                    kb=active_kb, knowledge_base=_get_kb(), top_k=6, context_window=2
                 )
                 docs = retriever.invoke(search_query)
                 blocks: list[str] = []

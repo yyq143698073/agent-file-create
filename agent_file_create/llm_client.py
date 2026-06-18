@@ -16,7 +16,7 @@ from agent_file_create.config import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SYSTEM_PROMPT = "你是一个中文助手，只输出中文。"
+from agent_file_create.system_prompts import SYSTEM_ASSISTANT as DEFAULT_SYSTEM_PROMPT
 
 
 def _extract_final_answer(thinking: str) -> str:

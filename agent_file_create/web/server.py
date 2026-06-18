@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -23,10 +24,18 @@ from agent_file_create.logging_config import setup_logging
 from agent_file_create.preprocessor import compute_quality_metrics
 from agent_file_create.rag.kb import KnowledgeBase
 from agent_file_create.task.manager import TaskManager
+from agent_file_create.web._kb_routes import init_kb_routes, router as kb_router
 
 logger = logging.getLogger(__name__)
 
-_KB = KnowledgeBase()
+_kb_instance = None
+
+def _get_kb():
+    """Lazy-initialize KnowledgeBase singleton (replaces module-level global)."""
+    global _kb_instance
+    if _kb_instance is None:
+        _kb_instance = KnowledgeBase()
+    return _kb_instance
 
 
 def _get_base_dir() -> Path:
@@ -242,52 +251,83 @@ def _run_task(task_id: str, file_paths: list[str], user_prompt: str, *, ab_eval:
                 nonlocal ab_results
                 ab_results = latest_ab
 
-            # Detect satisfaction interrupts by stage prefix
-            if q.startswith("[STAGE:satisfaction_outline]") or q.startswith("[STAGE:satisfaction_content]"):
+            # Detect clarify interrupt by stage prefix
+            if q.startswith("[STAGE:clarify]"):
+                q = q[len("[STAGE:clarify]"):].strip()
+
+            # Detect final_confirm interrupt
+            if q.startswith("[STAGE:final_confirm]"):
+                import json as _json
+                task_manager.write_status(
+                    task_id, "need_user", stage="final_confirm",
+                    message="请进行最终确认后渲染报告",
+                    extra={"final_confirmed": None},
+                )
+                t0 = time.time()
+                result = task_manager.wait_for_satisfaction(task_id, "final", timeout_s=1800)
+                if cancel_ev.is_set():
+                    return _json.dumps({"final_confirmed": True})
+                return _json.dumps({"final_confirmed": bool(result.get("satisfied", True)), "selected_version": result.get("selected_version") or 1})
+
+            # Detect satisfaction / quality_gate interrupts by stage prefix
+            if q.startswith("[STAGE:satisfaction_outline]") or q.startswith("[STAGE:satisfaction_content]") or q.startswith("[STAGE:quality_gate]"):
+                import json as _json
+                is_quality = q.startswith("[STAGE:quality_gate]")
                 is_outline = q.startswith("[STAGE:satisfaction_outline]")
-                stage_name = "outline" if is_outline else "content"
+                stage_name = "quality" if is_quality else ("outline" if is_outline else "content")
                 scope_default = "outline" if is_outline else "content_only"
-                label = "大纲" if is_outline else "报告正文"
+                label = "质量评估" if is_quality else ("大纲" if is_outline else "报告正文")
 
-                # Extract preview text between the first and last "---" markers
-                preview_text = ""
-                try:
-                    idx1 = q.index("---")
-                    idx2 = q.rindex("---")
-                    if idx1 < idx2:
-                        preview_text = q[idx1 + 3:idx2].strip()
-                except ValueError:
-                    pass
-
-                # Extract version number from question (e.g. "当前版本：V2")
-                import re as _re
-                preview_version = 1
-                vm = _re.search(r"当前版本[：:]\s*V(\d+)", q)
-                if vm:
+                if is_quality:
+                    preview_text = ""
+                    preview_version = 1
+                    task_manager.write_status(
+                        task_id, "need_user", stage="quality_gate",
+                        message="报告已完成，是否进行质量评估？",
+                        extra={"quality_satisfied": None},
+                    )
+                    t0 = time.time()
+                    result = task_manager.wait_for_satisfaction(task_id, "quality", timeout_s=300)
+                    if cancel_ev.is_set():
+                        return _json.dumps({"satisfied": False, "feedback": "", "scope": ""})
+                    elapsed = time.time() - t0
+                    if elapsed >= 300 - 2:
+                        return _json.dumps({"satisfied": False, "feedback": "超时未选择，跳过评估", "scope": ""})
+                    return _json.dumps(result)
+                else:
+                    preview_text = ""
                     try:
-                        preview_version = int(vm.group(1))
+                        idx1 = q.index("---")
+                        idx2 = q.rindex("---")
+                        if idx1 < idx2:
+                            preview_text = q[idx1 + 3:idx2].strip()
                     except ValueError:
                         pass
+                    import re as _re
+                    preview_version = 1
+                    vm = _re.search(r"当前版本[：:]\s*V(\d+)", q)
+                    if vm:
+                        try:
+                            preview_version = int(vm.group(1))
+                        except ValueError:
+                            pass
+                    task_manager.write_status(
+                        task_id, "need_user", stage=f"satisfaction_{stage_name}",
+                        message=f"{label}生成完成，请审阅并选择是否满意。",
+                        extra={f"{stage_name}_satisfied": None, "satisfaction_feedback": "",
+                               "regeneration_scope": scope_default,
+                               "preview_text": preview_text,
+                               "preview_version": preview_version,
+                               "ab_eval": bool(ab_eval), "ab_results": ab_results[-20:],
+                               "saved_templates": st_names},
+                    )
+                    result = task_manager.wait_for_satisfaction(task_id, stage_name, timeout_s=1800)
+                    if cancel_ev.is_set():
+                        return _json.dumps({"satisfied": True, "feedback": "", "scope": scope_default})
+                    return _json.dumps(result)
 
-                task_manager.write_status(
-                    task_id, "need_user", stage=f"satisfaction_{stage_name}",
-                    message=f"{label}生成完成，请审阅并选择是否满意。",
-                    extra={f"{stage_name}_satisfied": None, "satisfaction_feedback": "",
-                           "regeneration_scope": scope_default,
-                           "preview_text": preview_text,
-                           "preview_version": preview_version,
-                           "ab_eval": bool(ab_eval), "ab_results": ab_results[-20:],
-                           "saved_templates": st_names},
-                )
-                result = task_manager.wait_for_satisfaction(task_id, stage_name, timeout_s=1800)
-                if cancel_ev.is_set():
-                    import json as _json
-                    return _json.dumps({"satisfied": True, "feedback": "", "scope": scope_default})
-                import json as _json
-                return _json.dumps(result)
-
-            # Regular clarify interrupt
-            qs = _split_questions(question)
+            # Regular clarify interrupt (use cleaned q instead of raw question)
+            qs = _split_questions(q)
             task_manager.write_status(
                 task_id, "need_user", stage="clarify",
                 message="需要补充信息以便更好生成报告，请回答下列问题后点击提交。",
@@ -321,7 +361,7 @@ def _run_task(task_id: str, file_paths: list[str], user_prompt: str, *, ab_eval:
         if cancel_ev.is_set():
             task_manager.write_status(task_id, "canceled", stage="done", message="已取消", extra={"saved_templates": st_names})
         else:
-            extra: dict[str, Any] = {"result": {"output_dir": state.get("output_dir")}, "saved_templates": st_names, "eval_metrics": state.get("eval_metrics", {})}
+            extra: dict[str, Any] = {"result": {"output_dir": state.get("output_dir")}, "saved_templates": st_names, "eval_metrics": state.get("eval_metrics", {}), "warnings": state.get("warnings", []), "warnings_count": state.get("warnings_count", 0)}
             if state.get("eval_report"):
                 extra["eval"] = state["eval_report"]
             task_manager.write_status(task_id, "finished", stage="done", message="生成完成", extra=extra)
@@ -360,9 +400,25 @@ def _run_document_only(task_id: str, *, user_prompt: str, file_paths: list[str],
         from agent_core import DocumentAgent
 
         def _auto_approve(question: str) -> str:
-            """Auto-approve satisfaction interrupts during redo/regeneration."""
+            """Auto-approve satisfaction interrupts during redo/regeneration.
+            For quality_gate, prompt user to decide (same as initial generation).
+            """
             import json as _json
             q = str(question or "")
+            if q.startswith("[STAGE:quality_gate]"):
+                task_manager.write_status(
+                    task_id, "need_user", stage="quality_gate",
+                    message="报告已完成，是否进行质量评估？",
+                    extra={"quality_satisfied": None},
+                )
+                t0 = time.time()
+                result = task_manager.wait_for_satisfaction(task_id, "quality", timeout_s=300)
+                if cancel_ev.is_set():
+                    return _json.dumps({"satisfied": False, "feedback": "", "scope": ""})
+                elapsed = time.time() - t0
+                if elapsed >= 300 - 2:
+                    return _json.dumps({"satisfied": False, "feedback": "超时未选择，跳过评估", "scope": ""})
+                return _json.dumps(result)
             if "[STAGE:satisfaction_" in q:
                 scope = "outline" if "outline" in q.split("\n")[0].lower() else "content_only"
                 return _json.dumps({"satisfied": True, "feedback": "", "scope": scope})
@@ -377,7 +433,7 @@ def _run_document_only(task_id: str, *, user_prompt: str, file_paths: list[str],
         if cancel_ev.is_set():
             task_manager.write_status(task_id, "canceled", stage="done", message="已取消", extra={"saved_templates": st_names})
         else:
-            extra: dict[str, Any] = {"result": {"output_dir": state.get("output_dir")}, "saved_templates": st_names, "eval_metrics": state.get("eval_metrics", {})}
+            extra: dict[str, Any] = {"result": {"output_dir": state.get("output_dir")}, "saved_templates": st_names, "eval_metrics": state.get("eval_metrics", {}), "warnings": state.get("warnings", []), "warnings_count": state.get("warnings_count", 0)}
             if state.get("eval_report"):
                 extra["eval"] = state["eval_report"]
             task_manager.write_status(task_id, "finished", stage="done", message="重新生成完成", extra=extra)
@@ -426,14 +482,20 @@ def _start_task_thread(task_id: str, *, user_prompt: str, file_paths: list[str],
 
 
 def _run_section_regen(task_id: str, section_name: str, feedback: str = "") -> tuple[bool, str]:
-    """Regenerate a single section in the background, write updated content."""
+    """Regenerate a single section in the background."""
     try:
         from agent_file_create.document.content_generator import regenerate_section
+        from agent_file_create.document_service import render_document
 
         task_manager = TaskManager()
+        pause_ev, cancel_ev = task_manager.get_control_events(task_id)
         meta = task_manager.read_task_meta(task_id)
         user_prompt = str(meta.get("user_prompt") or "").strip() or "生成一份报告"
         analysis_results = task_manager.read_analysis_results(task_id)
+
+        current_st = task_manager.read_status(task_id)
+        current_stage = str(current_st.get("stage") or "").strip()
+        is_final_confirm = current_stage == "final_confirm"
 
         base = _result_dir() / task_id
         outline_path = base / "outline.md"
@@ -455,33 +517,167 @@ def _run_section_regen(task_id: str, section_name: str, feedback: str = "") -> t
         )
 
         if not new_content:
-            task_manager.write_status(task_id, "finished", stage="document",
-                                      message=f"未找到匹配章节「{section_name}」，请检查章节标题是否正确。")
+            if is_final_confirm:
+                clean_extra_final = {k: v for k, v in current_st.items() if k not in {
+                    "clarify_questions", "clarify_answers", "clarify_skip", "clarify_submitted_at",
+                    "content_satisfied", "outline_satisfied", "satisfaction_feedback",
+                    "regeneration_scope", "preview_text", "preview_version", "is_section_regen",
+                }}
+                clean_extra_final["final_confirmed"] = None
+                task_manager.write_status(
+                    task_id, "need_user", stage="final_confirm",
+                    message=f"未找到匹配章节「{section_name}」。请进行最终确认。",
+                    extra=clean_extra_final,
+                )
+            else:
+                task_manager.write_status(task_id, "finished", stage="document",
+                                          message=f"未找到匹配章节「{section_name}」，请检查章节标题是否正确。")
             return False, f"未找到匹配章节「{section_name}」。可尝试 /templates 或 /files 查看章节标题，使用精确标题重新生成。"
 
         content_path.write_text(new_content, encoding="utf-8")
-        task_manager.write_status(task_id, "finished", stage="document",
-                                  message=f"已重新生成章节「{section_name}」")
-        return True, f"已重新生成章节「{section_name}」。请查看预览确认结果。"
+
+        if is_final_confirm:
+            clean_extra_final = {k: v for k, v in current_st.items() if k not in {
+                "clarify_questions", "clarify_answers", "clarify_skip", "clarify_submitted_at",
+                "content_satisfied", "outline_satisfied", "satisfaction_feedback",
+                "regeneration_scope", "preview_text", "preview_version", "is_section_regen",
+            }}
+            clean_extra_final["final_confirmed"] = None
+            task_manager.write_status(
+                task_id, "need_user", stage="final_confirm",
+                message=f"章节「{section_name}」已重新生成，请进行最终确认。",
+                extra=clean_extra_final,
+            )
+            return True, f"章节「{section_name}」已重新生成。"
+
+        clean_extra = {k: v for k, v in current_st.items() if k not in {
+            "clarify_questions", "clarify_answers", "clarify_skip", "clarify_submitted_at",
+            "outline_satisfied", "quality_wanted",
+        }}
+        clean_extra.update({
+            "content_satisfied": None,
+            "satisfaction_feedback": "",
+            "regeneration_scope": "content_only",
+            "preview_text": new_content[:3000],
+            "preview_version": 1,
+            "is_section_regen": True,
+        })
+        task_manager.write_status(
+            task_id, "need_user", stage="satisfaction_content",
+            message=f"章节「{section_name}」已重新生成，请审阅并确认是否为最终版本。",
+            extra=clean_extra,
+        )
+        result = task_manager.wait_for_satisfaction(task_id, "content", timeout_s=1800)
+        if cancel_ev.is_set():
+            return False, "已取消"
+        satisfied = bool(result.get("satisfied", True))
+
+        if not satisfied:
+            task_manager.write_status(
+                task_id, "finished", stage="document",
+                message=f"用户对章节「{section_name}」不满意，未渲染最终报告。",
+            )
+            return True, f"章节「{section_name}」已重新生成，但用户选择不渲染。"
+
+        task_manager.write_status(task_id, "processing", stage="render",
+                                  message="正在渲染最终报告…")
+        output_dir = str(base)
+        template_dir = str(base / "template")
+        rendered = render_document(
+            task_id=task_id,
+            content=new_content,
+            outline=outline,
+            output_dir=output_dir,
+            template_dir=template_dir,
+        )
+
+        current_st_qg = task_manager.read_status(task_id)
+        clean_extra_qg = {k: v for k, v in current_st_qg.items() if k not in {
+            "clarify_questions", "clarify_answers", "clarify_skip", "clarify_submitted_at",
+            "content_satisfied", "outline_satisfied", "satisfaction_feedback",
+            "regeneration_scope", "preview_text", "preview_version", "is_section_regen",
+        }}
+        clean_extra_qg["quality_satisfied"] = None
+        task_manager.write_status(
+            task_id, "need_user", stage="quality_gate",
+            message="报告已渲染完成，是否进行质量评估？",
+            extra=clean_extra_qg,
+        )
+        t0 = time.time()
+        q_result = task_manager.wait_for_satisfaction(task_id, "quality", timeout_s=300)
+        if cancel_ev.is_set():
+            task_manager.write_status(task_id, "canceled", stage="done", message="已取消")
+            return False, "已取消"
+        elapsed = time.time() - t0
+        want_eval = bool(q_result.get("satisfied", False)) if elapsed < 298 else False
+
+        extra: dict[str, Any] = {"result": {"output_dir": output_dir}, "eval_metrics": {}, "warnings": [], "warnings_count": 0}
+        if want_eval:
+            try:
+                from agent_file_create.document_service import _run_faithfulness_checks
+                from agent_file_create.evaluation.orchestrator import evaluate as run_eval
+                task_manager.write_status(task_id, "processing", stage="quality_gate",
+                                          message="正在进行质量评估…")
+                final_content = _run_faithfulness_checks(
+                    content=new_content, analysis_results=analysis_results,
+                    task_id=task_id, output_dir=output_dir,
+                )
+                eval_report = run_eval(
+                    content=final_content or new_content,
+                    outline=outline,
+                    analysis_results=analysis_results,
+                    user_prompt=user_prompt,
+                )
+                extra["eval_metrics"] = eval_report.to_dict()
+                if final_content and final_content != new_content:
+                    content_path.write_text(final_content, encoding="utf-8")
+            except Exception as e:
+                logger.warning("section_regen_quality_gate_failed err=%s", e)
+
+        task_manager.write_status(task_id, "finished", stage="done",
+                                  message="生成完成", extra=extra)
+        return True, f"章节「{section_name}」已重新生成并渲染完成。"
     except Exception as e:
         logger.exception("section_regen_failed")
         try:
-            TaskManager().write_status(task_id, "finished", stage="document",
-                                       message=f"章节重生成失败：{str(e)[:120]}")
+            current_st = TaskManager().read_status(task_id)
+            current_stage = str(current_st.get("stage") or "").strip()
+            is_final_confirm = current_stage == "final_confirm"
+            if is_final_confirm:
+                clean_extra_final = {k: v for k, v in current_st.items() if k not in {
+                    "clarify_questions", "clarify_answers", "clarify_skip", "clarify_submitted_at",
+                    "content_satisfied", "outline_satisfied", "satisfaction_feedback",
+                    "regeneration_scope", "preview_text", "preview_version", "is_section_regen",
+                }}
+                clean_extra_final["final_confirmed"] = None
+                TaskManager().write_status(
+                    task_id, "need_user", stage="final_confirm",
+                    message=f"章节重生成失败，请进行最终确认。",
+                    extra=clean_extra_final,
+                )
+            else:
+                TaskManager().write_status(task_id, "finished", stage="document",
+                                           message=f"章节重生成失败：{str(e)[:120]}")
         except Exception:
             pass
         return False, f"章节生成失败：{str(e)[:200]}"
 
 
 def _run_section_edit(task_id: str, section_name: str, edited_content: str) -> tuple[bool, str]:
-    """Rewrite a section guided by user-edited content, in the background."""
+    """Rewrite a section guided by user-edited content."""
     try:
         from agent_file_create.document.content_generator import regenerate_section
+        from agent_file_create.document_service import render_document
 
         task_manager = TaskManager()
+        pause_ev, cancel_ev = task_manager.get_control_events(task_id)
         meta = task_manager.read_task_meta(task_id)
         user_prompt = str(meta.get("user_prompt") or "").strip() or "生成一份报告"
         analysis_results = task_manager.read_analysis_results(task_id)
+
+        current_st = task_manager.read_status(task_id)
+        current_stage = str(current_st.get("stage") or "").strip()
+        is_final_confirm = current_stage == "final_confirm"
 
         base = _result_dir() / task_id
         outline_path = base / "outline.md"
@@ -509,19 +705,147 @@ def _run_section_edit(task_id: str, section_name: str, edited_content: str) -> t
         )
 
         if not new_content:
-            task_manager.write_status(task_id, "finished", stage="document",
-                                      message=f"未找到匹配章节「{section_name}」，请检查章节标题是否正确。")
+            if is_final_confirm:
+                clean_extra_final = {k: v for k, v in current_st.items() if k not in {
+                    "clarify_questions", "clarify_answers", "clarify_skip", "clarify_submitted_at",
+                    "content_satisfied", "outline_satisfied", "satisfaction_feedback",
+                    "regeneration_scope", "preview_text", "preview_version", "is_section_regen",
+                }}
+                clean_extra_final["final_confirmed"] = None
+                task_manager.write_status(
+                    task_id, "need_user", stage="final_confirm",
+                    message=f"未找到匹配章节「{section_name}」。请进行最终确认。",
+                    extra=clean_extra_final,
+                )
+            else:
+                task_manager.write_status(task_id, "finished", stage="document",
+                                          message=f"未找到匹配章节「{section_name}」，请检查章节标题是否正确。")
             return False, f"未找到匹配章节「{section_name}」。"
 
         content_path.write_text(new_content, encoding="utf-8")
-        task_manager.write_status(task_id, "finished", stage="document",
-                                  message=f"已根据编辑内容重写章节「{section_name}」")
-        return True, f"已根据编辑内容重写章节「{section_name}」。请查看预览确认结果。"
+
+        if is_final_confirm:
+            clean_extra_final = {k: v for k, v in current_st.items() if k not in {
+                "clarify_questions", "clarify_answers", "clarify_skip", "clarify_submitted_at",
+                "content_satisfied", "outline_satisfied", "satisfaction_feedback",
+                "regeneration_scope", "preview_text", "preview_version", "is_section_regen",
+            }}
+            clean_extra_final["final_confirmed"] = None
+            task_manager.write_status(
+                task_id, "need_user", stage="final_confirm",
+                message=f"章节「{section_name}」已根据编辑内容重写，请进行最终确认。",
+                extra=clean_extra_final,
+            )
+            return True, f"章节「{section_name}」已重写。"
+
+        clean_extra = {k: v for k, v in current_st.items() if k not in {
+            "clarify_questions", "clarify_answers", "clarify_skip", "clarify_submitted_at",
+            "outline_satisfied", "quality_wanted",
+        }}
+        clean_extra.update({
+            "content_satisfied": None,
+            "satisfaction_feedback": "",
+            "regeneration_scope": "content_only",
+            "preview_text": new_content[:3000],
+            "preview_version": 1,
+            "is_section_regen": True,
+        })
+        task_manager.write_status(
+            task_id, "need_user", stage="satisfaction_content",
+            message=f"章节「{section_name}」已根据编辑内容重写，请审阅并确认是否为最终版本。",
+            extra=clean_extra,
+        )
+        result = task_manager.wait_for_satisfaction(task_id, "content", timeout_s=1800)
+        if cancel_ev.is_set():
+            return False, "已取消"
+        satisfied = bool(result.get("satisfied", True))
+
+        if not satisfied:
+            task_manager.write_status(
+                task_id, "finished", stage="document",
+                message=f"用户对章节「{section_name}」不满意，未渲染最终报告。",
+            )
+            return True, f"章节「{section_name}」已重写，但用户选择不渲染。"
+
+        task_manager.write_status(task_id, "processing", stage="render",
+                                  message="正在渲染最终报告…")
+        output_dir = str(base)
+        template_dir = str(base / "template")
+        rendered = render_document(
+            task_id=task_id,
+            content=new_content,
+            outline=outline,
+            output_dir=output_dir,
+            template_dir=template_dir,
+        )
+
+        current_st_qg = task_manager.read_status(task_id)
+        clean_extra_qg = {k: v for k, v in current_st_qg.items() if k not in {
+            "clarify_questions", "clarify_answers", "clarify_skip", "clarify_submitted_at",
+            "content_satisfied", "outline_satisfied", "satisfaction_feedback",
+            "regeneration_scope", "preview_text", "preview_version", "is_section_regen",
+        }}
+        clean_extra_qg["quality_satisfied"] = None
+        task_manager.write_status(
+            task_id, "need_user", stage="quality_gate",
+            message="报告已渲染完成，是否进行质量评估？",
+            extra=clean_extra_qg,
+        )
+        t0 = time.time()
+        q_result = task_manager.wait_for_satisfaction(task_id, "quality", timeout_s=300)
+        if cancel_ev.is_set():
+            task_manager.write_status(task_id, "canceled", stage="done", message="已取消")
+            return False, "已取消"
+        elapsed = time.time() - t0
+        want_eval = bool(q_result.get("satisfied", False)) if elapsed < 298 else False
+
+        extra: dict[str, Any] = {"result": {"output_dir": output_dir}, "eval_metrics": {}, "warnings": [], "warnings_count": 0}
+        if want_eval:
+            try:
+                from agent_file_create.document_service import _run_faithfulness_checks
+                from agent_file_create.evaluation.orchestrator import evaluate as run_eval
+                task_manager.write_status(task_id, "processing", stage="quality_gate",
+                                          message="正在进行质量评估…")
+                final_content = _run_faithfulness_checks(
+                    content=new_content, analysis_results=analysis_results,
+                    task_id=task_id, output_dir=output_dir,
+                )
+                eval_report = run_eval(
+                    content=final_content or new_content,
+                    outline=outline,
+                    analysis_results=analysis_results,
+                    user_prompt=user_prompt,
+                )
+                extra["eval_metrics"] = eval_report.to_dict()
+                if final_content and final_content != new_content:
+                    content_path.write_text(final_content, encoding="utf-8")
+            except Exception as e:
+                logger.warning("section_edit_quality_gate_failed err=%s", e)
+
+        task_manager.write_status(task_id, "finished", stage="done",
+                                  message="生成完成", extra=extra)
+        return True, f"章节「{section_name}」已重写并渲染完成。"
     except Exception as e:
         logger.exception("section_edit_failed")
         try:
-            TaskManager().write_status(task_id, "finished", stage="document",
-                                       message=f"章节编辑重写失败：{str(e)[:120]}")
+            current_st = TaskManager().read_status(task_id)
+            current_stage = str(current_st.get("stage") or "").strip()
+            is_final_confirm = current_stage == "final_confirm"
+            if is_final_confirm:
+                clean_extra_final = {k: v for k, v in current_st.items() if k not in {
+                    "clarify_questions", "clarify_answers", "clarify_skip", "clarify_submitted_at",
+                    "content_satisfied", "outline_satisfied", "satisfaction_feedback",
+                    "regeneration_scope", "preview_text", "preview_version", "is_section_regen",
+                }}
+                clean_extra_final["final_confirmed"] = None
+                TaskManager().write_status(
+                    task_id, "need_user", stage="final_confirm",
+                    message=f"章节编辑重写失败，请进行最终确认。",
+                    extra=clean_extra_final,
+                )
+            else:
+                TaskManager().write_status(task_id, "finished", stage="document",
+                                           message=f"章节编辑重写失败：{str(e)[:120]}")
         except Exception:
             pass
         return False, f"章节编辑重写失败：{str(e)[:200]}"
@@ -566,6 +890,13 @@ def _make_regenerate_fn(task_manager: TaskManager):
 
 app = FastAPI(title="agent-file-create", version="1.0.0")
 
+# ── Include modular route handlers ──
+from agent_file_create.web._kb_routes import router as kb_router, init_kb_routes
+
+# Initialize KB routes with the server's KB getter
+init_kb_routes(_get_kb)
+app.include_router(kb_router)
+
 # Mount static file directories
 _html = _html_dir()
 _result = _result_dir()
@@ -574,103 +905,7 @@ if _html.exists():
     app.mount("/static", StaticFiles(directory=str(_html)), name="static")
 
 
-# ── API Routes ──
-
-@app.get("/api/kb/list")
-def kb_list():
-    items = _KB.list_kb()
-    return {"kbs": items}
-
-
-@app.get("/api/kb/docs")
-def kb_docs(kb: str = Query("default")):
-    docs = _KB.list_docs(kb=kb)
-    return {"kb": kb, "docs": docs}
-
-
-@app.post("/api/kb/query")
-async def kb_query(request: Request):
-    body = await request.json()
-    kb = str(body.get("kb") or "").strip() or "default"
-    question = str(body.get("question") or body.get("message") or "").strip()
-    if not question:
-        raise HTTPException(400, "question 不能为空")
-    try:
-        top_k = int(body.get("top_k") or 6)
-    except Exception:
-        top_k = 6
-    filters = body.get("filters") if isinstance(body.get("filters"), dict) else None
-    try:
-        ans = _KB.answer(kb=kb, question=question, top_k=top_k, filters=filters)
-        cits = [{"doc_id": c.doc_id, "chunk_id": c.chunk_id, "section_path": c.section_path, "score": float(c.score), "snippet": c.snippet} for c in ans.citations]
-        return {"kb": ans.kb, "question": ans.question, "answer": ans.answer, "citations": cits}
-    except Exception as e:
-        raise HTTPException(500, str(e)[:240])
-
-
-@app.post("/api/kb/upload")
-async def kb_upload(
-    files: list[UploadFile] = File(...),
-    kb: str = Form("default"),
-    doc_type: str = Form(""),
-):
-    kb = kb.strip() or "default"
-    doc_type = doc_type.strip()
-    if not files:
-        raise HTTPException(400, "未收到文件")
-
-    base = _result_dir() / "kb" / kb / "uploads"
-    base.mkdir(parents=True, exist_ok=True)
-
-    results: list[dict] = []
-    for f in files:
-        name = _sanitize_filename(f.filename or "upload")
-        fp = base / (uuid.uuid4().hex[:8] + "_" + name)
-        data = await f.read()
-        try:
-            fp.write_bytes(data)
-        except Exception:
-            results.append({"file": name, "ok": False, "error": "write_failed"})
-            continue
-        try:
-            r = _KB.ingest_file(kb=kb, file_path=str(fp), doc_id=name, title=name, source=str(fp), doc_type=doc_type)
-            r["file"] = name
-            results.append(r)
-        except Exception as e:
-            results.append({"file": name, "ok": False, "error": str(e)[:240]})
-    return {"kb": kb, "results": results}
-
-
-@app.post("/api/kb/delete")
-async def kb_delete(request: Request):
-    body = await request.json()
-    kb = str(body.get("kb") or "").strip()
-    doc_id = str(body.get("doc_id") or "").strip()
-    if not kb:
-        raise HTTPException(400, "kb 不能为空")
-    if doc_id:
-        r = _KB.delete_doc(kb=kb, doc_id=doc_id)
-    else:
-        r = _KB.delete_kb(kb=kb)
-    if not r.get("ok"):
-        raise HTTPException(500, str(r.get("error") or "delete_failed")[:240])
-    return r
-
-
-@app.get("/api/kb/stats")
-def kb_stats(kb: str = "default"):
-    if not kb.strip():
-        raise HTTPException(400, "kb 不能为空")
-    try:
-        return _KB.kb_stats(kb=kb.strip())
-    except Exception as e:
-        raise HTTPException(500, str(e)[:240])
-
-
-@app.post("/api/kb/health")
-def kb_health():
-    return _KB.check_embed_health()
-
+# KB routes moved to web/_kb_routes.py
 
 def _ingest_files_to_kb(kb_name: str, file_paths: list[str]) -> None:
     """Ingest saved files into a knowledge base (runs in background thread)."""
@@ -702,6 +937,7 @@ async def api_upload(
     add_to_kb: str = Form("false"),
     kb_name: str = Form(""),
     kb_doc_ids: str = Form(""),
+    retrieval_kb: str = Form(""),
 ):
     kb_docs: list[str] = [x.strip() for x in str(kb_doc_ids).split(",") if x.strip()]
     files_list = [f for f in (files or []) if f.filename]
@@ -725,7 +961,7 @@ async def api_upload(
         kbn = (kb_name or "").strip() or "default"
         for did in kb_docs:
             try:
-                text = _KB.get_doc_text(kb=kbn, doc_id=did)
+                text = _get_kb().get_doc_text(kb=kbn, doc_id=did)
                 if text.strip():
                     fn = _sanitize_filename(did) + ".md"
                     fp = uploads / fn
@@ -763,14 +999,15 @@ async def api_upload(
         import threading
         threading.Thread(target=_ingest_files_to_kb, args=(kbn, list(saved)), daemon=True).start()
 
+    retrieval_kb_val = str(retrieval_kb or "").strip()
     task_manager = TaskManager()
     task_manager.write_status(
         task_id, "queued", stage="uploaded", message="已上传，等待开始生成…",
-        extra={"saved_files": [Path(x).name for x in saved], "saved_templates": [Path(x).name for x in saved_templates], "ab_eval": ab_val, "ab_results": [], "clarify_questions": [], "clarify_answers": "", "clarify_skip": False},
+        extra={"saved_files": [Path(x).name for x in saved], "saved_templates": [Path(x).name for x in saved_templates], "ab_eval": ab_val, "ab_results": [], "clarify_questions": [], "clarify_answers": "", "clarify_skip": False, "retrieval_kb": retrieval_kb_val},
     )
     try: tw = int(str(target_words).strip() or "0")
     except Exception: tw = 0
-    task_manager.write_task_meta(task_id, {"uploads_dir": str(uploads), "template_dir": str(user_template_dir), "file_paths": list(saved), "saved_templates": list(saved_templates), "user_prompt": str(user_prompt), "target_words": tw, "ab_eval": ab_val, "template_mode": template_mode, "active_kb": (kb_name or "").strip() or "default"})
+    task_manager.write_task_meta(task_id, {"uploads_dir": str(uploads), "template_dir": str(user_template_dir), "file_paths": list(saved), "saved_templates": list(saved_templates), "user_prompt": str(user_prompt), "target_words": tw, "ab_eval": ab_val, "template_mode": template_mode, "active_kb": retrieval_kb_val})
     _start_task_thread(task_id, user_prompt=user_prompt, file_paths=saved, target_words=tw, ab_eval=ab_val, template_dir_override=template_override, saved_templates=saved_templates, mode="all")
     return JSONResponse({"task_id": task_id, "status": task_manager.read_status(task_id), "downloads": task_manager.collect_downloads(task_id)}, status_code=202)
 
@@ -815,7 +1052,7 @@ async def api_append(
         kbn = (kb_name or "").strip() or "default"
         for did in kb_docs:
             try:
-                text = _KB.get_doc_text(kb=kbn, doc_id=did)
+                text = _get_kb().get_doc_text(kb=kbn, doc_id=did)
                 if text.strip():
                     fn = _sanitize_filename(did) + ".md"
                     fp = uploads / fn
@@ -857,7 +1094,7 @@ async def api_append(
     if saved_templates_new:
         template_mode = "task"
 
-    task_manager.write_task_meta(task_id, {"uploads_dir": str(uploads), "template_dir": str(user_template_dir), "file_paths": list(all_files), "user_prompt": user_prompt_val, "ab_eval": bool(ab_val), "template_mode": template_mode})
+    task_manager.write_task_meta(task_id, {"uploads_dir": str(uploads), "template_dir": str(user_template_dir), "file_paths": list(all_files), "user_prompt": user_prompt_val, "ab_eval": bool(ab_val), "template_mode": template_mode, "active_kb": str(meta.get("active_kb") or "").strip()})
     task_manager.write_status(task_id, "queued", stage="uploaded", message="已追加文件，等待重新生成…", extra={"saved_files": [Path(x).name for x in all_files], "saved_templates": [Path(x).name for x in task_manager.list_task_templates(task_id)], "ab_eval": bool(ab_val)})
     _start_task_thread(task_id, user_prompt=user_prompt_val, file_paths=all_files, ab_eval=bool(ab_val), template_dir_override=template_override, saved_templates=task_manager.list_task_templates(task_id), mode="all")
     return JSONResponse({"task_id": task_id, "status": task_manager.read_status(task_id), "downloads": task_manager.collect_downloads(task_id)}, status_code=202)
@@ -878,43 +1115,59 @@ async def api_clarify(request: Request):
 
 @app.post("/api/satisfaction")
 async def api_satisfaction(request: Request):
-    """Handle user satisfaction feedback for outline or content stage."""
+    """Handle user satisfaction feedback for outline, content, final, or quality_gate stage."""
     task_manager = TaskManager()
     body = await request.json()
     task_id = task_manager.normalize_task_id(str(body.get("task_id") or ""))
     if not task_id:
         raise HTTPException(400, "task_id 不能为空")
 
-    stage = str(body.get("stage") or "").strip()  # "outline" | "content"
+    stage = str(body.get("stage") or "").strip()  # "outline" | "content" | "final" | "quality"
     satisfied = bool(body.get("satisfied", True))
     feedback = str(body.get("feedback") or "").strip()
     scope = str(body.get("scope") or "outline").strip()  # "outline" | "content_only"
+    selected_version = body.get("selected_version")
 
-    if stage not in {"outline", "content"}:
-        raise HTTPException(400, "stage 必须是 outline 或 content")
+    if stage not in {"outline", "content", "final", "quality"}:
+        raise HTTPException(400, "stage 必须是 outline、content、final 或 quality")
 
-    # Save satisfaction state in status for the polling thread to pick up
     current_st = task_manager.read_status(task_id)
-    extra_update: dict[str, Any] = {
-        f"{stage}_satisfied": satisfied,
-        "satisfaction_feedback": feedback,
-        "regeneration_scope": scope,
-    }
 
-    if satisfied:
-        task_manager.write_status(
-            task_id, "processing",
-            stage=f"satisfaction_{stage}",
-            message=f"用户对{stage}表示满意，继续生成…",
-            extra={**current_st, **extra_update},
-        )
+    if stage == "final":
+        extra_update: dict[str, Any] = {
+            "final_satisfied": satisfied,
+            "selected_version": selected_version,
+        }
+        stage_label = "最终确认"
+        status_stage = "final_confirm"
+        message = f"用户已完成最终确认，开始渲染报告…"
+    elif stage == "quality":
+        extra_update = {
+            "quality_satisfied": satisfied,
+            "satisfaction_feedback": feedback,
+        }
+        stage_label = "质量评估"
+        status_stage = "quality_gate"
+        message = f"用户选择{'开启' if satisfied else '跳过'}质量评估"
     else:
-        task_manager.write_status(
-            task_id, "processing",
-            stage=f"satisfaction_{stage}",
-            message=f"用户对{stage}不满意，将重新生成（范围：{scope}）",
-            extra={**current_st, **extra_update},
-        )
+        extra_update = {
+            f"{stage}_satisfied": satisfied,
+            "satisfaction_feedback": feedback,
+            "regeneration_scope": scope,
+        }
+        stage_label = "大纲" if stage == "outline" else "报告正文"
+        status_stage = f"satisfaction_{stage}"
+        if satisfied:
+            message = f"用户对{stage_label}表示满意，继续生成…"
+        else:
+            message = f"用户对{stage_label}不满意，将重新生成（范围：{scope}）"
+
+    task_manager.write_status(
+        task_id, "processing",
+        stage=status_stage,
+        message=message,
+        extra={**current_st, **extra_update},
+    )
 
     return {"task_id": task_id, "ok": True, "satisfied": satisfied}
 
@@ -1335,6 +1588,90 @@ def _handle_clarify_answer(task_manager: TaskManager, chat_handler: ChatHandler,
         return "已收到补充信息。我会继续生成文档；你也可以继续提问或补充更多要求。"
 
 
+# ── Built-in template marketplace ─────────────────────────────────────────
+
+_BUILTIN_TEMPLATES_DIR = _get_base_dir() / "resource" / "templates"
+
+
+@app.get("/api/template/builtin/list")
+def api_template_builtin_list():
+    """List all built-in report templates with metadata."""
+    items = []
+    if _BUILTIN_TEMPLATES_DIR.exists():
+        for md_path in sorted(_BUILTIN_TEMPLATES_DIR.glob("*.md")):
+            meta_path = md_path.with_suffix("").with_name(md_path.stem + "_meta.json")
+            meta = {}
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            try:
+                from agent_file_create.document.template_renderer import _scan_md_placeholders
+                vars_set = _scan_md_placeholders(str(md_path))
+            except Exception:
+                vars_set = set()
+            items.append({
+                "name": md_path.name,
+                "id": md_path.stem,
+                "size": md_path.stat().st_size,
+                "variables": sorted(vars_set),
+                "description": meta.get("description", ""),
+                "category": meta.get("category", "通用"),
+                "suggested_prompt": meta.get("suggested_prompt", ""),
+            })
+    return {"templates": items}
+
+
+@app.get("/api/template/builtin/{name}")
+def api_template_builtin_get(name: str):
+    """Get a single built-in template by name."""
+    safe = _sanitize_filename(name)
+    if not safe.endswith(".md"):
+        safe += ".md"
+    fp = _BUILTIN_TEMPLATES_DIR / safe
+    if not fp.exists():
+        raise HTTPException(404, f"内置模板不存在: {safe}")
+    meta = {}
+    meta_path = _BUILTIN_TEMPLATES_DIR / (fp.stem + "_meta.json")
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    content = fp.read_text(encoding="utf-8")
+    from agent_file_create.document.template_renderer import _scan_md_placeholders
+    return {
+        "name": safe,
+        "content": content,
+        "variables": sorted(_scan_md_placeholders(str(fp))),
+        "description": meta.get("description", ""),
+        "category": meta.get("category", "通用"),
+        "suggested_prompt": meta.get("suggested_prompt", ""),
+    }
+
+
+@app.post("/api/template/builtin/use")
+async def api_template_builtin_use(request: Request):
+    """Copy a built-in template to a task for use."""
+    body = await request.json()
+    task_id = str(body.get("task_id") or "").strip()
+    name = str(body.get("name") or "").strip()
+    if not task_id or not name:
+        raise HTTPException(400, "task_id 和 name 不能为空")
+    safe = _sanitize_filename(name)
+    if not safe.endswith(".md"):
+        safe += ".md"
+    src = _BUILTIN_TEMPLATES_DIR / safe
+    if not src.exists():
+        raise HTTPException(404, f"内置模板不存在: {safe}")
+    dest_dir = _result_dir() / task_id / "template"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dst = dest_dir / safe
+    dst.write_bytes(src.read_bytes())
+    return {"name": safe, "task_id": task_id, "ok": True}
+
+
 @app.post("/api/chat")
 async def api_chat(request: Request):
     task_manager = TaskManager()
@@ -1462,6 +1799,45 @@ def api_status(task_id: str = Query("")):
     data = task_manager.read_status(tid)
     data["downloads"] = task_manager.collect_downloads(tid)
     return data
+
+
+@app.get("/api/stream")
+async def api_stream(task_id: str = Query("")):
+    """SSE endpoint: streams section completion events as they happen."""
+    if not task_id:
+        raise HTTPException(400, "task_id 不能为空")
+
+    stream_path = _result_dir() / task_id / "stream.jsonl"
+
+    async def event_generator():
+        seen = 0
+        # Clean old stream file
+        if stream_path.exists():
+            stream_path.unlink()
+        while True:
+            # Poll for new lines in stream file
+            if stream_path.exists():
+                lines = stream_path.read_text(encoding="utf-8").strip().split("\n")
+                new_lines = [l for l in lines[seen:] if l.strip()]
+                for line in new_lines:
+                    yield f"data: {line}\n\n"
+                    seen += 1
+            # Check if task is done
+            try:
+                st = TaskManager().read_status(task_id)
+                if str(st.get("status") or "") in ("finished", "canceled", "content_ready"):
+                    yield f"data: {json.dumps({'type': 'done', 'status': st.get('status')}, ensure_ascii=False)}\n\n"
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        # Cleanup
+        try:
+            stream_path.unlink()
+        except Exception:
+            pass
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.get("/api/tasks")
