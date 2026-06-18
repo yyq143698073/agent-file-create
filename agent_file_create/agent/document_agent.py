@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -15,7 +16,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from agent_file_create.agent.prompts import CLARIFY_QUESTIONS_PROMPT
+from agent_file_create.prompts import CLARIFY_QUESTIONS_PROMPT
 from agent_file_create.agent.state import AgentState
 from agent_file_create.config import (
     CONTENT_API_ENDPOINT,
@@ -125,8 +126,12 @@ class DocumentAgent:
     def _build_graph(self):
         builder = StateGraph(AgentState)
 
-        # Nodes
+        # Nodes — flow matches user expectation:
+        # extract→plan→assess→(clarify)→enrich→outline→satisfaction_outline
+        # →research→content→critic→satisfaction_content(版本比对+段落重生成)
+        # →render→quality_gate(评估可选)→END
         builder.add_node("extract", self._node_extract)
+        builder.add_node("plan", self._node_plan)           # ★ Planner
         builder.add_node("assess", self._node_assess)
         builder.add_node("clarify", self._node_clarify)
         builder.add_node("enrich", self._node_enrich)
@@ -134,48 +139,46 @@ class DocumentAgent:
         builder.add_node("satisfaction_outline", self._node_satisfaction_outline)
         builder.add_node("research", self._node_research)
         builder.add_node("content", self._node_content)
+        builder.add_node("critic", self._node_critic)       # ★ Critic
         builder.add_node("satisfaction_content", self._node_satisfaction_content)
+        builder.add_node("final_confirm", self._node_final_confirm)
         builder.add_node("render", self._node_render)
-        builder.add_node("eval", self._node_eval)
+        builder.add_node("quality_gate", self._node_quality_gate)
         builder.add_node("handle_error", self._node_handle_error)
 
         # Edges
         builder.add_edge(START, "extract")
-        builder.add_edge("extract", "assess")
+        builder.add_edge("extract", "plan")                  # ★ extract → plan
+        builder.add_edge("plan", "assess")                   # ★ plan → assess
         builder.add_conditional_edges(
-            "assess",
-            self._route_after_assess,
+            "assess", self._route_after_assess,
             {"clarify": "clarify", "enrich": "enrich"},
         )
         builder.add_edge("clarify", "enrich")
         builder.add_edge("enrich", "outline")
 
-        # outline -> satisfaction_outline (then conditional)
+        # outline → satisfaction_outline
         builder.add_edge("outline", "satisfaction_outline")
         builder.add_conditional_edges(
-            "satisfaction_outline",
-            self._route_after_satisfaction_outline,
+            "satisfaction_outline", self._route_after_satisfaction_outline,
             {"outline": "outline", "research": "research", "content": "content", "error": "handle_error"},
         )
 
-        # research -> content
+        # research → content → critic → satisfaction_content → final_confirm (版本比对+段落重生成)
         builder.add_edge("research", "content")
-
-        # content -> satisfaction_content (then conditional)
-        builder.add_edge("content", "satisfaction_content")
+        builder.add_edge("content", "critic")                # ★ content → critic
+        builder.add_edge("critic", "satisfaction_content")   # ★ critic → satisfaction
         builder.add_conditional_edges(
-            "satisfaction_content",
-            self._route_after_satisfaction_content,
-            {"outline": "outline", "content": "content", "render": "render", "error": "handle_error"},
+            "satisfaction_content", self._route_after_satisfaction_content,
+            {"outline": "outline", "content": "content", "final_confirm": "final_confirm", "error": "handle_error"},
         )
 
-        # Error‑aware routing for render
-        builder.add_conditional_edges(
-            "render",
-            self._route_after_render,
-            {"eval": "eval", "end": END, "error": "handle_error"},
-        )
-        builder.add_edge("eval", END)
+        # final_confirm → render
+        builder.add_edge("final_confirm", "render")
+
+        # render → quality_gate(评估可选) → END
+        builder.add_edge("render", "quality_gate")
+        builder.add_edge("quality_gate", END)
         builder.add_edge("handle_error", END)
 
         return builder.compile(checkpointer=_get_checkpointer())
@@ -227,11 +230,20 @@ class DocumentAgent:
         if state.get("error"):
             return "error"
         if state.get("content_satisfied"):
-            return "render"
+            return "final_confirm"
         scope = state.get("regeneration_scope", "outline")
         if scope == "content_only":
             return "content"
         return "outline"
+
+    @staticmethod
+    def _route_after_final_confirm(state: AgentState) -> str:
+        """After final confirm, decide next step."""
+        if state.get("error"):
+            return "error"
+        if state.get("final_confirmed"):
+            return "render"
+        return "final_confirm"
 
     # ── Node: extract ────────────────────────────────────────────────────────
 
@@ -266,6 +278,66 @@ class DocumentAgent:
 
         logger.info("extract done   task=%s files=%d", self.task_id, len(results))
         return {"analysis_results": results, "force_regen": False}
+
+    # ── Node: plan (Planner) ─────────────────────────────────────────────────
+
+    def _node_plan(self, state: AgentState) -> dict:
+        """Task-level planner: decompose user request into sub-tasks.
+
+        Runs once after file extraction. The plan is stored in state and guides
+        subsequent steps (outline, research, content).
+        """
+        logger.info("plan    start  task=%s", self.task_id)
+        if state.get("task_plan"):
+            logger.info("plan    skip   task=%s (already done)", self.task_id)
+            return {}
+
+        user_prompt = state.get("user_prompt", self.user_prompt)
+        ar = state.get("analysis_results") or []
+        file_list = "\n".join(
+            f"  - {r.get('_file', '?')}: {str(r.get('summary', ''))[:120]}"
+            for r in ar[:8] if isinstance(r, dict)
+        )
+
+        prompt = (
+            "你是一个报告撰写规划助手。请根据用户需求和已有材料，"
+            "将任务分解为 3-6 个子任务。\n\n"
+            f"用户需求：{user_prompt[:500]}\n\n"
+            f"已有材料：\n{file_list or '（无）'}\n\n"
+            "输出格式（每行一个子任务）：\n"
+            "- 子任务描述 | 需要什么信息 | 优先级(高/中/低)"
+        )
+
+        try:
+            llm = self._build_llm(timeout_s=30)
+            response = llm.invoke(prompt)
+            raw = (
+                response.content if hasattr(response, "content")
+                else str(response)
+            ).strip()
+        except Exception as e:
+            logger.warning("plan    llm_failed task=%s err=%s", self.task_id, e)
+            raw = (
+                "- 分析材料提取关键信息 | 材料内容 | 高\n"
+                "- 生成报告大纲 | 结构规划 | 高\n"
+                "- 撰写报告正文 | 大纲+材料 | 高"
+            )
+
+        # Parse plan items
+        plan_items: list[dict] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("- ") or line.startswith("* "):
+                parts = [p.strip() for p in line[2:].split("|")]
+                if len(parts) >= 1 and parts[0]:
+                    plan_items.append({
+                        "task": parts[0],
+                        "needs": parts[1] if len(parts) > 1 else "",
+                        "priority": parts[2] if len(parts) > 2 else "中",
+                    })
+
+        logger.info("plan    done   task=%s items=%d", self.task_id, len(plan_items))
+        return {"task_plan": plan_items, "plan_raw": raw}
 
     # ── Node: assess ─────────────────────────────────────────────────────────
 
@@ -321,6 +393,23 @@ class DocumentAgent:
         if state.get("enriched_context") and state.get("skills_used"):
             logger.info("enrich  skip   task=%s (already done)", self.task_id)
             return {}
+
+        # ── Query Rewrite: rewrite casual/spoken prompt into precise search query ──
+        raw_prompt = state.get("user_prompt", self.user_prompt)
+        if not state.get("rewritten_prompt") and raw_prompt and len(raw_prompt) > 8:
+            try:
+                from agent_file_create.rag.kb import KnowledgeBase
+                kb = KnowledgeBase()
+                rewritten = kb.rewrite_query(raw_prompt)
+                if rewritten and rewritten != raw_prompt and len(rewritten) >= 4:
+                    logger.info("enrich  query_rewritten  task=%s old=%.50s new=%.50s",
+                                self.task_id, raw_prompt, rewritten)
+                else:
+                    rewritten = raw_prompt
+            except Exception:
+                rewritten = raw_prompt
+        else:
+            rewritten = state.get("rewritten_prompt") or raw_prompt
 
         try:
             from agent_file_create.skills import get_registry
@@ -407,6 +496,7 @@ class DocumentAgent:
             "skill_results": skill_results,
             "skill_prompt": selection_prompt,
             "skill_calls_raw": raw,
+            "rewritten_prompt": rewritten,
         }
 
     # ── Node: research (skill invocation before content) ──────────────────────
@@ -529,6 +619,11 @@ class DocumentAgent:
                 "3. 篇幅偏好？A.3000字精简/B.5000字标准/C.8000字详尽"
             )
 
+        question = question or "请补充你希望生成文档的侧重点/受众/篇幅/风格等信息。"
+        logger.info("clarify_question  task=%s question_chars=%d", self.task_id, len(question))
+
+        question = "[STAGE:clarify]\n" + question
+
         # Native LangGraph interrupt — pauses the graph here
         answer = interrupt(question)
 
@@ -614,8 +709,47 @@ class DocumentAgent:
             f"当前版本：V{current_ver}",
         ]
         if len(versions) > 1:
-            prompt_parts.append(f"共 {len(versions)} 个版本")
-        prompt_parts.append("请选择：[满意] 完成并渲染  /  [不满意] 重新生成")
+            prompt_parts.append(f"共 {len(versions)} 个历史版本，可切换对比")
+
+        # ── ★ Critic 质检结果展示 ──
+        critic_report = state.get("critic_report") or {}
+        critic_issues = critic_report.get("issues", [])
+        high_issues = [i for i in critic_issues if i.get("severity") == "高"]
+        low_med_issues = [i for i in critic_issues if i.get("severity") != "高"]
+
+        if critic_issues:
+            prompt_parts.append("")
+            prompt_parts.append("── 自动质检报告 ──")
+            if not critic_report.get("passed", False):
+                if low_med_issues:
+                    prompt_parts.append(
+                        f"✅ 已自动修正 {len(low_med_issues)} 处低/中严重度问题"
+                    )
+                if high_issues:
+                    prompt_parts.append(f"⚠️ 发现 {len(high_issues)} 处高严重度问题，需人工确认：")
+                    for i, issue in enumerate(high_issues[:5]):
+                        prompt_parts.append(
+                            f"  {i+1}. [{issue.get('type','')}] {issue.get('location','')}: "
+                            f"{issue.get('description','')}"
+                        )
+                # Suggested search queries for missing evidence
+                suggested = state.get("suggested_queries") or []
+                if suggested:
+                    prompt_parts.append("")
+                    prompt_parts.append("🔍 证据不足？建议补充检索以下关键词后点 [不满意] 重新生成：")
+                    prompt_parts.append(f"  {', '.join(suggested[:5])}")
+            else:
+                prompt_parts.append("✅ 质检通过，未发现问题")
+            prompt_parts.append("──")
+
+        prompt_parts.append(
+            "操作选项：\n"
+            "  [满意] → 渲染最终报告\n"
+            "  [不满意] → 重新生成正文\n"
+            "  [编辑段落] → 点击预览区任意段落直接编辑\n"
+            "  [版本对比] → 切换查看历史版本差异\n"
+            "  [段落重生成] → 选中段落后AI重新生成该段"
+        )
         question = "\n".join(prompt_parts)
 
         answer = interrupt(question)
@@ -644,6 +778,54 @@ class DocumentAgent:
         # so the outline node regenerates instead of skipping.
         if not satisfied and scope == "outline":
             result["outline_satisfied"] = False
+        return result
+
+    # ── Node: final_confirm ───────────────────────────────────────────────────
+
+    def _node_final_confirm(self, state: AgentState) -> dict:
+        """Final confirmation before render. User can do version compare and section regen."""
+        logger.info("final_confirm start  task=%s", self.task_id)
+
+        current_ver = state.get("current_content_version", 1)
+        content = state.get("content", "")
+        versions = state.get("content_versions") or []
+
+        prompt_parts = [
+            "[STAGE:final_confirm]",
+            "📄 报告正文已生成，请进行最终确认：",
+            "",
+            f"当前版本：V{current_ver}",
+        ]
+        if len(versions) > 1:
+            prompt_parts.append(f"共 {len(versions)} 个历史版本")
+        prompt_parts.append(
+            "操作选项：\n"
+            "  [版本对比] → 切换查看历史版本差异\n"
+            "  [段落重生成] → 选中段落后AI重新生成该段\n"
+            "  [编辑段落] → 直接编辑段落内容\n"
+            "  [最终确认] → 确认后将渲染最终报告"
+        )
+        question = "\n".join(prompt_parts)
+
+        answer = interrupt(question)
+
+        import json as _json
+        try:
+            if isinstance(answer, str):
+                ans = _json.loads(answer)
+            else:
+                ans = answer if isinstance(answer, dict) else {}
+        except Exception:
+            ans = {"final_confirmed": True, "selected_version": current_ver}
+
+        final_confirmed = bool(ans.get("final_confirmed", False))
+        selected_version = int(ans.get("selected_version") or current_ver)
+
+        logger.info("final_confirm done  task=%s confirmed=%s version=%s", self.task_id, final_confirmed, selected_version)
+        result: dict = {
+            "final_confirmed": final_confirmed,
+            "selected_content_version": selected_version,
+        }
         return result
 
     # ── Node: outline ────────────────────────────────────────────────────────
@@ -681,7 +863,8 @@ class DocumentAgent:
 
             ar = state.get("analysis_results") or []
             multimodal = {f"source_{i}": r for i, r in enumerate(ar)}
-            user_prompt = state.get("user_prompt", self.user_prompt)
+            raw_prompt = state.get("user_prompt", self.user_prompt)
+            user_prompt = state.get("rewritten_prompt") or raw_prompt
             feedback = state.get("satisfaction_feedback", "")
             enriched = state.get("enriched_context", "")
             target_words = int(state.get("target_words") or 0)
@@ -709,6 +892,13 @@ class DocumentAgent:
                 pass
 
             logger.info("outline done   task=%s chars=%d ver=%d", self.task_id, len(outline or ""), current_ver)
+            # Write outline.md early so frontend can preview during satisfaction
+            try:
+                _out_path = Path(__file__).resolve().parent.parent.parent / "result" / str(self.task_id) / "outline.md"
+                _out_path.parent.mkdir(parents=True, exist_ok=True)
+                _out_path.write_text(str(outline or ""), encoding="utf-8")
+            except Exception:
+                pass
             return {
                 "outline": outline,
                 "outline_versions": versions,
@@ -740,13 +930,109 @@ class DocumentAgent:
             ar = state.get("analysis_results") or []
             multimodal = {f"source_{i}": r for i, r in enumerate(ar)}
             outline = str(state.get("outline") or "")
-            user_prompt = state.get("user_prompt", self.user_prompt)
+            raw_prompt = state.get("user_prompt", self.user_prompt)
+            user_prompt = state.get("rewritten_prompt") or raw_prompt
             feedback = state.get("satisfaction_feedback", "")
             enriched = state.get("enriched_context", "")
             target_words = int(state.get("target_words") or 0)
+
+            # ── Planner: pre-plan knowledge (skip if KB is empty) ──
+            try:
+                from agent_file_create.rag.planner import plan_all_sections, build_citation_map, format_citation_list
+                from agent_file_create.rag.kb import KnowledgeBase
+                from agent_file_create.task.manager import TaskManager
+                _kb = KnowledgeBase()
+                _tm = TaskManager()
+                _task_meta = _tm.read_task_meta(self.task_id)
+                _active_kb = str(_task_meta.get("active_kb") or "").strip()
+                _kb_name = str(_active_kb or "")
+                # Fallback: auto-pick first non-empty KB
+                if not _kb_name:
+                    _kb_list = _kb.list_kb()
+                    for _k in _kb_list:
+                        _s = _kb.kb_stats(kb=_k)
+                        if _s.get("doc_count", 0) > 0:
+                            _kb_name = _k
+                            logger.info("content planner_auto_kb task=%s kb=%s", self.task_id, _kb_name)
+                            break
+                _kb_stats = _kb.kb_stats(kb=_kb_name) if _kb_name else {}
+                if _kb_stats.get("doc_count", 0) > 0:
+                    logger.info("content planner_start  task=%s kb=%s docs=%d", self.task_id, _kb_name, _kb_stats["doc_count"])
+                    t_plan = time.perf_counter()
+                    _plan = plan_all_sections(
+                        outline=outline, user_prompt=user_prompt,
+                        kb=_kb, kb_name=_kb_name,
+                        target_words=target_words,
+                    )
+                    if _plan:
+                        _plan_parts = [enriched] if enriched else []
+                        for _sec_title, _sec_plan in _plan.items():
+                            _mat = _sec_plan.get("materials", "")
+                            _kps = "；".join(_sec_plan.get("knowledge_points", [])[:3])
+                            if _mat or _kps:
+                                _plan_parts.append(
+                                    f"[章节素材: {_sec_title}]\n"
+                                    f"知识点: {_kps}\n材料: {_mat}"
+                                )
+                        enriched = "\n\n".join(_plan_parts) if len(_plan_parts) > 1 else enriched
+
+                        # Cross-document conflict detection
+                        try:
+                            from agent_file_create.document._reviewer import (
+                                detect_cross_document_conflicts, annotate_conflicts_in_materials,
+                            )
+                            _all_plan_hits = []
+                            for _sp in _plan.values():
+                                _all_plan_hits.extend(_sp.get("_raw_hits", []))
+                            if _all_plan_hits:
+                                _conflicts = detect_cross_document_conflicts(_all_plan_hits)
+                                if _conflicts:
+                                    enriched = annotate_conflicts_in_materials(enriched, _conflicts)
+                                    logger.info("content cross_doc_conflicts=%d", len(_conflicts))
+                        except Exception:
+                            pass
+
+                        # Build global citation map from raw hits (plan_all_sections
+                        # delegates to plan_section_knowledge which doesn't produce
+                        # citation_map natively — rebuild from _raw_hits here)
+                        _all_cit_maps: dict[str, dict] = {}
+                        _annotated_parts: list[str] = []
+                        try:
+                            from agent_file_create.rag.planner import _compress_hits_annotated
+                            for _sec_title, _sec_plan in _plan.items():
+                                _raw = _sec_plan.get("_raw_hits") or []
+                                if _raw:
+                                    _annotated, _sec_cit_map = _compress_hits_annotated(
+                                        _raw,
+                                        _sec_plan.get("knowledge_points", [_sec_title])[0],
+                                        section_type=_sec_plan.get("section_type", "review"),
+                                    )
+                                    _all_cit_maps[_sec_title] = {"citation_map": _sec_cit_map}
+                                    if _annotated:
+                                        _annotated_parts.append(f"## {_sec_title}\n{_annotated}")
+                            _citation_map = build_citation_map(_all_cit_maps)  # once after all sections
+                            # Append annotated materials to enriched context so LLM sees 【n】 markers
+                            if _annotated_parts:
+                                enriched = (enriched or "") + "\n\n---\n\n# 带编号引用的检索材料\n\n" + "\n\n".join(_annotated_parts)
+                        except Exception:
+                            _citation_map = {}
+                        _citation_refs = format_citation_list(_citation_map) if _citation_map else ""
+                        logger.info("content planner_done sections=%d citations=%d annotated_chars=%d elapsed=%.1fs",
+                                    len(_plan), len(_citation_map), sum(len(p) for p in _annotated_parts), time.perf_counter() - t_plan)
+                    else:
+                        logger.warning("content planner_empty_plan  task=%s — no sections planned", self.task_id)
+                        _citation_map = {}
+                        _citation_refs = ""
+            except Exception as _pe:
+                logger.debug("content planner_skip err=%s", _pe)
+                _citation_map = {}
+                _citation_refs = ""
+
             content = _gen(outline, multimodal, user_prompt, task_id=self.task_id,
                           feedback=feedback, enriched_context=enriched,
                           target_words=target_words)
+
+            # Faithfulness check moved to quality_gate node (optional, user-decided)
 
             # Version management
             versions = list(state.get("content_versions") or [])
@@ -767,62 +1053,299 @@ class DocumentAgent:
             except Exception:
                 pass
 
-            logger.info("content done   task=%s chars=%d ver=%d", self.task_id, len(content or ""), current_ver)
+            # Citation post-processing: renumber + optionally append reference list
+            if content:
+                try:
+                    from agent_file_create.rag.planner import renumber_citations
+                    content, _citation_map = renumber_citations(content, _citation_map or {})
+                    _citation_refs = format_citation_list(_citation_map) if _citation_map else ""
+                except Exception:
+                    pass
+
+            # Template-aware reference placement:
+            # if the template has {{references}} placeholder, don't append —
+            # the renderer will inject it there. Otherwise append at end.
+            _template_has_refs = False
+            try:
+                tpl_dir = self.template_dir_override or state.get("template_dir_override") or ""
+                if tpl_dir:
+                    from agent_file_create.document.template_renderer import _get_template_placeholders
+                    td = Path(tpl_dir)
+                    if td.exists() and td.is_dir():
+                        for tp in sorted(td.glob("*.md")):
+                            if "references" in _get_template_placeholders(str(tp)):
+                                _template_has_refs = True
+                                break
+            except Exception:
+                pass
+
+            # Check if outline already has a references section
+            _outline_has_refs = bool(re.search(r'^#+\s*(?:参考|引用|文献|来源)', outline or "", re.MULTILINE | re.IGNORECASE))
+            if _citation_refs and not _template_has_refs and not _outline_has_refs:
+                content = (content or "") + "\n\n---\n\n" + _citation_refs
+
+            logger.info("content done   task=%s chars=%d ver=%d citations=%d template_has_refs=%s",
+                        self.task_id, len(content or ""), current_ver,
+                        len(_citation_map), _template_has_refs)
             return {
                 "content": content,
                 "content_versions": versions,
                 "current_content_version": current_ver,
                 "content_satisfied": False,
                 "satisfaction_feedback": "",
+                "citation_map": _citation_map,
+                "citation_refs": _citation_refs,
             }
         except Exception as exc:
             logger.warning("content failed  task=%s err=%s", self.task_id, exc)
-            return {"error": f"正文生成失败: {exc}"}
+            return {"error": f"正文生成失败: {exc}", "citation_map": {}, "citation_refs": ""}
+
+    # ── Node: critic (auto-review) ────────────────────────────────────────────
+
+    def _node_critic(self, state: AgentState) -> dict:
+        """Automated quality review + auto-fix for low/medium issues.
+
+        Runs after content generation, before human satisfaction check.
+        1. Regex pre-filter: fast number/entity/year cross-check (0 LLM calls).
+        2. LLM review: check content against outline & materials.
+        3. Auto-fix low/medium issues; leave high-severity for human review.
+        """
+        logger.info("critic  start  task=%s", self.task_id)
+
+        content = str(state.get("content") or "")
+        outline = str(state.get("outline") or "")
+        ar = state.get("analysis_results") or []
+
+        # Build materials digest from analysis results
+        materials_parts: list[str] = []
+        materials_full = ""
+        for r in ar[:8]:
+            if isinstance(r, dict):
+                title = str(r.get("title") or "").strip()
+                summary = str(r.get("summary") or "").strip()
+                if summary:
+                    materials_parts.append(f"[{title}] {summary}" if title else summary)
+        materials_full = "\n".join(materials_parts)
+        materials = materials_full[:3000]
+
+        if len(content) < 200:
+            logger.info("critic  skip   task=%s (content too short)", self.task_id)
+            return {"critic_report": {"issues": [], "passed": True}}
+
+        # ── Layer 1: regex pre-filter + numerical hallucination hardening ──
+        regex_issues: list[dict] = []
+        content_patched = content
+        try:
+            from agent_file_create.document._reviewer import (
+                extract_facts_from_materials, cross_check_facts, patch_unverified_claims,
+            )
+            material_facts = extract_facts_from_materials(materials_full)
+            # 1a: detect issues
+            raw_issues = cross_check_facts(content_patched, material_facts)
+            for ri in raw_issues[:8]:
+                regex_issues.append({
+                    "type": "regex",
+                    "location": ri.split(":")[0] if ":" in ri else "",
+                    "description": ri,
+                    "severity": "中",
+                })
+            # 1b: auto-patch unverifiable numbers/entities → [数据待核实]
+            content_patched, patches = patch_unverified_claims(content_patched, material_facts)
+            if patches:
+                for p in patches:
+                    regex_issues.append({
+                        "type": "auto_patch",
+                        "location": "numeral_guard",
+                        "description": p,
+                        "severity": "中",
+                    })
+                logger.info(
+                    "critic  regex_hardening patched=%d issues=%d",
+                    len(patches), len(raw_issues),
+                )
+            elif regex_issues:
+                logger.info("critic  regex_filter found=%d issues", len(regex_issues))
+        except Exception as e:
+            logger.debug("critic  regex_filter skipped: %s", e)
+
+        try:
+            from agent_file_create.document._critic import run_critic, run_critic_fix
+
+            # Step 1: Review (on already-hardened content)
+            report = run_critic(content=content_patched, outline=outline, materials=materials)
+        except Exception as e:
+            logger.warning("critic  failed task=%s err=%s", self.task_id, e)
+            report = {"issues": [], "raw": "", "passed": True}
+
+        issues = regex_issues + report.get("issues", [])
+        n_issues = len(issues)
+        high_issues = [i for i in issues if i.get("severity") == "高"]
+        fixable = [i for i in issues if i.get("severity") != "高"]
+
+        # ── Citation verification (optional, lightweight) ──
+        citation_warnings: list[dict] = []
+        try:
+            _cit_map = state.get("citation_map") or {}
+            if _cit_map and content:
+                from agent_file_create.rag.planner import verify_citations
+                citation_warnings = verify_citations(content_patched, _cit_map)
+                if citation_warnings:
+                    logger.info("critic  citation_warnings=%d", len(citation_warnings))
+        except Exception as e:
+            logger.debug("critic  citation_verify skipped: %s", e)
+
+        # Merge reports
+        merged = dict(report)
+        merged["issues"] = issues
+        merged["regex_issues"] = len(regex_issues)
+        merged["citation_warnings"] = citation_warnings
+
+        # Step 2: Auto-fix low/medium issues (regex + LLM)
+        # Start from already-hardened content (numerical patches applied)
+        fixed_content = content_patched
+        if fixable:
+            try:
+                fixed_content = run_critic_fix(
+                    content=content_patched, issues=fixable, materials=materials,
+                )
+                if fixed_content != content_patched:  # LLM did further changes
+                    logger.info(
+                        "critic  auto_fixed task=%s low_med=%d chars=%d->%d",
+                        self.task_id, len(fixable),
+                        len(content_patched), len(fixed_content),
+                    )
+            except Exception as e:
+                logger.warning("critic  auto_fix_failed task=%s err=%s", self.task_id, e)
+
+        _had_changes = fixed_content != content
+        logger.info(
+            "critic  done   task=%s total=%d regex=%d llm=%d high=%d changed=%s",
+            self.task_id, n_issues, len(regex_issues),
+            len(report.get("issues", [])), len(high_issues),
+            _had_changes,
+        )
+
+        return {
+            "content": fixed_content if _had_changes else content,
+            "critic_report": merged,
+            "critic_issues_count": n_issues,
+            "critic_high_issues": len(high_issues),
+            "suggested_queries": report.get("suggested_queries", []),
+        }
 
     # ── Node: render ─────────────────────────────────────────────────────────
 
+    # ── Node: quality_gate ───────────────────────────────────────────────────
+
+    def _node_quality_gate(self, state: AgentState) -> dict:
+        """After render — ask user: '报告已完成，是否进行质量评估？'"""
+        logger.info("quality_gate start  task=%s", self.task_id)
+
+        question = (
+            "[STAGE:quality_gate]\n"
+            "📋 当前报告已完成，是否进行质量评估？\n\n"
+            "开启后将核查每一章节的事实准确性，对可疑内容进行增量检索修正。\n\n"
+            "请选择：[要] 开启质量评估  /  [不要] 跳过"
+        )
+        answer = interrupt(question)
+
+        import json as _json
+        try:
+            ans = _json.loads(answer) if isinstance(answer, str) else {}
+        except Exception:
+            ans = {}
+        want_eval = bool(ans.get("satisfied", False))  # reuse satisfied=true for "要"
+
+        if not want_eval:
+            logger.info("quality_gate skip  task=%s (user declined)", self.task_id)
+            return {"eval_skipped": True}
+
+        logger.info("quality_gate run   task=%s", self.task_id)
+        content = str(state.get("content") or "")
+        ar = state.get("analysis_results") or []
+
+        try:
+            from agent_file_create.document_service import _run_faithfulness_checks
+            from agent_file_create.evaluation.orchestrator import evaluate as run_eval
+            output_dir = str(
+                __import__('pathlib').Path(__file__).resolve().parent.parent.parent
+                / "result" / self.task_id
+            )
+            new_content = _run_faithfulness_checks(
+                content=content, analysis_results=ar,
+                task_id=self.task_id, output_dir=output_dir,
+            )
+
+            # Run evaluation
+            eval_report = run_eval(
+                content=new_content or content,
+                outline=str(state.get("outline") or ""),
+                analysis_results=ar,
+                user_prompt=str(state.get("user_prompt") or ""),
+            )
+            scores = eval_report.combined
+            logger.info("quality_gate eval_done task=%s faith=%.2f comp=%.2f",
+                        self.task_id, scores.faithfulness, scores.completeness)
+
+            _eval_dict = eval_report.to_dict()
+            logger.info("quality_gate return task=%s eval_keys=%s", self.task_id, list(_eval_dict.keys()) if _eval_dict else [])
+            return {
+                "content": new_content if new_content != content else content,
+                "eval_applied": True,
+                "eval_metrics": _eval_dict,
+                "eval_report": _eval_dict,
+            }
+        except Exception as e:
+            logger.warning("quality_gate failed  task=%s err=%s", self.task_id, e)
+            return {"eval_skipped": True}
+
     def _node_render(self, state: AgentState) -> dict:
+        """Render already-generated content into templates.
+
+        Only called AFTER satisfaction_content confirms the user is happy.
+        Does NOT re-generate — content comes from state.
+        Uses user-selected version if specified.
+        """
         logger.info("render  start  task=%s", self.task_id)
 
         try:
-            from agent_file_create.document_service import generate_document
+            from agent_file_create.document_service import render_document
+            from pathlib import Path as _Path
 
-            ar = state.get("analysis_results") or []
-            # Fallback: load from disk if state is empty (e.g. task reload)
-            if not ar:
-                try:
-                    from agent_file_create.task.manager import TaskManager
-                    ar = TaskManager().read_analysis_results(self.task_id) or []
-                except Exception:
-                    pass
-            user_prompt = state.get("user_prompt", self.user_prompt)
-            result = retry_call(
-                generate_document,
-                user_prompt=user_prompt,
-                analysis_results=ar,
-                document_type="report",
-                task_id=self.task_id,
-                template_dir_override=state.get("template_dir_override") or "",
-                outline=str(state.get("outline") or "") or None,
-                content=str(state.get("content") or "") or None,
+            selected_version = state.get("selected_content_version") or state.get("current_content_version") or 1
+            content_versions = state.get("content_versions") or []
+            content = str(state.get("content") or "")
+
+            if content_versions and selected_version:
+                for v in content_versions:
+                    if v.get("version") == selected_version:
+                        content = str(v.get("content") or content)
+                        logger.info("render using_selected_version  task=%s version=%s", self.task_id, selected_version)
+                        break
+
+            outline = str(state.get("outline") or "")
+            output_dir = str(
+                state.get("output_dir") or
+                (_Path(__file__).resolve().parent.parent.parent / "result" / self.task_id)
+            )
+            template_dir = str(
+                state.get("template_dir_override") or
+                (_Path(__file__).resolve().parent.parent.parent / "result" / self.task_id / "template")
             )
 
-            logger.info("render  done   task=%s", self.task_id)
+            rendered = render_document(
+                task_id=self.task_id,
+                content=content,
+                outline=outline,
+                output_dir=output_dir,
+                template_dir=template_dir,
+            )
+
+            logger.info("render  done   task=%s outputs=%d", self.task_id, len(rendered))
             return {
-                "outputs": result.get("rendered_outputs") or [],
-                "output_dir": result.get("output_dir") or "",
-                "outline": result.get("document_outline") or state.get("outline") or "",
-                "content": result.get("document_content") or state.get("content") or "",
+                "outputs": rendered,
+                "output_dir": output_dir,
                 "finished": True,
-                "eval_metrics": {
-                    "factscore": result.get("factscore"),
-                    "coverage": result.get("coverage"),
-                    "facts_verified": result.get("facts_verified", 0),
-                    "facts_total": result.get("facts_total", 0),
-                    "aspects_covered": result.get("aspects_covered", 0),
-                    "aspects_total": result.get("aspects_total", 0),
-                    "uncovered_aspects": result.get("uncovered_aspects", []),
-                },
             }
         except Exception as exc:
             logger.warning("render failed   task=%s err=%s", self.task_id, exc)
@@ -941,6 +1464,13 @@ class DocumentAgent:
             "skill_results": list(external.get("skill_results") or []),
             "enriched_context": str(external.get("enriched_context") or ""),
             "skills_used": list(external.get("skills_used") or []),
+            # Planner + Critic
+            "task_plan": list(external.get("task_plan") or []),
+            "plan_raw": str(external.get("plan_raw") or ""),
+            "critic_report": dict(external.get("critic_report") or {}),
+            "critic_issues_count": int(external.get("critic_issues_count") or 0),
+            "critic_high_issues": int(external.get("critic_high_issues") or 0),
+            "suggested_queries": list(external.get("suggested_queries") or []),
         }
         # If caller pre‑populated analysis_results (e.g. from a previous run
         # or external extractor), carry them forward to skip extraction.

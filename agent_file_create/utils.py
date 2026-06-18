@@ -1,10 +1,46 @@
 import base64
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
+
+def split_questions(text: str) -> list[str]:
+    """Parse LLM-generated clarification text into a list of individual questions.
+
+    Handles numbered lists (1. / 1) / 1、), bullet points (- / *), and
+    lettered options (A. / A) / A、). Returns deduplicated questions, max 6.
+    """
+    out: list[str] = []
+    cur = ""
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s:
+            if cur:
+                out.append(cur)
+                cur = ""
+            continue
+        is_option = bool(re.match(r"^[A-Z][.)、\s]", s))
+        if is_option and cur:
+            cur += "\n" + s
+            continue
+        if cur:
+            out.append(cur)
+        s = re.sub(r"^[0-9]+[.)、\s]+", "", s).strip()
+        s = re.sub(r"^[-*]\s+", "", s).strip()
+        if s:
+            cur = s[:240]
+        if len(out) >= 6:
+            break
+    if cur and len(out) < 6:
+        out.append(cur)
+    if out:
+        return out
+    s = str(text or "").strip()
+    return [s[:240]] if s else []
 
 
 def image_to_base64(image_path: str) -> str:

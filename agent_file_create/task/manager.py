@@ -489,20 +489,23 @@ class TaskManager:
         return "", True
 
     def wait_for_satisfaction(self, task_id: str, stage: str, *, timeout_s: int = 1800) -> dict:
-        """Wait for user satisfaction response. Returns dict with satisfied/feedback/scope."""
+        """Wait for user satisfaction response. Returns dict with satisfied/feedback/scope/selected_version."""
         t0 = time.time()
         while time.time() - t0 <= float(timeout_s or 0):
             st = self.read_status(task_id)
             if str(st.get("status") or "") in {"canceled", "cancelled"}:
-                return {"satisfied": True, "feedback": "", "scope": "outline"}
+                return {"satisfied": True, "feedback": "", "scope": "outline", "selected_version": None}
             # Check for satisfaction response keys
             satisfied = st.get(f"{stage}_satisfied")
             if satisfied is not None:
-                return {
+                result = {
                     "satisfied": bool(satisfied),
                     "feedback": str(st.get("satisfaction_feedback") or "").strip(),
                     "scope": str(st.get("regeneration_scope") or "outline").strip(),
                 }
+                if st.get("selected_version"):
+                    result["selected_version"] = st.get("selected_version")
+                return result
             time.sleep(1.0)
         # Timeout: assume satisfied
-        return {"satisfied": True, "feedback": "", "scope": "outline"}
+        return {"satisfied": True, "feedback": "", "scope": "outline", "selected_version": None}

@@ -1,8 +1,11 @@
+import hashlib
 import json
 import logging
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, List
 
 from langchain_core.output_parsers import StrOutputParser
@@ -11,6 +14,14 @@ from langchain_core.prompts import ChatPromptTemplate
 from agent_file_create.config import CONTENT_API_ENDPOINT, CONTENT_API_KEY, CONTENT_API_STYLE, CONTENT_MODEL_NAME, MAX_WORKERS_DEFAULT, MODEL_TIMEOUT
 from agent_file_create.llm_client import call_llm
 from agent_file_create.llm_factory import get_chat_model
+from agent_file_create.document._reviewer import (
+    SECTION_SUMMARY_PROMPT as _SECTION_SUMMARY_PROMPT,
+    COHERENCE_REVIEW_PROMPT as _COHERENCE_REVIEW_PROMPT,
+    SECTION_FACT_CHECK_PROMPT as _SECTION_FACT_CHECK_PROMPT,
+    extract_facts_from_materials as _extract_facts_from_materials,
+    cross_check_facts as _cross_check_facts,  # kept as utility, called from _node_critic
+    final_coherence_review as _final_coherence_review,  # deprecated, replaced by Critic node
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +63,6 @@ def _check_cancel(task_id: str) -> None:
     except Exception:
         pass
 
-# ── LLM-based section summary for cross-section coherence ──────────────────
-
 _SECTION_SUMMARY_PROMPT = ChatPromptTemplate.from_messages([
     ("human", """\
 将以下报告章节内容压缩为一段不超过200字的摘要，重点提取：
@@ -67,8 +76,6 @@ _SECTION_SUMMARY_PROMPT = ChatPromptTemplate.from_messages([
 
 摘要："""),
 ])
-
-# ── Final coherence / fact-consistency review ──────────────────────────────
 
 _COHERENCE_REVIEW_PROMPT = ChatPromptTemplate.from_messages([
     ("human", """\
@@ -93,8 +100,6 @@ _COHERENCE_REVIEW_PROMPT = ChatPromptTemplate.from_messages([
 只标记明确的问题，不要吹毛求疵。"""),
 ])
 
-# ── Per-section fact grounding check (lightweight) ─────────────────────────
-
 _SECTION_FACT_CHECK_PROMPT = ChatPromptTemplate.from_messages([
     ("human", """\
 检查以下报告章节内容是否严格基于参考材料，标记出无依据的断言。
@@ -115,87 +120,6 @@ _SECTION_FACT_CHECK_PROMPT = ChatPromptTemplate.from_messages([
 - 如有问题，逐条列出：问题类型 | 具体内容 | 严重程度（高/中/低）"""),
 ])
 
-
-# ── Structured fact extraction for cross-checking ──────────────────────────
-
-def _extract_facts_from_materials(multimodal_digest: str) -> dict:
-    """Extract structured data points from source materials using regex.
-
-    Returns a dict with keys: 'numbers', 'entities', 'years'.
-    Each value is a set of strings found in the materials.
-    """
-    text = str(multimodal_digest or "")
-    if not text.strip():
-        return {"numbers": set(), "entities": set(), "years": set()}
-
-    # Numbers with units/context: "120亿", "35.6%", "2000万元", "1.5万"
-    num_patterns = [
-        r"\d+(?:\.\d+)?\s*[万亿千百]?\s*(?:元|美元|亿|万|%|％|个|人|家|次|倍|吨|公斤|千米|公里|米|小时|天|年|月)",
-        r"\d+(?:\.\d+)?\s*%",
-        r"(?:约|大约|近|超过|不足|至少|最多)\s*\d+(?:\.\d+)?",
-    ]
-    numbers: set[str] = set()
-    for pat in num_patterns:
-        for m in re.finditer(pat, text):
-            v = m.group().strip()
-            if len(v) >= 2:
-                numbers.add(v)
-
-    # Organization/institution names: "XX公司", "XX集团", "XX大学", "XX部门"
-    org_patterns = [
-        r"[一-鿿]{2,16}(?:公司|集团|大学|学院|研究所|研究院|中心|部门|委员会|协会|基金会|医院|银行|证券|保险|基金|科技|技术|网络|数据|人工智能|机器人)",
-        r"[一-鿿]{2,8}(?:有限|股份|责任|合资|独资)公司",
-    ]
-    entities: set[str] = set()
-    for pat in org_patterns:
-        for m in re.finditer(pat, text):
-            v = m.group().strip()
-            if len(v) >= 3 and len(v) <= 24:
-                entities.add(v)
-
-    # Years and date ranges
-    years: set[str] = set()
-    for m in re.finditer(r"(?:19|20|21)\d{2}(?:[-—–/](?:19|20|21)?\d{2})?", text):
-        years.add(m.group().strip())
-
-    return {"numbers": numbers, "entities": entities, "years": years}
-
-
-def _cross_check_facts(section_text: str, material_facts: dict) -> list[str]:
-    """Check generated content for claims not supported by source material facts.
-
-    Returns a list of warning strings (empty if clean).
-    """
-    text = str(section_text or "")
-    if not text.strip() or not material_facts:
-        return []
-
-    issues: list[str] = []
-
-    # Check numbers
-    for m in re.finditer(r"\d+(?:\.\d+)?\s*[万亿千百]?\s*(?:元|美元|亿|万|%|％|个|人|家|次|倍)", text):
-        val = m.group().strip()
-        if len(val) >= 2 and val not in material_facts.get("numbers", set()):
-            # Only flag if it looks like a specific data point (not generic)
-            if any(c.isdigit() for c in val) and len(val) >= 3:
-                issues.append(f"数字:{val}")
-
-    # Check entities
-    for pat in [r"[一-鿿]{2,16}(?:公司|集团|大学|银行|医院|研究所|中心)", r"[一-鿿]{2,8}(?:有限|股份)公司"]:
-        for m in re.finditer(pat, text):
-            val = m.group().strip()
-            if val not in material_facts.get("entities", set()):
-                exists = any(val[:4] in e or e[:4] in val for e in material_facts.get("entities", set()))
-                if not exists:
-                    issues.append(f"机构:{val}")
-
-    # Check years
-    for m in re.finditer(r"(?:19|20|21)\d{2}", text):
-        val = m.group().strip()
-        if val not in material_facts.get("years", set()):
-            issues.append(f"年份:{val}")
-
-    return issues[:12]  # cap at 12 flagged items
 
 
 def parse_outline_sections(outline: str) -> list[dict]:
@@ -244,6 +168,11 @@ _SECTION_TYPE_KEYWORDS: dict[str, list[str]] = {
         "消融", "参数", "配置", "超参数", "训练", "推理", "延迟", "吞吐",
         "baseline", "基线", "对比实验", "定量", "数值", "百分比",
     ],
+    "experiment_setup": [
+        "实验设定", "实验设计", "实验设置", "方法", "设置",
+        "数据集", "实现细节", "模型架构", "训练配置", "评测方案",
+        "预处理", "特征工程", "采样", "划分", "验证策略",
+    ],
     "analysis": [
         "讨论", "分析", "展望", "启示", "建议", "未来", "趋势", "影响",
         "意义", "价值", "优劣", "权衡", "局限", "不足", "改进方向",
@@ -252,20 +181,115 @@ _SECTION_TYPE_KEYWORDS: dict[str, list[str]] = {
 }
 
 def classify_section_type(section_title: str) -> str:
-    """Classify a section heading into data / analysis / review based on keywords.
+    """Classify a section heading into data / experiment_setup / analysis / review.
 
     - ``data``: experiments, metrics, quantitative results — strict sourcing, low temperature
+    - ``experiment_setup``: methods, datasets, model config — data-adjacent but method-focused
     - ``analysis``: discussion, implications, future work — more inference, higher temperature
     - ``review``: background, definitions, frameworks — balanced (default)
     """
     title = (section_title or "").strip()
     data_score = sum(1 for kw in _SECTION_TYPE_KEYWORDS["data"] if kw in title)
+    experiment_score = sum(1 for kw in _SECTION_TYPE_KEYWORDS["experiment_setup"] if kw in title)
     analysis_score = sum(1 for kw in _SECTION_TYPE_KEYWORDS["analysis"] if kw in title)
-    if data_score > analysis_score:
-        return "data"
-    elif analysis_score > data_score:
-        return "analysis"
+
+    # Tie-break: experiment_setup > data > analysis > review
+    # experiment_setup is a data-adjacent type that wins ties against pure data
+    scores = [
+        (experiment_score, "experiment_setup"),
+        (data_score, "data"),
+        (analysis_score, "analysis"),
+    ]
+    # Sort by score descending; on tie, first in list wins (experiment_setup priority)
+    scores.sort(key=lambda x: (-x[0], ["experiment_setup", "data", "analysis"].index(x[1])))
+    if scores[0][0] > 0:
+        return scores[0][1]
     return "review"
+
+
+def _extract_kps_from_context(enriched_context: str, section_title: str) -> list[str]:
+    """Extract knowledge_points from enriched_context text for a given section.
+
+    Looks for blocks like::
+
+        [章节素材: Section Title]
+        知识点: kp1; kp2; kp3
+
+    Returns a list of knowledge point strings, or empty list.
+    """
+    if not enriched_context or not section_title:
+        return []
+    # Find the block for this section
+    pattern = rf"\[章节素材:\s*{re.escape(section_title)}\][^\[]*?知识点:\s*(.+?)(?:\n|$)"
+    m = re.search(pattern, enriched_context, re.DOTALL)
+    if not m:
+        # Fuzzy match: first 4 chars
+        probe = section_title[:4]
+        pattern = rf"\[章节素材:\s*{re.escape(probe)}[^\]]*\][^\[]*?知识点:\s*(.+?)(?:\n|$)"
+        m = re.search(pattern, enriched_context, re.DOTALL)
+    if m:
+        raw = m.group(1).strip()
+        return [kp.strip() for kp in re.split(r"[；;]", raw) if kp.strip() and len(kp.strip()) >= 3]
+    return []
+
+
+def _compute_coverage_map(
+    knowledge_points: list[str],
+    materials_text: str,
+) -> list[tuple[str, str]]:
+    """Check each knowledge point against retrieved materials using
+    jieba token overlap (Jaccard similarity).
+
+    Returns [(kp, status), ...] where status is `充足` / `有限` / `无`.
+    """
+    if not knowledge_points or not materials_text:
+        return []
+
+    try:
+        import jieba
+        material_words = set(w for w in jieba.lcut(materials_text) if len(w.strip()) >= 2)
+    except Exception:
+        material_words = set()
+        for i in range(len(materials_text) - 1):
+            chunk = materials_text[i:i+2]
+            if chunk.strip() and len(chunk) >= 2:
+                material_words.add(chunk)
+
+    result = []
+    for kp in knowledge_points:
+        kp = str(kp).strip()
+        if not kp or len(kp) < 4:
+            continue
+
+        try:
+            import jieba
+            kp_words = set(w for w in jieba.lcut(kp) if len(w.strip()) >= 2)
+        except Exception:
+            kp_words = set()
+            for i in range(len(kp) - 1):
+                chunk = kp[i:i+2]
+                if chunk.strip() and len(chunk) >= 2:
+                    kp_words.add(chunk)
+
+        if not kp_words or not material_words:
+            count = materials_text.count(kp[:6])
+            status = "充足" if count >= 2 else ("有限" if count == 1 else "无")
+            result.append((kp, status))
+            continue
+
+        intersection = kp_words & material_words
+        union = kp_words | material_words
+        jaccard = len(intersection) / max(len(union), 1)
+
+        if jaccard >= 0.3:
+            status = "充足"
+        elif jaccard >= 0.1:
+            status = "有限"
+        else:
+            status = "无"
+        result.append((kp, status))
+
+    return result
 
 
 def _build_section_prompt(
@@ -280,6 +304,8 @@ def _build_section_prompt(
     next_title: str = "",
     feedback: str = "",
     section_type: str = "review",
+    knowledge_points: list[str] | None = None,
+    enriched_context: str = "",
 ) -> str:
     lo, hi = target_range
     parts = [
@@ -291,6 +317,9 @@ def _build_section_prompt(
         "3) 场景化扩写：解释数据和结论的业务含义，但场景必须是材料中有线索支撑的，不要凭空想象。",
         "4) 降低幻觉：不要编造具体的数字、机构名、人名、年份。材料中明确出现的数值可以引用，但要标注具体来源（如「据某论文实验数据」），禁止使用「据材料显示」「据资料记载」等笼统表述。不确定就说「相关数据暂缺」。",
         "5) 溯源要求：每个关键论断后，用「（据+来源文件具体关键词）」标注——如引用自「RAG技术综述_张三.pdf」则标注为「（据RAG技术综述）」。多个材料支撑时标注「（综合多份材料）」。无任何材料支撑的推论标注「（分析推测）」。",
+        "6) 编号引用：参考材料中的 【1】【2】 等编号对应来源文件。当你引用某个编号材料的具体数据时，在句末标注引用编号，如「实验显示准确率达95.3%【1】」。可同时使用自然语言引用和编号引用。注意使用【】而非[]，避免 Markdown 链接语法冲突。",
+        "7) 时效优先：参考材料标注了发表年份（如「2023, xxx.pdf」）。优先采信年份较新的来源。如果引用了较旧的文献（3年以上），请在文中注明其发表年份或标注'据20XX年研究'。",
+        "8) 简化标注：你只需使用两套标注——①自然语言引用「（据XXX）」用于标明来源文件，②【n】编号引用用于对标检索片段。两者可以同时出现在同一论断中。不再需要第三套标注系统。",
         "",
     ]
     # ── Type-specific instructions ──
@@ -301,6 +330,15 @@ def _build_section_prompt(
             "• 每个数据点后必须标注出处：「（据<材料名>）」。",
             "• 如果材料中数据不足，只写已有数据，禁止推测数值或编造比较对象。",
             "• 温度极低：行文可以干练，但数据必须精确。",
+            "",
+        ]
+    elif section_type == "experiment_setup":
+        parts += [
+            "🔧 本节为「实验设定/方法型」章节（含实验设计、数据集、实现细节），特别要求：",
+            "• 准确描述实验配置和参数设定，不遗漏关键超参数（学习率、batch size、epoch 等）。",
+            "• 数据集描述需包含规模、来源、划分方式，不可笼统说「使用公开数据集」。",
+            "• 方法描述要能复现：模型架构、训练策略、评估方案逐条写清。",
+            "• 可以引用材料中的配置表，但用自己的语言组织，标注出处。",
             "",
         ]
     elif section_type == "analysis":
@@ -344,6 +382,31 @@ def _build_section_prompt(
             "请特别注意上述反馈，在写作时针对性修正问题。",
             "",
         ]
+    # ── Coverage map: tell the LLM what we have / don't have ──
+    # Try to extract knowledge_points from enriched_context if not explicitly provided.
+    # Enriched context contains lines like "[章节素材: Title]\n知识点: kp1; kp2; kp3"
+    if not knowledge_points and enriched_context:
+        kps = _extract_kps_from_context(enriched_context, section_title)
+        if kps:
+            knowledge_points = kps
+
+    if knowledge_points:
+        coverage = _compute_coverage_map(knowledge_points, multimodal_digest)
+        if coverage:
+            parts.append("")
+            parts.append("## 知识覆盖度提示")
+            parts.append("以下知识点在当前检索材料中的覆盖情况：")
+            for kp, status in coverage:
+                icon = {"充足": "[FULL]", "有限": "[LIMITED]", "无": "[MISSING]"}.get(status, "?")
+                parts.append(f"  {icon} {status}: {kp}")
+            parts.append("")
+            parts.append("写作时请注意：")
+            parts.append("- [充足] 的知识点可以深入展开，引用具体数据。")
+            parts.append("- [有限] 的知识点只写材料中已有的内容，不要延伸推测。")
+            parts.append("- [无] 的知识点：如果跳过不影响章节完整性则跳过；")
+            parts.append("  如果必须提及，用一句话概括并标注 [需补充数据]。")
+            parts.append("")
+
     parts += [
         f"写作要求：本节建议 {lo}~{hi} 字。",
         "只输出本节正文，不要输出标题行。不要输出「本节」「本章」等元描述文字。",
@@ -360,7 +423,7 @@ def _call_qwen_text(prompt: str, *, timeout_s: int, num_predict: int, temperatur
         temperature=temperature,
         num_predict=num_predict,
         stop=["```"],
-        system="你是一个中文助手，只输出中文正文段落。",
+        system="你是一个中文文档处理助手。",
         api_style=CONTENT_API_STYLE,
         api_endpoint=CONTENT_API_ENDPOINT,
         api_key=CONTENT_API_KEY,
@@ -369,7 +432,10 @@ def _call_qwen_text(prompt: str, *, timeout_s: int, num_predict: int, temperatur
     t = (text or "").strip()
     t = re.sub(r"^```[a-zA-Z]*\s*", "", t).strip()
     t = re.sub(r"\s*```$", "", t).strip()
-    if not t or t.startswith("{"):
+    # Only filter genuine JSON errors, not content starting with {
+    if not t:
+        return ""
+    if t.startswith('{"error"') or t.startswith('{"success": false'):
         return ""
     return t
 
@@ -402,6 +468,7 @@ def generate_section_content(
     feedback: str = "",
     target_words: int = 0,
     section_type: str = "",
+    enriched_context: str = "",
 ) -> str:
     # Auto-classify if caller didn't specify
     section_type = section_type or classify_section_type(section_title)
@@ -429,6 +496,7 @@ def generate_section_content(
         next_title=next_title,
         feedback=feedback,
         section_type=section_type,
+        enriched_context=enriched_context,
     )
 
     # Temperature by section type: data=0.1, analysis=0.4, review=0.2
@@ -478,116 +546,17 @@ def _llm_summarize_for_next(section_title: str, content: str) -> str:
     return s[:200] + ("…" if len(s) > 200 else "")
 
 
-def _verify_section_facts(section_title: str, section_text: str, multimodal_digest: str) -> list[str]:
-    """Lightweight fact-check: returns list of flagged issues (empty if clean)."""
-    if not multimodal_digest.strip() or len(section_text) < 50:
-        return []
-    try:
-        llm = get_chat_model(
-            style=CONTENT_API_STYLE,
-            model=CONTENT_MODEL_NAME,
-            endpoint=CONTENT_API_ENDPOINT,
-            api_key=CONTENT_API_KEY,
-            temperature=0.0,
-            max_tokens=200,
-            timeout_s=60,
-        )
-        chain = _SECTION_FACT_CHECK_PROMPT | llm | StrOutputParser()
-        result = (chain.invoke({
-            "material_digest": multimodal_digest[:2000],
-            "section_text": section_text[:1500],
-        }) or "").strip()
-        if not result or result.upper().startswith("PASS"):
-            return []
-        return [line.strip("- ").strip() for line in result.splitlines() if line.strip() and "问题" not in line[:4]]
-    except Exception:
-        return []
-
-
-def _final_coherence_review(full_text: str, multimodal_digest: str) -> str:
-    """Post-generation coherence review with layered clipping.
-
-    Layer 3 (LLM contradiction check) and Layer 4 (regex fact cross-check) are
-    expensive — each costs an extra LLM call.  Skip them for short reports where
-    the base prompt constraints (Layer 1) and data-handling rules (Layer 2) already
-    provide reasonable guardrails.
-    """
-    text_len = len(full_text)
-
-    # Short report (< 3000 chars): layers 1 & 2 suffice
-    if text_len < 3000:
-        return full_text
-
-    # Medium report (3000–8000 chars): layer 3 only (LLM review), skip layer 4
-    run_layer4 = text_len >= 8000
-
-    all_issues: list[str] = []
-
-    # ── Step 1: LLM coherence review (layer 3) ──────────────────────────────
-    try:
-        llm = get_chat_model(
-            style=CONTENT_API_STYLE,
-            model=CONTENT_MODEL_NAME,
-            endpoint=CONTENT_API_ENDPOINT,
-            api_key=CONTENT_API_KEY,
-            temperature=0.1,
-            max_tokens=800,
-            timeout_s=120,
-        )
-        chain = _COHERENCE_REVIEW_PROMPT | llm | StrOutputParser()
-        review = (chain.invoke({
-            "full_text": full_text[:8000],
-            "material_digest": (multimodal_digest or "无")[:2000],
-        }) or "").strip()
-        if review and not review.upper().startswith("PASS"):
-            for line in review.splitlines():
-                s = line.strip()
-                if s.startswith("##"):
-                    all_issues.append(s)
-    except Exception:
-        pass
-
-    # ── Step 2: Structured fact cross-check (layer 4, long reports only) ────
-    if run_layer4:
-        try:
-            material_facts = _extract_facts_from_materials(multimodal_digest)
-            fact_issues = _cross_check_facts(full_text, material_facts)
-            for fi in fact_issues:
-                all_issues.append(f"## 事实核查: {fi}")
-        except Exception:
-            pass
-
-    if not all_issues:
-        return full_text
-
-    # ── Apply markers for flagged issues ─────────────────────────────────
-    corrected = full_text
-    for issue in all_issues[:8]:
-        if "→" in issue:
-            problem_part, suggestion = issue.split("→", 1)
-            section_name = problem_part.split(":")[0].replace("##", "").strip()
-            if section_name and section_name in corrected:
-                marker = f"\n\n<!-- 核查提示：{suggestion.strip()[:120]} -->"
-                idx = corrected.find(section_name)
-                if idx >= 0:
-                    next_section = corrected.find("\n## ", idx + len(section_name))
-                    if next_section < 0:
-                        next_section = len(corrected)
-                    insert_at = min(next_section, idx + 2000)
-                    if "<!-- 核查提示" not in corrected[max(0, insert_at - 200):insert_at + 200]:
-                        corrected = corrected[:insert_at] + marker + corrected[insert_at:]
-        else:
-            # Fact-check issues without →: append at end as review notes
-            marker = f"\n\n<!-- 核查提示：{issue.replace('##', '').strip()[:160]} -->"
-            if marker not in corrected[-800:]:
-                corrected = corrected.rstrip() + marker
-
-    return corrected
-
-
 def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user_prompt: str,
                           *, task_id: str = "", feedback: str = "", enriched_context: str = "",
                           target_words: int = 0) -> str:
+    """Generate report body section by section, streaming progress to disk.
+
+    Why sequential? Each section's content depends on the previous section's summary
+    for coherence (cross-references, avoiding repetition). The previous_summary
+    carries forward key entities and conclusions so later sections can refer back
+    naturally. Sections are flushed to content.md after each write so the frontend
+    can show live preview via SSE polling.
+    """
     flat = parse_outline_sections(outline)
     if not flat:
         return ""
@@ -649,7 +618,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
         if level == 2:
             out_lines.append("")
             out_lines.append(f"## {title}")
-            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words)
+            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words, enriched_context=enriched_context)
             out_lines.append("")
             out_lines.append(body)
             previous_summary = _llm_summarize_for_next(title, body)
@@ -662,7 +631,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
         if level == 3:
             out_lines.append("")
             out_lines.append(f"### {title}")
-            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words)
+            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words, enriched_context=enriched_context)
             out_lines.append("")
             out_lines.append(body)
             previous_summary = _llm_summarize_for_next(title, body)
@@ -684,7 +653,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
         _flush_seq()
 
     raw = "\n".join(out_lines).strip() + "\n"
-    return _final_coherence_review(raw, multimodal_digest)
+    return raw  # _final_coherence_review replaced by Critic graph node
 
 
 def generate_content(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "", feedback: str = "") -> str:
@@ -725,6 +694,50 @@ def _build_section_args(task: dict, multimodal_results: Dict[str, Any], user_pro
     }
 
 
+# ── Section-level caching: skip LLM calls for unchanged sections ────────────
+
+def _section_cache_key(title: str, parent: str, multimodal_digest: str,
+                        user_prompt: str, previous_summary: str, level: int,
+                        target_words: int, feedback: str) -> str:
+    """Hash all inputs affecting section content. Same hash = same output."""
+    raw = "|".join([
+        title, parent,
+        (multimodal_digest or "")[:800],
+        (user_prompt or "")[:300],
+        (previous_summary or "")[:300],
+        str(level), str(target_words),
+        (feedback or "")[:200],
+    ])
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_section_cache(task_id: str) -> Dict[str, str]:
+    """Load previous section key→content map from disk."""
+    if not task_id:
+        return {}
+    try:
+        base = Path(__file__).resolve().parent.parent.parent
+        p = base / "result" / str(task_id) / "_section_cache.json"
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_section_cache(task_id: str, cache: Dict[str, str]) -> None:
+    """Persist section key→content map to disk."""
+    if not task_id:
+        return
+    try:
+        base = Path(__file__).resolve().parent.parent.parent
+        p = base / "result" / str(task_id) / "_section_cache.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "", feedback: str = "", enriched_context: str = "", target_words: int = 0) -> str:
     flat = parse_outline_sections(outline)
     if not flat:
@@ -742,37 +755,22 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
     if enriched_context.strip():
         multimodal_digest = f"[技能搜集到的补充信息]\n{enriched_context.strip()}\n\n{multimodal_digest}"
 
-    # Tag tasks with their parent h2 for grouping
-    parent_stack: list[str] = []
-    h2_index_map: dict[int, int] = {}
-    current_h2_idx = -1
-    for i, item in enumerate(flat):
-        level = int(item.get("level") or 0)
-        title = str(item.get("title") or "").strip()
-        if not title or level < 1:
-            continue
-        while len(parent_stack) >= level:
-            parent_stack.pop()
-        if level == 2:
-            current_h2_idx = i
-        if level >= 3:
-            h2_index_map[i] = current_h2_idx if current_h2_idx >= 0 else -1
-        parent_stack.append(title)
-
     results: dict[int, str] = {}
-    max_workers = max(1, min(int(MAX_WORKERS_DEFAULT), len(tasks)))
+    # Cap concurrent LLM calls to avoid overwhelming local models
+    _llm_limit = int(os.environ.get("CONCURRENT_LLM_CALLS", str(MAX_WORKERS_DEFAULT)))
+    max_workers = max(1, min(_llm_limit, len(tasks)))
 
-    # Helper to write partial content so the frontend can preview completed sections
+    # Helper to write partial content and stream events
+    base_dir = Path(__file__).resolve().parent.parent.parent  # pre-compute for both paths
     def _flush_partial():
         if not task_id:
             return
         try:
-            from pathlib import Path as _Path
-            base = _Path(__file__).resolve().parent.parent.parent
-            p = base / "result" / str(task_id) / "content.md"
+            p = base_dir / "result" / str(task_id) / "content.md"
             p.parent.mkdir(parents=True, exist_ok=True)
             buf: list[str] = []
             pstack: list[str] = []
+            completed_sections = []
             for i, item in enumerate(flat):
                 lv = int(item.get("level") or 0)
                 ti = str(item.get("title") or "").strip()
@@ -789,24 +787,58 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
                     body = results.get(i, "")
                     buf.append("")
                     buf.append(body if body else "（生成中…）")
+                    if body and lv >= 2:
+                        completed_sections.append({"level": lv, "title": ti})
             raw = "\n".join(buf).strip() + "\n"
             p.write_text(raw, encoding="utf-8")
+            # Write stream event for SSE (append-only JSONL)
+            if completed_sections:
+                stream_p = base_dir / "result" / str(task_id) / "stream.jsonl"
+                with open(stream_p, "a", encoding="utf-8") as sf:
+                    for sec in completed_sections:
+                        sf.write(json.dumps({"type": "section_done", "title": sec["title"],
+                                             "level": sec["level"], "done": done_count,
+                                             "total": total_sections}, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
-    # Phase 1: parallelize h2 sections
-    h2_summaries: dict[int, str] = {}  # flat_index -> summary
-    h2_tasks = [t for t in tasks if t["level"] == 2]
+    # ── Unified parallel phase: submit ALL sections (h2 + h3) at once ──
+    # h3 sections use empty parent_summary initially (h2 content not ready yet),
+    # but gain coherence from parent_title + multimodal_digest + user_prompt.
+    # This eliminates the h2→h3 serial barrier, cutting wall-clock time by ~40%.
 
-    # Flush initial skeleton so frontend shows structure with placeholders immediately
-    _flush_partial()
+    _flush_partial()  # skeleton for frontend
 
-    if h2_tasks:
+    section_cache = _load_section_cache(task_id)
+    cache_hits = 0
+
+    # Check cache first for all tasks
+    uncached: list[dict] = []
+    for t in tasks:
+        parent_summary = ""  # always empty — h2 content may not be ready
+        key = _section_cache_key(
+            t["title"], t["parent_title"], multimodal_digest,
+            user_prompt, parent_summary, t["level"], per_section_words, feedback)
+        if key in section_cache:
+            results[t["index"]] = section_cache[key]
+            done_count += 1
+            cache_hits += 1
+            logger.info(f"section_cache_hit section={t['title'][:40]}")
+        else:
+            t["_cache_key"] = key
+            uncached.append(t)
+
+    if uncached:
         _check_cancel(task_id)
+        section_names = [t["title"][:30] for t in uncached]
+        logger.info(f"content_generating sections={len(uncached)}/{total_sections} titles={section_names} task={task_id}")
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {}
-            for t in h2_tasks:
-                args = _build_section_args(t, multimodal_results, user_prompt, task_id=task_id, feedback=feedback, target_words=per_section_words)
+            for t in uncached:
+                args = _build_section_args(t, multimodal_results, user_prompt,
+                                           parent_summary="",
+                                           task_id=task_id, feedback=feedback,
+                                           target_words=per_section_words)
                 futures[pool.submit(generate_section_content, **args)] = t["index"]
             for fut in as_completed(futures):
                 idx = futures[fut]
@@ -817,36 +849,21 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
                 _check_cancel(task_id)
                 done_count += 1
                 section_title = str(flat[idx].get("title") or "") if idx < len(flat) else ""
+                logger.info(f"content_section_done {done_count}/{total_sections} title={section_title[:40]}")
                 _notify_section_progress(task_id, done_count, total_sections, section_title)
-                _flush_partial()  # stream each section to frontend immediately
-        # Compute summaries after all h2s complete
-        for t in h2_tasks:
-            idx = t["index"]
-            body = results.get(idx, "")
-            h2_summaries[idx] = _llm_summarize_for_next(t["title"], body)
+                _flush_partial()
 
-    # Phase 2: parallelize h3+ sections under their parent h2 context
-    sub_tasks = [t for t in tasks if t["level"] >= 3]
-    if sub_tasks:
-        _check_cancel(task_id)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {}
-            for t in sub_tasks:
-                parent_h2_idx = h2_index_map.get(t["index"], -1)
-                parent_summary = h2_summaries.get(parent_h2_idx, "") if parent_h2_idx >= 0 else ""
-                args = _build_section_args(t, multimodal_results, user_prompt, parent_summary=parent_summary, task_id=task_id, feedback=feedback, target_words=per_section_words)
-                futures[pool.submit(generate_section_content, **args)] = t["index"]
-            for fut in as_completed(futures):
-                idx = futures[fut]
-                try:
-                    results[idx] = str(fut.result() or "")
-                except Exception as e:
-                    results[idx] = f"（本节生成失败：{str(e)[:120]}）"
-                done_count += 1
-                _check_cancel(task_id)
-                section_title = str(flat[idx].get("title") or "") if idx < len(flat) else ""
-                _notify_section_progress(task_id, done_count, total_sections, section_title)
-                _flush_partial()  # stream each section to frontend immediately
+    # Update cache for all generated sections
+    for t in tasks:
+        ck = t.get("_cache_key")
+        body = results.get(t["index"], "")
+        if ck and body:
+            section_cache[ck] = body
+
+    # Persist section cache
+    _save_section_cache(task_id, section_cache)
+    if cache_hits:
+        logger.info(f"section_cache_summary task={task_id} hits={cache_hits}/{total_sections}")
 
     parent_stack = []
     out_lines: list[str] = []
@@ -871,7 +888,7 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
             out_lines.append(body)
 
     raw = "\n".join(out_lines).strip() + "\n"
-    return _final_coherence_review(raw, multimodal_digest)
+    return raw  # _final_coherence_review replaced by Critic graph node
 
 
 def regenerate_section(

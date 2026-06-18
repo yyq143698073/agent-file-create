@@ -185,6 +185,79 @@ def _extract_pdf_text_pypdf2_fallback(file_path: str, max_chars: int = 20000) ->
         return ""
 
 
+def _extract_page_range_text(file_path: str, start: int, end: int, max_chars: int) -> str:
+    """Extract text from a specific page range of a PDF (worker for parallel extraction)."""
+    try:
+        import fitz
+    except Exception:
+        return ""
+    try:
+        doc = fitz.open(str(file_path))
+        parts: list[str] = []
+        total = 0
+        for i in range(start, min(end, len(doc))):
+            try:
+                t = doc[i].get_text("text") or ""
+            except Exception:
+                t = ""
+            if t:
+                parts.append(f"[Page {i+1}] {t}")
+                total += len(t)
+                if total >= max_chars:
+                    break
+        doc.close()
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def extract_pdf_text_parallel(file_path: str, max_chars: int = 30000,
+                               chunk_pages: int = 8, max_workers: int = 4) -> str:
+    """Extract text from a large PDF by processing page ranges in parallel.
+
+    Falls back to serial extraction for small files.
+    """
+    try:
+        import fitz
+        doc = fitz.open(str(file_path))
+        total_pages = len(doc)
+        doc.close()
+    except Exception:
+        return extract_pdf_text_fast(file_path, max_chars)
+
+    if total_pages <= chunk_pages:
+        return extract_pdf_text_fast(file_path, max_chars)
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Split into page ranges
+    chunks: list[tuple[int, int]] = []
+    for start in range(0, total_pages, chunk_pages):
+        end = min(start + chunk_pages, total_pages)
+        chunks.append((start, end))
+
+    # Per-chunk character budget
+    per_chunk_chars = max(1000, max_chars // len(chunks))
+
+    results: dict[int, str] = {}
+    workers = min(max_workers, len(chunks))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {}
+        for order, (start, end) in enumerate(chunks):
+            fut = pool.submit(_extract_page_range_text, file_path, start, end, per_chunk_chars)
+            futures[fut] = order
+        for fut in as_completed(futures):
+            order = futures[fut]
+            try:
+                results[order] = fut.result()
+            except Exception:
+                results[order] = ""
+
+    # Reassemble in page order
+    text = "\n".join(results.get(i, "") for i in range(len(chunks)))
+    return preprocess_text(text, max_chars=max_chars)
+
+
 def extract_pdf_embedded_images(
     file_path: str,
     threshold: tuple[float, float] = (0.6, 0.6),

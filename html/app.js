@@ -1,4 +1,4 @@
-/* ═══════════════════════════════════════════════════════════════════════
+﻿/* ═══════════════════════════════════════════════════════════════════════
    State
    ═══════════════════════════════════════════════════════════════════════ */
 
@@ -40,6 +40,7 @@ const S = {
   },
   _historyDirty: false,          // pending chat history sync to backend
   _satisfactionSubmitting: false, // guard against double-submit
+  _pendingTemplate: null,         // template selected before task creation
 };
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -169,6 +170,10 @@ function renderMD(text) {
   // Images ![alt](url)
   h = h.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%">');
 
+  // Auto-link bare URLs (but not already inside <a> or <img>)
+  h = h.replace(/(?<!href="|src=")(https?:\/\/[^\s<>"]+)/g,
+    '<a href="$1" target="_blank" rel="noopener">$1</a>');
+
   // ── Phase 5: Restore code blocks ──
   h = h.replace(/\x00CODEBLOCK_(\d+)\x00/g, (_, idx) => {
     const cb = codeBlocks[parseInt(idx, 10)];
@@ -294,6 +299,8 @@ async function uploadAndGenerate() {
   }
   const kbDocIds = getKbDocIdsStr();
   if (kbDocIds) fd.append("kb_doc_ids", kbDocIds);
+  const retrievalKb = ($("retrievalKbSelect").value || "").trim();
+  if (retrievalKb) fd.append("retrieval_kb", retrievalKb);
 
   S.generating = true;
   S._lastOperation = "generate";
@@ -306,6 +313,7 @@ async function uploadAndGenerate() {
   S.lastAbText = "";
   $("abBox").textContent = "";
   $("abCard").style.display = "none";
+  $("warningsCard").style.display = "none";
   $("evalCard").style.display = "none";
   S._evalData = null;
   S._outlineDone = false;
@@ -313,6 +321,11 @@ async function uploadAndGenerate() {
   try {
     const data = await apiPost("/api/upload", fd);
     setTaskBadge(data.task_id || "");
+    // Apply pending template if user selected one before generating
+    if (S._pendingTemplate) {
+      try { await useTemplateForTask(S._pendingTemplate); } catch (e) {}
+      S._pendingTemplate = null;
+    }
     S.history = [];
     clearChat();
     $("previewBox").textContent = "";
@@ -361,10 +374,15 @@ async function appendToTask() {
   setStatus("追加中…", "busy");
   S._outlineDone = false;
   $("evalCard").style.display = "none";
+  $("warningsCard").style.display = "none";
   S._evalData = null;
   try {
     const data = await apiPost("/api/append", fd);
     setTaskBadge(data.task_id || tid);
+    if (S._pendingTemplate) {
+      try { await useTemplateForTask(S._pendingTemplate); } catch (e) {}
+      S._pendingTemplate = null;
+    }
     setDownloads(data.downloads || {});
     setStatus("重新生成中…", "busy");
     startPolling();
@@ -435,6 +453,14 @@ async function pollStatus() {
         const previewText = data.preview_text || "";
         const previewVersion = data.preview_version || 1;
         showSatisfactionInChat(stage === "satisfaction_outline" ? "outline" : "content", previewText, previewVersion);
+      } else if (stage === "final_confirm") {
+        setStatus("请进行最终确认", "busy");
+        S._isFinalConfirmStage = true;
+        await loadFinalConfirmPreview(data);
+        showFinalConfirmInChat(msg || "请进行最终确认后渲染报告");
+      } else if (stage === "quality_gate") {
+        setStatus("报告已完成", "busy");
+        showQualityGateInChat(msg || "报告已完成，是否进行质量评估？");
       } else {
         setStatus(msg || "需要补充信息", "busy");
         showClarifyInChat(data.clarify_questions || []);
@@ -497,14 +523,27 @@ async function pollStatus() {
       }
       // Show version tags for the currently active preview tab
       showVersionTags(S.previewTab === "compare" ? (ov.length > 1 ? "outline" : "content") : S.previewTab);
-      // Eval metrics bar (from generate_document pipeline)
-      if (data.eval_metrics && typeof data.eval_metrics === "object") {
-        renderEvalMetricsBar(data.eval_metrics);
+      // ── Unified eval card ──
+      S._evalData = data.eval || null;
+      S._evalMetrics = data.eval_metrics || {};
+      const merged = Object.assign(
+        {}, S._evalMetrics,
+        (S._evalData || {}).combined || S._evalData || {}
+      );
+      const hasEvalData = (data.eval && Object.keys(data.eval).length > 0) ||
+        (data.eval_metrics && Object.keys(data.eval_metrics).length > 0);
+      if (hasEvalData) {
+        $("evalCard").style.display = "";
+        renderEvalMetricsBar(merged);
+        renderEvalContent(merged);
+      } else {
+        $("evalCard").style.display = "none";
       }
-      // Eval results
-      if (data.eval && typeof data.eval === "object") {
-        S._evalData = data.eval;
-        renderEval();
+      // ── Warnings card ──
+      if (data.warnings && data.warnings.length) {
+        renderWarningsList(data.warnings);
+      } else {
+        $("warningsCard").style.display = "none";
       }
       // Chat notification on completion
       if (S._lastOperation) {
@@ -576,13 +615,17 @@ async function fetchText(url) {
 }
 
 function showPreview() {
-  // Cancel any active section edit
-  if (S._editingSection) cancelSectionEdit();
   const tab = S.previewTab;
   const raw = tab === "outline" ? (S._outline || "（大纲尚未生成）") : (S._content || "（正文尚未生成）");
-  $("previewBox").innerHTML = renderMD(raw);
+  if (S._editingSection) return;
+  const cacheKey = "__previewCache_" + tab;
+  if (window[cacheKey] === raw) return;
+  window[cacheKey] = raw;
+  const box = $("previewBox");
+  const st = box.scrollTop;  // save scroll position
+  box.innerHTML = renderMD(raw);
+  box.scrollTop = Math.min(st, box.scrollHeight);  // restore (clamped)
   attachSectionActions(tab);
-  // Show/hide full-screen button when content exists
   const btn = $("btnFullPreview");
   if (btn) btn.style.display = (S._content && S._content.trim()) ? "" : "none";
 }
@@ -655,9 +698,10 @@ const REGEN_OPTIONS = ["更详细", "更简短", "换种结构", "增加数据",
 
 function regenSection(headingText) {
   if (!S.taskId) { toast("请先生成或加载一个任务", "err"); return; }
-  if (S.generating) { toast("任务正在进行中，请等待完成", "info", 2000); return; }
+  if (S.generating && !S._isFinalConfirmStage) { toast("任务正在进行中，请等待完成", "info", 2000); return; }
 
   S.generating = true;
+  S._isFinalConfirmStage = false;
   $("btnUpload").disabled = true;
   $("btnAppend").disabled = true;
 
@@ -882,54 +926,188 @@ function renderEvalPanel(scores) {
   return html;
 }
 
+/* ── Render Warnings Card ─────────────────────────────────────────── */
+
+function renderWarningsList(warnings) {
+  const card = $("warningsCard");
+  const list = $("warningsList");
+  const count = $("warningsCount");
+
+  if (!warnings || !warnings.length) {
+    card.style.display = "none";
+    return;
+  }
+
+  card.style.display = "";
+  count.textContent = warnings.length;
+
+  list.innerHTML = warnings.map((w, i) => {
+    const type = w.type || "warning";
+    const severity = w.severity || "medium";
+    const icon = type === "citation" ? "📖" : type === "contrastive" ? "⚖️" : "⚠️";
+    const title = w.title || "待核实问题";
+    const desc = w.description || "";
+    const details = w.details || [];
+    const context = w.context || "";
+    const reason = w.reason || "";
+    const suggestion = w.suggestion || "";
+
+    let detailsHtml = "";
+    if (details.length) {
+      detailsHtml = `<div class="warning-detail">
+        <div class="warning-detail-label">详情</div>
+        ${details.map(d => `<div>• ${esc(d)}</div>`).join("")}
+      </div>`;
+    } else if (context) {
+      detailsHtml = `<div class="warning-detail">
+        <div class="warning-detail-label">引用上下文</div>
+        <div>「${esc(context)}...」</div>
+      </div>`;
+    }
+
+    if (reason) {
+      detailsHtml += `<div class="warning-detail">
+        <div class="warning-detail-label">问题原因</div>
+        <div>${esc(reason)}</div>
+      </div>`;
+    }
+
+    let suggestionHtml = "";
+    if (suggestion) {
+      suggestionHtml = `<div class="warning-suggestion">${esc(suggestion)}</div>`;
+    }
+
+    return `<div class="warning-item" id="warn-${i}">
+      <div class="warning-header" onclick="toggleWarning(${i})">
+        <div class="warning-icon ${type} ${severity}">${icon}</div>
+        <div class="warning-title">${esc(title)}</div>
+        <div class="warning-desc">${esc(desc)}</div>
+        <div class="warning-toggle" id="warn-toggle-${i}">▶</div>
+      </div>
+      <div class="warning-body" id="warn-body-${i}" style="display:none">
+        ${detailsHtml}
+        ${suggestionHtml}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function toggleWarning(i) {
+  const body = $("warn-body-" + i);
+  const toggle = $("warn-toggle-" + i);
+  if (!body) return;
+
+  if (body.style.display === "none") {
+    body.style.display = "";
+    if (toggle) { toggle.textContent = "▼"; toggle.classList.add("expanded"); }
+  } else {
+    body.style.display = "none";
+    if (toggle) { toggle.textContent = "▶"; toggle.classList.remove("expanded"); }
+  }
+}
+
 function renderEvalMetricsBar(metrics) {
   if (!metrics) return;
-  const bar = $("evalMetricsBar");
-  bar.style.display = "flex";
+  $("evalCard").style.display = "";
 
-  // Warn count
-  const warns = metrics.warns !== undefined ? metrics.warns :
-    (metrics.facts_total || 0) - (metrics.facts_verified || 0);
-  const warnBadge = $("evalWarns");
-  if (warns > 0) {
-    warnBadge.style.background = "#fef2f2"; warnBadge.style.color = "#dc2626";
-    warnBadge.textContent = `⚠️ ${warns} 条警告`;
+  // Warn count badge
+  // Count real warnings from content, not unverified facts
+  const realWarns = ((S._content || "").match(/> ⚠/g) || []).length;
+  const wb = $("evalWarns");
+  if (realWarns > 0) {
+    wb.style.background = "#fef2f2"; wb.style.color = "#dc2626";
+    wb.textContent = `⚠️ ${realWarns} 条警告`;
   } else {
-    warnBadge.style.background = "#f0fdf4"; warnBadge.style.color = "#16a34a";
-    warnBadge.textContent = "✅ 无警告";
+    wb.style.background = "#f0fdf4"; wb.style.color = "#16a34a";
+    wb.textContent = "✅ 无警告";
   }
 
-  // FActScore
+  // FActScore badge
   const fs = metrics.factscore;
-  const fsBadge = $("evalFActScore");
-  if (fs != null && fs !== undefined) {
+  const fb = $("evalFActScore");
+  if (fs != null && fs > 0) {
     const pct = Math.round(fs * 100);
-    fsBadge.style.background = pct >= 70 ? "#f0fdf4" : pct >= 40 ? "#fffbeb" : "#fef2f2";
-    fsBadge.style.color = pct >= 70 ? "#16a34a" : pct >= 40 ? "#b45309" : "#dc2626";
-    fsBadge.textContent = `FAct: ${pct}%`;
-  } else {
-    fsBadge.textContent = "";
-  }
+    fb.style.display = ""; fb.style.background = pct >= 70 ? "#f0fdf4" : pct >= 40 ? "#fffbeb" : "#fef2f2";
+    fb.style.color = pct >= 70 ? "#16a34a" : pct >= 40 ? "#b45309" : "#dc2626";
+    fb.textContent = `原子事实: ${pct}%`;
+  } else { fb.style.display = "none"; }
 
-  // Coverage
+  // Coverage badge
   const cov = metrics.coverage;
-  const covBadge = $("evalCoverage");
-  if (cov != null && cov !== undefined) {
+  const cb = $("evalCoverage");
+  if (cov != null && cov > 0) {
     const pct = Math.round(cov * 100);
-    covBadge.style.background = pct >= 70 ? "#f0fdf4" : pct >= 40 ? "#fffbeb" : "#fef2f2";
-    covBadge.style.color = pct >= 70 ? "#16a34a" : pct >= 40 ? "#b45309" : "#dc2626";
-    covBadge.textContent = `覆盖: ${pct}%`;
-  } else {
-    covBadge.textContent = "";
-  }
+    cb.style.display = ""; cb.style.background = pct >= 70 ? "#f0fdf4" : pct >= 40 ? "#fffbeb" : "#fef2f2";
+    cb.style.color = pct >= 70 ? "#16a34a" : pct >= 40 ? "#b45309" : "#dc2626";
+    cb.textContent = `主题覆盖: ${pct}%`;
+  } else { cb.style.display = "none"; }
 
-  // Citation estimate (from citation verification results if available)
-  const citeBadge = $("evalCiteAcc");
-  if (metrics.facts_verified != null && metrics.facts_total != null && metrics.facts_total > 0) {
-    citeBadge.style.background = "#f0fdf4"; citeBadge.style.color = "#16a34a";
-    citeBadge.textContent = `${metrics.facts_verified}/${metrics.facts_total} 事实已验证`;
-  } else {
-    citeBadge.textContent = "";
+  // Consistency badge
+  const cs = metrics.consistency_score;
+  const csb = $("evalConsistency");
+  if (cs != null) {
+    const pct = Math.round(cs * 100);
+    csb.style.display = ""; csb.style.background = pct >= 90 ? "#f0fdf4" : "#fffbeb";
+    csb.style.color = pct >= 90 ? "#16a34a" : "#b45309";
+    csb.textContent = `一致性: ${pct}%`;
+  } else { csb.style.display = "none"; }
+
+  // Update eval card title: count real warnings from content
+  const totalWarns = ((S._content || "").match(/> ⚠/g) || []).length;
+  const citeWarns = ((S._content || "").match(/引用溯源提醒/g) || []).length;
+  const cntrWarns = ((S._content || "").match(/对比论断待核实/g) || []).length;
+  const title = $("evalCard").querySelector(".card-title");
+  if (title) {
+    let extra = [];
+    if (totalWarns) extra.push(`${totalWarns}条事实`);
+    if (citeWarns) extra.push(`${citeWarns}条引用`);
+    if (cntrWarns) extra.push(`${cntrWarns}条对比`);
+    title.textContent = extra.length ? `📊 报告质量评估（${extra.join("，")}）` : "📊 报告质量评估";
+    title.textContent = extra.length ? `📊 报告质量评估（${extra.join("，")}）` : "📊 报告质量评估";
+  }
+}
+
+function renderEvalBars(scores) {
+  const dims = [];
+  // Old eval metrics (0-1 scores)
+  if (scores && (scores.relevance != null || scores.faithfulness != null)) {
+    dims.push(["相关性", scores.relevance || 0]);
+    dims.push(["忠实度", scores.faithfulness || 0]);
+    dims.push(["连贯性", scores.coherence || 0]);
+    dims.push(["完整性", scores.completeness || 0]);
+  }
+  // New metrics — always show, use 0 if not yet computed
+  dims.push(["原子事实", scores.factscore || 0]);
+  dims.push(["主题覆盖", scores.coverage || 0]);
+
+  if (!dims.length) { $("evalBars").innerHTML = ""; return; }
+  let html = dims.map(d => renderScoreBar(d[0], d[1])).join("");
+  const avg = dims.reduce((s, d) => s + d[1], 0) / dims.length;
+  html += `<div class="eval-avg">
+    <span>综合均分</span>
+    <span class="eval-avg-badge" style="background:${avgBadgeColor(avg)}">${Math.round(avg * 100)}</span>
+  </div>`;
+  $("evalBars").innerHTML = html;
+}
+
+function renderEvalContent(evalData) {
+  $("evalContent").innerHTML = "";
+  if (!evalData) return;
+  renderEvalBars(evalData);
+  // Show actual ⚠️ warnings from content
+  const content = S._content || "";
+  // Match warning lines: starts with "> " and contains warning keyword or emoji
+  const warnBlocks = (content || "").split("\n").filter(line =>
+    line.trim().startsWith(">") && /警告|提醒|核实|⚠|核查/.test(line)
+  );
+  if (warnBlocks && warnBlocks.length) {
+    let h = '<div style="margin-top:8px;font-size:11px;max-height:220px;overflow-y:auto">';
+    for (const w of warnBlocks.slice(0, 8)) {
+      h += `<div style="padding:3px 6px;margin:2px 0;background:#fef2f2;border-left:3px solid #dc2626;border-radius:3px">${esc(w)}</div>`;
+    }
+    if (warnBlocks.length > 8) h += `<div style="color:#999;font-size:10px">...还有 ${warnBlocks.length - 8} 条</div>`;
+    h += '</div>';
+    $("evalContent").innerHTML += h;
   }
 }
 
@@ -937,6 +1115,7 @@ function renderEval() {
   const data = S._evalData;
   if (!data) {
     $("evalCard").style.display = "none";
+    $("warningsCard").style.display = "none";
     return;
   }
   $("evalCard").style.display = "";
@@ -1078,20 +1257,22 @@ function showSatisfactionInChat(stage, previewText, versionNum) {
 
   const label = stage === "outline" ? "大纲" : "报告正文";
   const ver = versionNum || 1;
+  const text = previewText || (stage === "outline" ? (S._outline || "") : (S._content || ""));
 
-  // Show preview in right panel
+  if (stage === "outline") {
+    S._outline = text;
+  } else {
+    S._content = text;
+  }
+
   const previewTitle = $("satisfactionPreviewTitle");
   const previewContent = $("satisfactionPreviewContent");
   previewTitle.textContent = `📝 ${label}已生成 — V${ver}`;
-  const text = previewText || (stage === "outline" ? (S._outline || "") : (S._content || ""));
   previewContent.innerHTML = text ? renderMD(text) : "<p style='color:var(--c-text3)'>（内容加载中…）</p>";
 
-  // Clean up old UI before building new one
   hideSatisfaction();
 
-  // Build buttons
   _satisfactionChatMsg = _renderSatisfactionButtons(label, stage, ver);
-  // Set guard AFTER everything is built — prevents duplicate on next poll
   S._satisfactionKey = key;
 }
 
@@ -1107,9 +1288,16 @@ function _renderSatisfactionButtons(label, stage, ver) {
   _satisfactionChatMsg = null;
 
   const bubbleId = "satisfactionBubble_" + stage;
+  const isContent = stage === "content";
+  const extraHint = isContent
+    ? `<p style="margin-top:6px;color:var(--c-text3);font-size:0.85em">
+         💡 可在下方预览区直接<b>编辑段落</b>，或切换<b>历史版本</b>进行对比。<br>
+         👍 满意后进入模板渲染和可选的质量评估。</p>`
+    : "";
+
   const html = `<div id="${bubbleId}">
     <p>📝 <strong>${label}已生成 — V${ver}</strong></p>
-    <p>请查看下方预览区的内容，然后选择：</p>
+    <p>请查看下方预览区的内容，然后选择：</p>${extraHint}
     <div class="satisf-action-row" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
       <button class="btn btn-primary btn-sm satisf-satisfied-btn">满意，继续</button>
       <button class="btn btn-outline btn-sm satisf-unsatisfied-btn">不满意，重新生成</button>
@@ -1123,7 +1311,6 @@ function _renderSatisfactionButtons(label, stage, ver) {
   const unsatisfiedBtn = msg.querySelector(".satisf-unsatisfied-btn");
   if (satisfiedBtn) {
     satisfiedBtn.addEventListener("click", function () {
-      if (S._satisfactionSubmitting) return; // prevent double-submit
       S._satisfactionSubmitting = true;
       satisfiedBtn.disabled = true;
       if (unsatisfiedBtn) unsatisfiedBtn.disabled = true;
@@ -1133,7 +1320,6 @@ function _renderSatisfactionButtons(label, stage, ver) {
   }
   if (unsatisfiedBtn) {
     unsatisfiedBtn.addEventListener("click", function () {
-      if (S._satisfactionSubmitting) return;
       S._satisfactionSubmitting = true;
       satisfiedBtn.disabled = true;
       unsatisfiedBtn.disabled = true;
@@ -1161,6 +1347,9 @@ const FEEDBACK_OPTIONS = [
 ];
 
 function _showFeedbackChipsInPlace(stage) {
+  // Release submitting guard — we're now in a new UI state (chips)
+  S._satisfactionSubmitting = false;
+
   const label = stage === "outline" ? "大纲" : "报告正文";
   _feedbackChips = new Set();
   _selectedScope = "content_only";
@@ -1219,7 +1408,6 @@ function _showFeedbackChipsInPlace(stage) {
   const submitBtn = bubble.querySelector(".satisf-submit-fb-btn");
   if (submitBtn) {
     submitBtn.addEventListener("click", function () {
-      if (S._satisfactionSubmitting) return;
       S._satisfactionSubmitting = true;
       const activeChips = bubble.querySelectorAll(".feedback-chip.active:not(.feedback-chip-scope)");
       const checkedOpts = Array.from(activeChips).map(c => c.dataset.opt).filter(Boolean);
@@ -1237,7 +1425,6 @@ function _showFeedbackChipsInPlace(stage) {
   const skipBtn = bubble.querySelector(".satisf-skip-fb-btn");
   if (skipBtn) {
     skipBtn.addEventListener("click", function () {
-      if (S._satisfactionSubmitting) return;
       S._satisfactionSubmitting = true;
       S._waitingFeedback = false;
       submitSatisfactionChat(false, stage, "");
@@ -1291,6 +1478,114 @@ function toggleScopeChip(el) {
 }
 
 let _selectedScope = "content_only";
+
+/* ── Quality gate (after render) ────────────────────────────────────────── */
+
+let _qualityGateKey = "";
+
+function showQualityGateInChat(msg) {
+  if (_qualityGateKey === S.taskId) return;
+  if (_satisfactionChatMsg && _satisfactionChatMsg.parentNode) {
+    _satisfactionChatMsg.remove();
+  }
+  const bubbleId = "qualityGateBubble";
+  const html = `<div id="${bubbleId}">
+    <p>📋 <strong>${msg}</strong></p>
+    <p>开启后将核查事实准确性并修正可疑内容。</p>
+    <div class="satisf-action-row" style="display:flex;gap:8px;margin-top:10px">
+      <button class="btn btn-primary btn-sm qg-yes-btn">要，开启评估</button>
+      <button class="btn btn-outline btn-sm qg-no-btn">不要，跳过</button>
+    </div>
+  </div>`;
+
+  _satisfactionChatMsg = addActionMsg(html);
+  const yesBtn = _satisfactionChatMsg.querySelector(".qg-yes-btn");
+  const noBtn = _satisfactionChatMsg.querySelector(".qg-no-btn");
+
+  yesBtn.addEventListener("click", async () => {
+    yesBtn.disabled = true; noBtn.disabled = true;
+    setStatus("正在进行质量评估…", "busy");
+    addMsg("assistant", "✅ 已收到：开启质量评估。正在核查事实准确性…");
+    _satisfactionChatMsg.remove(); _satisfactionChatMsg = null;
+    await fetch("/api/satisfaction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: S.taskId, stage: "quality", satisfied: true, feedback: "" }),
+    });
+  });
+
+  noBtn.addEventListener("click", async () => {
+    yesBtn.disabled = true; noBtn.disabled = true;
+    setStatus("报告生成完成", "done");
+    addMsg("assistant", "✅ 已收到：跳过质量评估。报告生成完成！");
+    _satisfactionChatMsg.remove(); _satisfactionChatMsg = null;
+    await fetch("/api/satisfaction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: S.taskId, stage: "quality", satisfied: false, feedback: "" }),
+    });
+  });
+
+  _qualityGateKey = S.taskId;
+}
+
+/* ── Final confirm (before render) ────────────────────────────────────────── */
+
+let _finalConfirmKey = "";
+
+async function loadFinalConfirmPreview(data) {
+  const outline = await fetchText(`/result/${encodeURIComponent(S.taskId)}/outline.md`);
+  const content = await fetchText(`/result/${encodeURIComponent(S.taskId)}/content.md`);
+  S._outline = outline;
+  S._content = content;
+  showPreview();
+  await loadVersions("outline");
+  await loadVersions("content");
+  const ov = S._versions.outline || [];
+  const cv = S._versions.content || [];
+  if (ov.length > 1 || cv.length > 1) {
+    $("tabCompare").style.display = "";
+  }
+  showVersionTags(S.previewTab === "compare" ? (ov.length > 1 ? "outline" : "content") : S.previewTab);
+}
+
+function showFinalConfirmInChat(msg) {
+  if (_finalConfirmKey === S.taskId) return;
+  if (_satisfactionChatMsg && _satisfactionChatMsg.parentNode) {
+    _satisfactionChatMsg.remove();
+  }
+  const bubbleId = "finalConfirmBubble";
+  const html = `<div id="${bubbleId}">
+    <p>✅ <strong>${msg}</strong></p>
+    <p>您可以在右侧预览框中进行以下操作：</p>
+    <ul style="margin:8px 0 8px 20px;padding:0">
+      <li><strong>版本对比</strong>：切换查看历史版本差异</li>
+      <li><strong>段落重生成</strong>：点击段落旁的 🔄 按钮让 AI 重写该段</li>
+      <li><strong>编辑段落</strong>：点击段落旁的 ✏️ 按钮直接编辑</li>
+    </ul>
+    <p>确认无误后点击下方按钮：</p>
+    <div class="satisf-action-row" style="display:flex;gap:8px;margin-top:10px">
+      <button class="btn btn-primary btn-sm fc-confirm-btn">✅ 最终确认，开始渲染</button>
+    </div>
+  </div>`;
+
+  _satisfactionChatMsg = addActionMsg(html);
+  const confirmBtn = _satisfactionChatMsg.querySelector(".fc-confirm-btn");
+
+  confirmBtn.addEventListener("click", async () => {
+    confirmBtn.disabled = true;
+    setStatus("正在渲染最终报告…", "busy");
+    addMsg("assistant", "✅ 已收到：最终确认。正在渲染最终报告…");
+    _satisfactionChatMsg.remove(); _satisfactionChatMsg = null;
+    await fetch("/api/satisfaction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: S.taskId, stage: "final", satisfied: true, feedback: "" }),
+    });
+  });
+
+  _finalConfirmKey = S.taskId;
+}
 
 async function submitSatisfactionChat(satisfied, stage, feedback) {
   const fb = (feedback || "").trim();
@@ -2007,6 +2302,61 @@ async function sendChat() {
   $("chatInput").value = "";
   addMsg("user", msg);
 
+  // ── Hint: if user has files but didn't use /gen ──
+  if (!msg.startsWith("/") && (S.taskId || ($("files").files || []).length > 0)) {
+    const genKw = /生成|报告|写.*(?:报告|文章|文档|总结|综述|分析|方案)/;
+    if (genKw.test(msg)) {
+      addMsg("assistant", "💡 提示：你可以使用 <b>/gen 需求描述</b> 来启动报告生成。\n\n例如：<code>/gen " + msg.slice(0, 50) + "</code>");
+      S._sending = false;
+      return;
+    }
+  }
+
+  // ── /gen command: trigger generation from chat ──
+  const genMatch = msg.match(/^\/(?:gen|generate|生成)(?:\s+(.+))?/i);
+  if (genMatch) {
+    const prompt = (genMatch[1] || "").trim();
+    if (!prompt) {
+      addMsg("assistant", "请提供需求描述，格式：\n\n<code>/gen 需求描述</code>\n\n例如：\n• /gen 帮我写一份RAG技术综述\n• /gen 根据材料生成市场分析报告\n• /gen 写一份项目总结，重点突出技术方案和性能评估");
+      S._sending = false;
+      return;
+    }
+    // Auto-create task if files selected but no task yet
+    if (!S.taskId) {
+      const files = $("files").files;
+      if (!files.length) {
+        addMsg("assistant", "请先在左侧面板选择要上传的材料文件，然后使用 /gen 命令。");
+        S._sending = false;
+        return;
+      }
+      addMsg("assistant", "收到需求：" + prompt + "\n\n正在上传文件并启动生成…");
+      S._sending = false;
+      $("userPrompt").value = prompt;
+      uploadAndGenerate();
+      return;
+    }
+    addMsg("assistant", "收到需求：" + prompt + "\n\n正在启动报告生成…");
+    S.generating = true;
+    S._lastOperation = "generate";
+    $("btnUpload").disabled = true;
+    $("btnAppend").disabled = true;
+    setStatus("启动生成中…", "busy");
+    S._sending = false;
+    try {
+      const data = await apiPost("/api/gen", { task_id: S.taskId, prompt: prompt });
+      if (data.ok) {
+        addMsg("assistant", "任务已启动，任务ID：" + data.task_id + "\n\n等待报告生成完成后会在预览区显示。");
+        startPolling();
+      }
+    } catch (e) {
+      addMsg("assistant", "启动失败：" + e.message);
+      S.generating = false;
+      $("btnUpload").disabled = false;
+      $("btnAppend").disabled = false;
+    }
+    return;
+  }
+
   // If waiting for section regen feedback, route to section regen
   if (S._waitingRegenFeedback) {
     const info = S._waitingRegenFeedback;
@@ -2167,6 +2517,7 @@ async function loadTaskById() {
   setStatus("加载中…", "busy");
   stopPolling();
   $("evalCard").style.display = "none";
+  $("warningsCard").style.display = "none";
   S._evalData = null;
 
   try {
@@ -2281,6 +2632,11 @@ async function loadKbDocs() {
       metaSpan.className = "doc-meta";
       metaSpan.textContent = meta;
       item.appendChild(metaSpan);
+      const delBtn = document.createElement("button");
+      delBtn.className = "btn btn-sm"; delBtn.style.cssText = "color:var(--c-red);margin-left:auto;font-size:11px;padding:1px 6px;";
+      delBtn.textContent = "删除";
+      delBtn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); deleteKbDoc(did); });
+      item.appendChild(delBtn);
       list.appendChild(item);
     }
     updateKbDocCount();
@@ -2316,9 +2672,33 @@ async function loadKbList() {
     }
     sel.value = S.kb;
     setKbStatus("");
+    refreshKbDocList();
   } catch (e) {
     setKbStatus("加载失败: " + e.message);
   }
+}
+
+async function refreshKbDocList() {
+  const box = $("kbDocListView");
+  if (!box) return;
+  const kb = ($("kbSelect").value || "").trim() || S.kb;
+  if (!kb) { box.innerHTML = ""; return; }
+  try {
+    const data = await apiGet(`/api/kb/docs?kb=${encodeURIComponent(kb)}`);
+    const docs = Array.isArray(data.docs) ? data.docs : [];
+    if (!docs.length) {
+      box.innerHTML = "<div class='kb-doc-empty'>知识库为空，请先上传文档</div>";
+      return;
+    }
+    box.innerHTML = docs.slice(0, 30).map(d => {
+      const name = esc(d.title || d.doc_id || "");
+      const cnt = d.chunk_count || 0;
+      return `<div class="kb-doc-item small">
+        <span class="doc-name">${name}</span>
+        <span class="doc-meta">${cnt} chunks</span>
+      </div>`;
+    }).join("");
+  } catch { box.innerHTML = "<div class='kb-doc-empty'>加载失败</div>"; }
 }
 
 function useKbFromUI() {
@@ -2326,6 +2706,41 @@ function useKbFromUI() {
   const chosen = ($("kbSelect").value || "").trim();
   setKbCurrent(typed || chosen || "default");
   setKbStatus("");
+}
+
+async function deleteKb() {
+  const kb = ($("kbSelect").value || "").trim();
+  if (!kb) return toast("请先选择知识库", "warn");
+  if (!confirm(`确定要删除整个知识库 "${kb}" 及其所有文档吗？此操作不可撤销。`)) return;
+  try {
+    const resp = await apiPost("/api/kb/delete", { kb });
+    if (resp.ok) {
+      toast(`知识库 "${kb}" 已删除`, "info");
+      loadKbList();
+      loadKbDocs();
+    } else {
+      toast("删除失败: " + (resp.error || "未知错误"), "error");
+    }
+  } catch (e) {
+    toast("删除失败: " + e.message, "error");
+  }
+}
+
+async function deleteKbDoc(docId) {
+  const kb = ($("kbSelect").value || "").trim() || S.kb;
+  if (!kb || !docId) return;
+  if (!confirm(`确定要从 "${kb}" 中删除文档 "${docId}" 吗？`)) return;
+  try {
+    const resp = await apiPost("/api/kb/delete", { kb, doc_id: docId });
+    if (resp.ok) {
+      toast(`文档已删除`, "info");
+      loadKbDocs();
+    } else {
+      toast("删除失败: " + (resp.error || "未知错误"), "error");
+    }
+  } catch (e) {
+    toast("删除失败: " + e.message, "error");
+  }
 }
 
 function setKbStatus(s) { const el = $("kbStatus"); if (el) el.textContent = s || ""; }
@@ -2351,6 +2766,7 @@ async function kbUpload() {
     $("kbAnswer").textContent = JSON.stringify(data, null, 2);
     $("kbCitations").textContent = "";
     await loadKbList();
+    if (S._refreshRetrievalKbList) S._refreshRetrievalKbList();
     $("kbSelect").value = S.kb;
   } catch (e) {
     setKbStatus("失败: " + e.message);
@@ -2389,22 +2805,89 @@ async function kbQuery() {
   }
 }
 
+function _parseCitationMeta(text) {
+  const meta = { abstract: "", keywords: [], doi: "", url: "",
+    boilerplate: [], citation: "", bodyLines: [] };
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  // Deduplicate
+  const deduped = []; const seen60 = new Set();
+  for (const l of lines) { const k = l.slice(0, 60); if (!seen60.has(k)) { seen60.add(k); deduped.push(l); } }
+
+  const bpTerms = ["录用定稿", "排版定稿", "整期汇编", "网络首发", "出版确认",
+    "出版管理条例", "期刊出版管理规定", "首发视为正式出版", "编辑部工作流程",
+    "中国学术期刊", "ISSN", "CN 11-", "文献标志码", "中图分类号"];
+  let current = "body";
+  const buckets = { abstract: [], keywords: [], body: [] };
+
+  for (const line of deduped) {
+    if (/^摘要[：:]/.test(line)) { current = "abstract"; buckets.abstract.push(line.replace(/^摘要[：:]\s*/, "")); continue; }
+    if (/^关键词[：:]/.test(line)) { current = "keywords"; buckets.keywords.push(line.replace(/^关键词[：:]\s*/, "")); continue; }
+    if (/^作者简介|^基金项目/.test(line)) { continue; }
+    if (/^引用格式[：:]/.test(line)) { meta.citation = line.replace(/^引用格式[：:]\s*/, ""); continue; }
+    if (bpTerms.some(t => line.includes(t))) { meta.boilerplate.push(line); continue; }
+    const doiM = line.match(/(?:doi|DOI)[：:]\s*(\S+)/); if (doiM) { meta.doi = doiM[1]; continue; }
+    const urlM = line.match(/(https?:\/\/\S+)/); if (urlM) { meta.url = urlM[1]; continue; }
+    buckets[current].push(line);
+  }
+
+  meta.abstract = buckets.abstract.join(" ").trim();
+  meta.keywords = buckets.keywords.join(" ").split(/[；;，,]/).map(k => k.trim()).filter(k => k.length > 1 && k.length < 30);
+  meta.bodyLines = buckets.body.filter(l => !bpTerms.some(t => l.includes(t)));
+  return meta;
+}
+
 function renderKbCitations(items) {
   const box = $("kbCitations");
   if (!box) return;
   const cits = Array.isArray(items) ? items : [];
-  if (!cits.length) { box.textContent = "（无引用）"; return; }
-  const lines = [];
-  let i = 1;
+  if (!cits.length) { box.innerHTML = "<div class='citation-empty'>（无引用）</div>"; return; }
+
+  // Group by document (all chunks, not just adjacent)
+  const docMap = new Map();
   for (const c of cits) {
     if (!c) continue;
-    const score = c.score != null ? Number(c.score).toFixed(3) : "-";
-    lines.push(`${i}. [score=${score}] ${c.doc_id || "-"} | ${c.section_path || "-"}`);
-    if (c.snippet) lines.push("   " + c.snippet);
-    lines.push("");
-    i++;
+    const key = c.doc_id || c.doc_name || "";
+    const entry = docMap.get(key);
+    if (entry) { entry.snippets.push(c.snippet || ""); }
+    else { docMap.set(key, { key, docName: c.doc_name || c.doc_id || "?", snippets: [c.snippet || ""] }); }
   }
-  box.textContent = lines.join("\n").trim();
+  const groups = [...docMap.values()];
+
+  // Merge + parse each group
+  const cards = [];
+  for (const g of groups) {
+    const lines = g.snippets.join("\n").split("\n");
+    const seen = new Set(); const uniq = [];
+    for (const l of lines) { const t = l.trim(); if (!t) continue; const k = t.slice(0, 60); if (!seen.has(k)) { seen.add(k); uniq.push(t); } }
+    const merged = uniq.join("\n");
+    const meta = _parseCitationMeta(merged);
+    const docLabel = esc(g.docName.replace(/\.(pdf|docx?|md|txt)$/i, ""));
+    // Best title: use docLabel, stripped clean
+    let title = docLabel
+      .replace(/\.(pdf|docx?|md|txt)$/i, "")
+      .replace(/\s*\/\s*\S.*$/, "");  // strip trailing path/date fragments
+
+    let html = `<div class="cit-card">
+      <div class="cit-title">${esc(title)}</div>`;
+
+    // Abstract — main content
+    const ab = meta.abstract || meta.bodyLines.slice(0, 8).join(" ");
+    if (ab) {
+      const maxLen = 300;
+      const show = ab.length > maxLen ? ab.slice(0, maxLen) + "…" : ab;
+      html += `<div class="cit-abstract">${renderMD(show)}</div>`;
+    }
+
+    // Keywords as tags
+    if (meta.keywords.length) {
+      html += `<div class="cit-keywords">${meta.keywords.map(k => `<span class="cit-tag">${esc(k)}</span>`).join("")}</div>`;
+    }
+
+    html += `</div>`;
+    cards.push(html);
+  }
+
+  box.innerHTML = cards.join("\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -2510,15 +2993,14 @@ const TPL_FULL_PRESETS = {
 };
 
 function newTemplate() {
-  const presetKey = ($("tplNewPreset").value) || "blank";
-  const preset = TPL_FULL_PRESETS[presetKey] || TPL_FULL_PRESETS.blank;
-  $("tplEditorName").value = presetKey === "blank" ? "" : preset.label;
-  $("tplEditorTextarea").value = preset.content;
+  $("tplEditorName").value = "";
+  $("tplEditorTextarea").value = "";
   $("tplEditorSelect").value = "";
-  S._tplEditor.currentName = presetKey === "blank" ? "" : preset.label;
-  S._tplEditor.content = preset.content;
-  S._tplEditor.dirty = presetKey !== "blank";
+  S._tplEditor.currentName = "";
+  S._tplEditor.content = "";
+  $("tplPreviewBox").innerHTML = "";
   refreshTplPreview();
+  S._tplEditor.dirty = false;
 }
 
 async function loadVariables() {
@@ -2645,11 +3127,9 @@ async function useTemplateForTask(name) {
 async function quickUseTemplate() {
   const name = $("tplQuickSelect").value;
   if (!name) { toast("请选择一个模板", "info"); return; }
-  if (!S.taskId) {
-    toast("请先上传文件生成任务，或加载已有任务", "info");
-    return;
-  }
-  await useTemplateForTask(name);
+  // Remember the selection — will be applied when task starts
+  S._pendingTemplate = name;
+  toast(`已选择模板「${name}」，将在生成报告时自动应用。`, "ok", 3000);
 }
 
 function initTemplateEditor() {
@@ -2741,13 +3221,7 @@ function init() {
   $("tplPresetCat").addEventListener("change", renderPresetList);
   renderPresetList();
 
-  // Eval tabs
-  $("evalTabs").addEventListener("click", (e) => {
-    const tab = e.target.closest(".eval-tab");
-    if (!tab) return;
-    S._evalTab = tab.dataset.eval;
-    renderEval();
-  });
+  // Eval tabs removed — unified card replaces old eval system
 
   // Upload
   $("btnUpload").addEventListener("click", uploadAndGenerate);
@@ -2792,6 +3266,7 @@ function init() {
 
   // KB
   $("btnKbRefresh").addEventListener("click", loadKbList);
+  $("btnKbDelete").addEventListener("click", deleteKb);
   $("btnKbUse").addEventListener("click", useKbFromUI);
   $("btnKbUpload").addEventListener("click", kbUpload);
   $("btnKbQuery").addEventListener("click", kbQuery);
@@ -2817,6 +3292,33 @@ function init() {
     } catch {}
   };
   syncKbDocSelect();
+
+  // Retrieval KB selector
+  const loadRetrievalKbList = async () => {
+    try {
+      const data = await apiGet("/api/kb/list");
+      const items = (data && Array.isArray(data.kbs)) ? data.kbs : ["default"];
+      const sel = $("retrievalKbSelect");
+      sel.innerHTML = "";
+      const emptyOpt = document.createElement("option");
+      emptyOpt.value = "";
+      emptyOpt.textContent = "— 不使用知识库检索 —";
+      sel.appendChild(emptyOpt);
+      for (const name of items) {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+      }
+    } catch {}
+  };
+  S._refreshRetrievalKbList = loadRetrievalKbList;
+  $("btnRefreshRetrievalKb").addEventListener("click", loadRetrievalKbList);
+  $("retrievalKbSelect").addEventListener("change", () => {
+    const v = $("retrievalKbSelect").value;
+    if (v) toast("已选择检索知识库：" + v, "ok", 2500);
+  });
+  loadRetrievalKbList();
 
   // Toggle KB name field when "add to KB" checkbox changes
   $("addToKb").addEventListener("change", () => {

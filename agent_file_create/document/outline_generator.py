@@ -79,7 +79,60 @@ def _clean_llm_output(text: str) -> str:
     out = (text or "").strip()
     out = re.sub(r"^```[a-zA-Z]*\s*", "", out).strip()
     out = re.sub(r"\s*```$", "", out).strip()
+    # Demote headings deeper than ### to bold list items
+    out = re.sub(r"^#{4,}\s+(.+)", r"- **\1**", out, flags=re.MULTILINE)
     return out
+
+
+def _add_outline_numbering(outline: str) -> str:
+    """Add hierarchical numbering to markdown outline headings.
+
+    Transforms::
+
+        # 报告标题
+        ## 背景分析
+        ### 行业现状
+        ## 数据解读
+
+    into::
+
+        # 1. 报告标题
+        ## 1.1 背景分析
+        ### 1.1.1 行业现状
+        ## 1.2 数据解读
+    """
+    lines = (outline or "").splitlines()
+    result: list[str] = []
+    # counters[i] = current count at heading level i (1-indexed: counters[1] for #, counters[2] for ##, ...)
+    counters: list[int] = [0] * 10
+
+    for line in lines:
+        stripped = line.strip()
+        m = re.match(r"^(#{1,6})\s+(.+?)\s*$", stripped)
+        if not m:
+            result.append(line)
+            continue
+
+        level = len(m.group(1))
+        title = m.group(2).strip()
+
+        # Increment counter at this level, reset all deeper levels
+        counters[level] += 1
+        for lv in range(level + 1, len(counters)):
+            counters[lv] = 0
+
+        # Build hierarchical number: e.g. "1.1.2" for level 3
+        number_parts = [str(counters[lv]) for lv in range(1, level + 1) if counters[lv] > 0]
+        number = ".".join(number_parts) + "."
+
+        # Preserve original indentation
+        indent = line[:len(line) - len(line.lstrip())]
+        if level == 1:
+            result.append(f"{indent}# {title}")
+        else:
+            result.append(f"{indent}{'#' * level} {number} {title}")
+
+    return "\n".join(result)
 
 
 def _build_outline_prompt(user_req: str, digest: str, feedback: str, target_words: int = 0, template_sections: list = None) -> str:
@@ -94,7 +147,7 @@ def _build_outline_prompt(user_req: str, digest: str, feedback: str, target_word
         "   差的命名示例：「第一章 背景」「第一部分 概述」（过于空洞）",
         "3) ### 三级标题 = 子节（每个 ## 下至少1个，建议不超过5个）。",
         "   子节应拆解主章节的具体维度，如数据拆解、原因分析、方案对比、案例举证等。",
-        "4) 建议不超过 #### 四级标题（如需更深层级，优先考虑拆分 ##）。",
+        "4) 最多到 ### 三级标题。禁止使用 #### 或更深的标题。如果内容需要更细粒度，用列表项或粗体文本组织，不要增加标题层级。",
         "5) 层级必须连续，禁止 # 直接跳 ###（跳过 ##）。",
         "6) 如果材料中没有支撑某类内容，不要强行编造该章节。宁可大纲短一些，也不要无中生有。",
         "7) 只输出 Markdown 大纲本身，不要解释、不要前言后语、不要代码块包裹。",
@@ -162,7 +215,7 @@ def _check_outline_coverage(outline: str, user_req: str, template_sections: list
             timeout_s=15,
             temperature=0.0,
             num_predict=120,
-            system="你是大纲质量审查助手，只输出缺失主题名或OK。",
+            system="你是一个中文文档处理助手。",
             api_style=OUTLINE_API_STYLE,
             api_endpoint=OUTLINE_API_ENDPOINT,
             api_key=OUTLINE_API_KEY,
@@ -209,7 +262,7 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
             timeout_s=MODEL_TIMEOUT,
             temperature=0.2,
             num_predict=900,
-            system="你是一个中文报告助手，只输出 Markdown 大纲。",
+            system="你是一个中文文档处理助手。",
             api_style=OUTLINE_API_STYLE,
             api_endpoint=OUTLINE_API_ENDPOINT,
             api_key=OUTLINE_API_KEY,
@@ -228,7 +281,7 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
             if not coverage_issues:
                 t1 = time.perf_counter()
                 logger.info(f"outline_done seconds={t1 - t0:.2f} prompt_chars={len(prompt)} outline_chars={len(out)} attempts={attempt + 1}")
-                return out
+                return _add_outline_numbering(out)
             last_issues = [f"内容覆盖不足，缺失或需加强：{'、'.join(coverage_issues)}"]
             logger.warning(f"outline_coverage_failed attempt={attempt + 1} missing={coverage_issues}")
         else:
@@ -237,4 +290,4 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
 
     t1 = time.perf_counter()
     logger.warning(f"outline_done_with_issues seconds={t1 - t0:.2f} attempts=3 issues={last_issues}")
-    return best_outline
+    return _add_outline_numbering(best_outline)
