@@ -1,4 +1,4 @@
-/* ═══════════════════════════════════════════════════════════════════════
+﻿/* ═══════════════════════════════════════════════════════════════════════
    State
    ═══════════════════════════════════════════════════════════════════════ */
 
@@ -169,6 +169,10 @@ function renderMD(text) {
 
   // Images ![alt](url)
   h = h.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" style="max-width:100%">');
+
+  // Auto-link bare URLs (but not already inside <a> or <img>)
+  h = h.replace(/(?<!href="|src=")(https?:\/\/[^\s<>"]+)/g,
+    '<a href="$1" target="_blank" rel="noopener">$1</a>');
 
   // ── Phase 5: Restore code blocks ──
   h = h.replace(/\x00CODEBLOCK_(\d+)\x00/g, (_, idx) => {
@@ -617,7 +621,10 @@ function showPreview() {
   const cacheKey = "__previewCache_" + tab;
   if (window[cacheKey] === raw) return;
   window[cacheKey] = raw;
-  $("previewBox").innerHTML = renderMD(raw);
+  const box = $("previewBox");
+  const st = box.scrollTop;  // save scroll position
+  box.innerHTML = renderMD(raw);
+  box.scrollTop = Math.min(st, box.scrollHeight);  // restore (clamped)
   attachSectionActions(tab);
   const btn = $("btnFullPreview");
   if (btn) btn.style.display = (S._content && S._content.trim()) ? "" : "none";
@@ -2295,6 +2302,61 @@ async function sendChat() {
   $("chatInput").value = "";
   addMsg("user", msg);
 
+  // ── Hint: if user has files but didn't use /gen ──
+  if (!msg.startsWith("/") && (S.taskId || ($("files").files || []).length > 0)) {
+    const genKw = /生成|报告|写.*(?:报告|文章|文档|总结|综述|分析|方案)/;
+    if (genKw.test(msg)) {
+      addMsg("assistant", "💡 提示：你可以使用 <b>/gen 需求描述</b> 来启动报告生成。\n\n例如：<code>/gen " + msg.slice(0, 50) + "</code>");
+      S._sending = false;
+      return;
+    }
+  }
+
+  // ── /gen command: trigger generation from chat ──
+  const genMatch = msg.match(/^\/(?:gen|generate|生成)(?:\s+(.+))?/i);
+  if (genMatch) {
+    const prompt = (genMatch[1] || "").trim();
+    if (!prompt) {
+      addMsg("assistant", "请提供需求描述，格式：\n\n<code>/gen 需求描述</code>\n\n例如：\n• /gen 帮我写一份RAG技术综述\n• /gen 根据材料生成市场分析报告\n• /gen 写一份项目总结，重点突出技术方案和性能评估");
+      S._sending = false;
+      return;
+    }
+    // Auto-create task if files selected but no task yet
+    if (!S.taskId) {
+      const files = $("files").files;
+      if (!files.length) {
+        addMsg("assistant", "请先在左侧面板选择要上传的材料文件，然后使用 /gen 命令。");
+        S._sending = false;
+        return;
+      }
+      addMsg("assistant", "收到需求：" + prompt + "\n\n正在上传文件并启动生成…");
+      S._sending = false;
+      $("userPrompt").value = prompt;
+      uploadAndGenerate();
+      return;
+    }
+    addMsg("assistant", "收到需求：" + prompt + "\n\n正在启动报告生成…");
+    S.generating = true;
+    S._lastOperation = "generate";
+    $("btnUpload").disabled = true;
+    $("btnAppend").disabled = true;
+    setStatus("启动生成中…", "busy");
+    S._sending = false;
+    try {
+      const data = await apiPost("/api/gen", { task_id: S.taskId, prompt: prompt });
+      if (data.ok) {
+        addMsg("assistant", "任务已启动，任务ID：" + data.task_id + "\n\n等待报告生成完成后会在预览区显示。");
+        startPolling();
+      }
+    } catch (e) {
+      addMsg("assistant", "启动失败：" + e.message);
+      S.generating = false;
+      $("btnUpload").disabled = false;
+      $("btnAppend").disabled = false;
+    }
+    return;
+  }
+
   // If waiting for section regen feedback, route to section regen
   if (S._waitingRegenFeedback) {
     const info = S._waitingRegenFeedback;
@@ -2610,9 +2672,33 @@ async function loadKbList() {
     }
     sel.value = S.kb;
     setKbStatus("");
+    refreshKbDocList();
   } catch (e) {
     setKbStatus("加载失败: " + e.message);
   }
+}
+
+async function refreshKbDocList() {
+  const box = $("kbDocListView");
+  if (!box) return;
+  const kb = ($("kbSelect").value || "").trim() || S.kb;
+  if (!kb) { box.innerHTML = ""; return; }
+  try {
+    const data = await apiGet(`/api/kb/docs?kb=${encodeURIComponent(kb)}`);
+    const docs = Array.isArray(data.docs) ? data.docs : [];
+    if (!docs.length) {
+      box.innerHTML = "<div class='kb-doc-empty'>知识库为空，请先上传文档</div>";
+      return;
+    }
+    box.innerHTML = docs.slice(0, 30).map(d => {
+      const name = esc(d.title || d.doc_id || "");
+      const cnt = d.chunk_count || 0;
+      return `<div class="kb-doc-item small">
+        <span class="doc-name">${name}</span>
+        <span class="doc-meta">${cnt} chunks</span>
+      </div>`;
+    }).join("");
+  } catch { box.innerHTML = "<div class='kb-doc-empty'>加载失败</div>"; }
 }
 
 function useKbFromUI() {
@@ -2680,6 +2766,7 @@ async function kbUpload() {
     $("kbAnswer").textContent = JSON.stringify(data, null, 2);
     $("kbCitations").textContent = "";
     await loadKbList();
+    if (S._refreshRetrievalKbList) S._refreshRetrievalKbList();
     $("kbSelect").value = S.kb;
   } catch (e) {
     setKbStatus("失败: " + e.message);
@@ -2718,22 +2805,89 @@ async function kbQuery() {
   }
 }
 
+function _parseCitationMeta(text) {
+  const meta = { abstract: "", keywords: [], doi: "", url: "",
+    boilerplate: [], citation: "", bodyLines: [] };
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  // Deduplicate
+  const deduped = []; const seen60 = new Set();
+  for (const l of lines) { const k = l.slice(0, 60); if (!seen60.has(k)) { seen60.add(k); deduped.push(l); } }
+
+  const bpTerms = ["录用定稿", "排版定稿", "整期汇编", "网络首发", "出版确认",
+    "出版管理条例", "期刊出版管理规定", "首发视为正式出版", "编辑部工作流程",
+    "中国学术期刊", "ISSN", "CN 11-", "文献标志码", "中图分类号"];
+  let current = "body";
+  const buckets = { abstract: [], keywords: [], body: [] };
+
+  for (const line of deduped) {
+    if (/^摘要[：:]/.test(line)) { current = "abstract"; buckets.abstract.push(line.replace(/^摘要[：:]\s*/, "")); continue; }
+    if (/^关键词[：:]/.test(line)) { current = "keywords"; buckets.keywords.push(line.replace(/^关键词[：:]\s*/, "")); continue; }
+    if (/^作者简介|^基金项目/.test(line)) { continue; }
+    if (/^引用格式[：:]/.test(line)) { meta.citation = line.replace(/^引用格式[：:]\s*/, ""); continue; }
+    if (bpTerms.some(t => line.includes(t))) { meta.boilerplate.push(line); continue; }
+    const doiM = line.match(/(?:doi|DOI)[：:]\s*(\S+)/); if (doiM) { meta.doi = doiM[1]; continue; }
+    const urlM = line.match(/(https?:\/\/\S+)/); if (urlM) { meta.url = urlM[1]; continue; }
+    buckets[current].push(line);
+  }
+
+  meta.abstract = buckets.abstract.join(" ").trim();
+  meta.keywords = buckets.keywords.join(" ").split(/[；;，,]/).map(k => k.trim()).filter(k => k.length > 1 && k.length < 30);
+  meta.bodyLines = buckets.body.filter(l => !bpTerms.some(t => l.includes(t)));
+  return meta;
+}
+
 function renderKbCitations(items) {
   const box = $("kbCitations");
   if (!box) return;
   const cits = Array.isArray(items) ? items : [];
-  if (!cits.length) { box.textContent = "（无引用）"; return; }
-  const lines = [];
-  let i = 1;
+  if (!cits.length) { box.innerHTML = "<div class='citation-empty'>（无引用）</div>"; return; }
+
+  // Group by document (all chunks, not just adjacent)
+  const docMap = new Map();
   for (const c of cits) {
     if (!c) continue;
-    const score = c.score != null ? Number(c.score).toFixed(3) : "-";
-    lines.push(`${i}. [score=${score}] ${c.doc_id || "-"} | ${c.section_path || "-"}`);
-    if (c.snippet) lines.push("   " + c.snippet);
-    lines.push("");
-    i++;
+    const key = c.doc_id || c.doc_name || "";
+    const entry = docMap.get(key);
+    if (entry) { entry.snippets.push(c.snippet || ""); }
+    else { docMap.set(key, { key, docName: c.doc_name || c.doc_id || "?", snippets: [c.snippet || ""] }); }
   }
-  box.textContent = lines.join("\n").trim();
+  const groups = [...docMap.values()];
+
+  // Merge + parse each group
+  const cards = [];
+  for (const g of groups) {
+    const lines = g.snippets.join("\n").split("\n");
+    const seen = new Set(); const uniq = [];
+    for (const l of lines) { const t = l.trim(); if (!t) continue; const k = t.slice(0, 60); if (!seen.has(k)) { seen.add(k); uniq.push(t); } }
+    const merged = uniq.join("\n");
+    const meta = _parseCitationMeta(merged);
+    const docLabel = esc(g.docName.replace(/\.(pdf|docx?|md|txt)$/i, ""));
+    // Best title: use docLabel, stripped clean
+    let title = docLabel
+      .replace(/\.(pdf|docx?|md|txt)$/i, "")
+      .replace(/\s*\/\s*\S.*$/, "");  // strip trailing path/date fragments
+
+    let html = `<div class="cit-card">
+      <div class="cit-title">${esc(title)}</div>`;
+
+    // Abstract — main content
+    const ab = meta.abstract || meta.bodyLines.slice(0, 8).join(" ");
+    if (ab) {
+      const maxLen = 300;
+      const show = ab.length > maxLen ? ab.slice(0, maxLen) + "…" : ab;
+      html += `<div class="cit-abstract">${renderMD(show)}</div>`;
+    }
+
+    // Keywords as tags
+    if (meta.keywords.length) {
+      html += `<div class="cit-keywords">${meta.keywords.map(k => `<span class="cit-tag">${esc(k)}</span>`).join("")}</div>`;
+    }
+
+    html += `</div>`;
+    cards.push(html);
+  }
+
+  box.innerHTML = cards.join("\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -3158,7 +3312,12 @@ function init() {
       }
     } catch {}
   };
+  S._refreshRetrievalKbList = loadRetrievalKbList;
   $("btnRefreshRetrievalKb").addEventListener("click", loadRetrievalKbList);
+  $("retrievalKbSelect").addEventListener("change", () => {
+    const v = $("retrievalKbSelect").value;
+    if (v) toast("已选择检索知识库：" + v, "ok", 2500);
+  });
   loadRetrievalKbList();
 
   // Toggle KB name field when "add to KB" checkbox changes

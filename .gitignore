@@ -1,8 +1,40 @@
+# Byte-compiled / cached
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+.venv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
 logs/
+*.log
+
+# Runtime data
 result/
 resource/
-__pycache__/
-*.pyc
 *.db
-.venv/
-.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Datasets (large files)
+.Dataset/
+datasets/
+external_data/
+source/
+.env

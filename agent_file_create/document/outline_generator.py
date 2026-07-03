@@ -79,6 +79,8 @@ def _clean_llm_output(text: str) -> str:
     out = (text or "").strip()
     out = re.sub(r"^```[a-zA-Z]*\s*", "", out).strip()
     out = re.sub(r"\s*```$", "", out).strip()
+    # Demote headings deeper than ### to bold list items
+    out = re.sub(r"^#{4,}\s+(.+)", r"- **\1**", out, flags=re.MULTILINE)
     return out
 
 
@@ -125,7 +127,10 @@ def _add_outline_numbering(outline: str) -> str:
 
         # Preserve original indentation
         indent = line[:len(line) - len(line.lstrip())]
-        result.append(f"{indent}{'#' * level} {number} {title}")
+        if level == 1:
+            result.append(f"{indent}# {title}")
+        else:
+            result.append(f"{indent}{'#' * level} {number} {title}")
 
     return "\n".join(result)
 
@@ -142,7 +147,7 @@ def _build_outline_prompt(user_req: str, digest: str, feedback: str, target_word
         "   差的命名示例：「第一章 背景」「第一部分 概述」（过于空洞）",
         "3) ### 三级标题 = 子节（每个 ## 下至少1个，建议不超过5个）。",
         "   子节应拆解主章节的具体维度，如数据拆解、原因分析、方案对比、案例举证等。",
-        "4) 建议不超过 #### 四级标题（如需更深层级，优先考虑拆分 ##）。",
+        "4) 最多到 ### 三级标题。禁止使用 #### 或更深的标题。如果内容需要更细粒度，用列表项或粗体文本组织，不要增加标题层级。",
         "5) 层级必须连续，禁止 # 直接跳 ###（跳过 ##）。",
         "6) 如果材料中没有支撑某类内容，不要强行编造该章节。宁可大纲短一些，也不要无中生有。",
         "7) 只输出 Markdown 大纲本身，不要解释、不要前言后语、不要代码块包裹。",

@@ -9,7 +9,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
 from agent_file_create.chat.history import TaskChatMessageHistory
-from agent_file_create.chat.prompts import (
+from agent_file_create.prompts import (
     FOLLOWUPS_PROMPT,
     REWRITE_QUERY_PROMPT,
     SUMMARIZE_HISTORY_PROMPT,
@@ -23,20 +23,11 @@ from agent_file_create.config import (
     CONTENT_MODEL_NAME,
 )
 from agent_file_create.llm_factory import get_chat_model
-from agent_file_create.rag.kb import KnowledgeBase
+from agent_file_create.rag import get_kb
 from agent_file_create.rag.retriever import KnowledgeBaseRetriever
 from agent_file_create.task.manager import TaskManager
 
 logger = logging.getLogger(__name__)
-
-_kb_instance = None
-
-def _get_kb():
-    """Lazy-initialize KnowledgeBase singleton (replaces module-level global)."""
-    global _kb_instance
-    if _kb_instance is None:
-        _kb_instance = KnowledgeBase()
-    return _kb_instance
 
 
 class ChatHandler:
@@ -85,35 +76,6 @@ class ChatHandler:
         if len(s) > max_len:
             return s[:max_len] + "…"
         return s
-
-    def _split_questions(self, text: str) -> list[str]:
-        out: list[str] = []
-        cur = ""
-        for line in (text or "").splitlines():
-            s = line.strip()
-            if not s:
-                if cur:
-                    out.append(cur)
-                    cur = ""
-                continue
-            is_option = bool(re.match(r"^[A-Z][.)、\s]", s))
-            if is_option and cur:
-                cur += "\n" + s
-                continue
-            if cur:
-                out.append(cur)
-            s = re.sub(r"^[0-9]+[.)、\s]+", "", s).strip()
-            s = re.sub(r"^[-*]\s+", "", s).strip()
-            if s:
-                cur = s[:240]
-            if len(out) >= 6:
-                break
-        if cur and len(out) < 6:
-            out.append(cur)
-        if out:
-            return out
-        s = str(text or "").strip()
-        return [s[:240]] if s else []
 
     def _tokenize(self, text: str) -> list[str]:
         xs = re.findall(r"[一-鿿A-Za-z0-9]{2,}", str(text or ""))
@@ -363,7 +325,7 @@ class ChatHandler:
             return self._format_status(task_id)
 
         if typ == "kb_list":
-            items = _get_kb().list_kb()
+            items = get_kb().list_kb()
             if not items:
                 return "暂无知识库。可调用 /api/kb/upload 上传文件入库。"
             return "知识库列表：\n" + "\n".join(["- " + str(x) for x in items[:50]])
@@ -379,7 +341,7 @@ class ChatHandler:
         if typ == "kb_stats":
             kb = str(action.get("kb") or "").strip() or "default"
             try:
-                st = _get_kb().kb_stats(kb=kb)
+                st = get_kb().kb_stats(kb=kb)
                 return f"知识库 {kb}：文档数={st.get('doc_count',0)} chunk数={st.get('chunk_count',0)}"
             except Exception as e:
                 return f"获取统计失败：{str(e)[:180]}"
@@ -390,12 +352,12 @@ class ChatHandler:
                 return "用法：/kb delete <kb> [doc_id]"
             try:
                 if doc_id:
-                    r = _get_kb().delete_doc(kb=kb, doc_id=doc_id)
+                    r = get_kb().delete_doc(kb=kb, doc_id=doc_id)
                     if r.get("ok"):
                         return f"已从知识库 {kb} 中删除文档 {doc_id}。"
                     return f"删除失败：{r.get('error', 'unknown')[:180]}"
                 else:
-                    r = _get_kb().delete_kb(kb=kb)
+                    r = get_kb().delete_kb(kb=kb)
                     if r.get("ok"):
                         return f"已删除知识库 {kb}。"
                     return f"删除失败：{r.get('error', 'unknown')[:180]}"
@@ -762,11 +724,11 @@ class ChatHandler:
                     msg = str(message or "")
                     # For reasoning questions, expand via HyDE before retrieval
                     if self._should_use_hyde(msg):
-                        search_query = _get_kb()._hyde_expand(msg)
+                        search_query = get_kb()._hyde_expand(msg)
                     else:
                         search_query = self._rewrite_query(msg)
                     retriever = KnowledgeBaseRetriever(
-                        kb=active_kb, knowledge_base=_get_kb(), top_k=6, context_window=2
+                        kb=active_kb, knowledge_base=get_kb(), top_k=6, context_window=2
                     )
                     docs = retriever.invoke(search_query)
                     blocks: list[str] = []
@@ -876,11 +838,11 @@ class ChatHandler:
                 msg = str(message or "")
                 # For complex questions, expand via HyDE before retrieval
                 if self._is_complex_question(msg):
-                    search_query = _get_kb()._hyde_expand(msg)
+                    search_query = get_kb()._hyde_expand(msg)
                 else:
                     search_query = self._rewrite_query(msg)
                 retriever = KnowledgeBaseRetriever(
-                    kb=active_kb, knowledge_base=_get_kb(), top_k=6, context_window=2
+                    kb=active_kb, knowledge_base=get_kb(), top_k=6, context_window=2
                 )
                 docs = retriever.invoke(search_query)
                 blocks: list[str] = []

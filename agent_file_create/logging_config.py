@@ -1,8 +1,14 @@
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
 def setup_logging() -> None:
+    """Configure application-wide logging with rotation and console output.
+
+    File handler: INFO level, 5MB max per file, keeps 3 backups.
+    Console handler: WARNING for third-party libs, INFO for our modules.
+    """
     base_dir = Path(__file__).resolve().parent.parent
     log_dir = base_dir / "logs"
     try:
@@ -16,24 +22,23 @@ def setup_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
 
-    # file: INFO for all modules
-    fh = logging.FileHandler(str(log_path), encoding="utf-8")
+    # Rotating file handler: 5 MB per file, keep 3 backups
+    fh = RotatingFileHandler(
+        str(log_path), encoding="utf-8",
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=3,
+    )
     fh.setLevel(logging.INFO)
     fh.setFormatter(logging.Formatter(fmt))
     root.addHandler(fh)
 
-    # console: WARNING+ for third-party libs
+    # Console: INFO for our modules, WARNING for third-party libs
     ch = logging.StreamHandler()
-    ch.setLevel(logging.WARNING)
-    ch.setFormatter(logging.Formatter(fmt))
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s"))
+    ch.addFilter(lambda r: r.name.startswith("agent_file_create") or r.name == "__main__")
     root.addHandler(ch)
 
-    # our modules: INFO on console as well
-    for name in ("agent_file_create", "__main__"):
-        lg = logging.getLogger(name)
-        lg.propagate = False
-        lg.addHandler(fh)
-        ch2 = logging.StreamHandler()
-        ch2.setLevel(logging.INFO)
-        ch2.setFormatter(logging.Formatter(fmt))
-        lg.addHandler(ch2)
+    # Silence noisy third-party libs
+    for lib in ("urllib3", "httpx", "fastapi", "uvicorn", "langchain", "jieba"):
+        logging.getLogger(lib).setLevel(logging.WARNING)

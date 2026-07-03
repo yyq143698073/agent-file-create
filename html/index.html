@@ -200,24 +200,37 @@
               <button id="btnKbRefresh" class="btn btn-outline btn-sm">刷新</button>
               <button id="btnKbDelete" class="btn btn-outline btn-sm" style="color:var(--c-red)">删除KB</button>
             </div>
+            <div id="kbStatsDisplay" class="kb-stats"></div>
+            <div id="kbDocListView" class="kb-doc-list-view"></div>
             <div class="field mt">
               <label class="field-label">查询问题</label>
               <div class="field-row">
                 <input id="kbQuestion" type="text" class="input" placeholder="输入问题，例如：报销流程是什么？" />
                 <input id="kbTopK" type="number" class="input input-sm" value="6" min="1" max="20" style="width:70px" />
+                <span id="kbQuerySpinner" class="kb-spinner" style="display:none"></span>
                 <button id="btnKbQuery" class="btn btn-primary btn-sm">查询</button>
               </div>
             </div>
             <div class="field mt">
-              <label class="field-label">过滤条件（可选 JSON）</label>
-              <input id="kbFilters" type="text" class="input" placeholder='{"doc_type":"制度"}' />
+              <label class="field-label">文档类型筛选</label>
+              <div class="field-row">
+                <select id="kbDocTypeFilter" class="input input-sm">
+                  <option value="">全部类型</option>
+                  <option value="制度">制度</option>
+                  <option value="规范">规范</option>
+                  <option value="报告">报告</option>
+                  <option value="FAQ">FAQ</option>
+                  <option value="合同">合同</option>
+                </select>
+                <input id="kbFilters" type="text" class="input" placeholder='高级: {"doc_type":"制度"}' style="flex:1;min-width:80px" />
+              </div>
             </div>
             <div class="field mt">
               <label class="field-label">回答</label>
               <div id="kbAnswer" class="kb-answer"></div>
             </div>
             <details>
-              <summary class="card-subtitle">引用片段</summary>
+              <summary class="card-subtitle">引用片段（点击展开）</summary>
               <div id="kbCitations" class="kb-citations"></div>
             </details>
           </div>

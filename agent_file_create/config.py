@@ -1,15 +1,20 @@
 import os
+from pathlib import Path
+
+# Auto-load .env from project root (fallback defaults, overridden by real env vars)
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.5:4b").strip()
 API_GENERATE_ENDPOINT = os.getenv("API_GENERATE_ENDPOINT", f"{OLLAMA_HOST.rstrip('/')}/api/generate").strip()
 
-_OPENAI_KEY_DEFAULT = "sk-f6b2b9da7f574be982bee0139b3fe987"
-os.environ.setdefault("OPENAI_API_KEY", _OPENAI_KEY_DEFAULT)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-os.environ["OUTLINE_MODEL_NAME"] = "deepseek-v4-flash"
-os.environ["CONTENT_MODEL_NAME"] = "deepseek-v4-flash"
 
 OUTLINE_API_STYLE = os.getenv("OUTLINE_API_STYLE", "openai").strip()
 OUTLINE_MODEL_NAME = os.getenv("OUTLINE_MODEL_NAME", "deepseek-v4-flash").strip()
@@ -28,10 +33,10 @@ PLANNER_API_KEY = os.getenv("PLANNER_API_KEY", "").strip() or OPENAI_API_KEY
 
 OPENAI_API_ENDPOINT = os.getenv("OPENAI_API_ENDPOINT", "https://api.deepseek.com/v1/chat/completions").strip()
 OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "deepseek-v4-pro").strip()
-DB_URL = os.getenv("DB_URL", "postgresql://postgres:yyq1436980873@localhost:5432/FIle_create").strip()
+DB_URL = os.getenv("DB_URL", "").strip()
 DB_PATH = os.getenv("DB_PATH", "result/app.db").strip()
 
-KB_DB_URL = os.getenv("KB_DB_URL", "postgresql://postgres:yyq1436980873@localhost:5432/agent_file_create_kb").strip()
+KB_DB_URL = os.getenv("KB_DB_URL", "").strip()
 KB_DB_PATH = os.getenv("KB_DB_PATH", "result/kb.db").strip()
 KB_INDEX_TYPE = os.getenv("KB_INDEX_TYPE", "hnsw").strip()
 KB_HNSW_EF_SEARCH = int(os.getenv("KB_HNSW_EF_SEARCH", "64"))

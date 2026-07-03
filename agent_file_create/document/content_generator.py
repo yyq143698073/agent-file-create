@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,9 +19,8 @@ from agent_file_create.document._reviewer import (
     COHERENCE_REVIEW_PROMPT as _COHERENCE_REVIEW_PROMPT,
     SECTION_FACT_CHECK_PROMPT as _SECTION_FACT_CHECK_PROMPT,
     extract_facts_from_materials as _extract_facts_from_materials,
-    cross_check_facts as _cross_check_facts,
-    verify_section_facts as _verify_section_facts,
-    final_coherence_review as _final_coherence_review,
+    cross_check_facts as _cross_check_facts,  # kept as utility, called from _node_critic
+    final_coherence_review as _final_coherence_review,  # deprecated, replaced by Critic node
 )
 
 logger = logging.getLogger(__name__)
@@ -168,6 +168,11 @@ _SECTION_TYPE_KEYWORDS: dict[str, list[str]] = {
         "消融", "参数", "配置", "超参数", "训练", "推理", "延迟", "吞吐",
         "baseline", "基线", "对比实验", "定量", "数值", "百分比",
     ],
+    "experiment_setup": [
+        "实验设定", "实验设计", "实验设置", "方法", "设置",
+        "数据集", "实现细节", "模型架构", "训练配置", "评测方案",
+        "预处理", "特征工程", "采样", "划分", "验证策略",
+    ],
     "analysis": [
         "讨论", "分析", "展望", "启示", "建议", "未来", "趋势", "影响",
         "意义", "价值", "优劣", "权衡", "局限", "不足", "改进方向",
@@ -176,20 +181,115 @@ _SECTION_TYPE_KEYWORDS: dict[str, list[str]] = {
 }
 
 def classify_section_type(section_title: str) -> str:
-    """Classify a section heading into data / analysis / review based on keywords.
+    """Classify a section heading into data / experiment_setup / analysis / review.
 
     - ``data``: experiments, metrics, quantitative results — strict sourcing, low temperature
+    - ``experiment_setup``: methods, datasets, model config — data-adjacent but method-focused
     - ``analysis``: discussion, implications, future work — more inference, higher temperature
     - ``review``: background, definitions, frameworks — balanced (default)
     """
     title = (section_title or "").strip()
     data_score = sum(1 for kw in _SECTION_TYPE_KEYWORDS["data"] if kw in title)
+    experiment_score = sum(1 for kw in _SECTION_TYPE_KEYWORDS["experiment_setup"] if kw in title)
     analysis_score = sum(1 for kw in _SECTION_TYPE_KEYWORDS["analysis"] if kw in title)
-    if data_score > analysis_score:
-        return "data"
-    elif analysis_score > data_score:
-        return "analysis"
+
+    # Tie-break: experiment_setup > data > analysis > review
+    # experiment_setup is a data-adjacent type that wins ties against pure data
+    scores = [
+        (experiment_score, "experiment_setup"),
+        (data_score, "data"),
+        (analysis_score, "analysis"),
+    ]
+    # Sort by score descending; on tie, first in list wins (experiment_setup priority)
+    scores.sort(key=lambda x: (-x[0], ["experiment_setup", "data", "analysis"].index(x[1])))
+    if scores[0][0] > 0:
+        return scores[0][1]
     return "review"
+
+
+def _extract_kps_from_context(enriched_context: str, section_title: str) -> list[str]:
+    """Extract knowledge_points from enriched_context text for a given section.
+
+    Looks for blocks like::
+
+        [章节素材: Section Title]
+        知识点: kp1; kp2; kp3
+
+    Returns a list of knowledge point strings, or empty list.
+    """
+    if not enriched_context or not section_title:
+        return []
+    # Find the block for this section
+    pattern = rf"\[章节素材:\s*{re.escape(section_title)}\][^\[]*?知识点:\s*(.+?)(?:\n|$)"
+    m = re.search(pattern, enriched_context, re.DOTALL)
+    if not m:
+        # Fuzzy match: first 4 chars
+        probe = section_title[:4]
+        pattern = rf"\[章节素材:\s*{re.escape(probe)}[^\]]*\][^\[]*?知识点:\s*(.+?)(?:\n|$)"
+        m = re.search(pattern, enriched_context, re.DOTALL)
+    if m:
+        raw = m.group(1).strip()
+        return [kp.strip() for kp in re.split(r"[；;]", raw) if kp.strip() and len(kp.strip()) >= 3]
+    return []
+
+
+def _compute_coverage_map(
+    knowledge_points: list[str],
+    materials_text: str,
+) -> list[tuple[str, str]]:
+    """Check each knowledge point against retrieved materials using
+    jieba token overlap (Jaccard similarity).
+
+    Returns [(kp, status), ...] where status is `充足` / `有限` / `无`.
+    """
+    if not knowledge_points or not materials_text:
+        return []
+
+    try:
+        import jieba
+        material_words = set(w for w in jieba.lcut(materials_text) if len(w.strip()) >= 2)
+    except Exception:
+        material_words = set()
+        for i in range(len(materials_text) - 1):
+            chunk = materials_text[i:i+2]
+            if chunk.strip() and len(chunk) >= 2:
+                material_words.add(chunk)
+
+    result = []
+    for kp in knowledge_points:
+        kp = str(kp).strip()
+        if not kp or len(kp) < 4:
+            continue
+
+        try:
+            import jieba
+            kp_words = set(w for w in jieba.lcut(kp) if len(w.strip()) >= 2)
+        except Exception:
+            kp_words = set()
+            for i in range(len(kp) - 1):
+                chunk = kp[i:i+2]
+                if chunk.strip() and len(chunk) >= 2:
+                    kp_words.add(chunk)
+
+        if not kp_words or not material_words:
+            count = materials_text.count(kp[:6])
+            status = "充足" if count >= 2 else ("有限" if count == 1 else "无")
+            result.append((kp, status))
+            continue
+
+        intersection = kp_words & material_words
+        union = kp_words | material_words
+        jaccard = len(intersection) / max(len(union), 1)
+
+        if jaccard >= 0.3:
+            status = "充足"
+        elif jaccard >= 0.1:
+            status = "有限"
+        else:
+            status = "无"
+        result.append((kp, status))
+
+    return result
 
 
 def _build_section_prompt(
@@ -204,6 +304,8 @@ def _build_section_prompt(
     next_title: str = "",
     feedback: str = "",
     section_type: str = "review",
+    knowledge_points: list[str] | None = None,
+    enriched_context: str = "",
 ) -> str:
     lo, hi = target_range
     parts = [
@@ -215,6 +317,9 @@ def _build_section_prompt(
         "3) 场景化扩写：解释数据和结论的业务含义，但场景必须是材料中有线索支撑的，不要凭空想象。",
         "4) 降低幻觉：不要编造具体的数字、机构名、人名、年份。材料中明确出现的数值可以引用，但要标注具体来源（如「据某论文实验数据」），禁止使用「据材料显示」「据资料记载」等笼统表述。不确定就说「相关数据暂缺」。",
         "5) 溯源要求：每个关键论断后，用「（据+来源文件具体关键词）」标注——如引用自「RAG技术综述_张三.pdf」则标注为「（据RAG技术综述）」。多个材料支撑时标注「（综合多份材料）」。无任何材料支撑的推论标注「（分析推测）」。",
+        "6) 编号引用：参考材料中的 【1】【2】 等编号对应来源文件。当你引用某个编号材料的具体数据时，在句末标注引用编号，如「实验显示准确率达95.3%【1】」。可同时使用自然语言引用和编号引用。注意使用【】而非[]，避免 Markdown 链接语法冲突。",
+        "7) 时效优先：参考材料标注了发表年份（如「2023, xxx.pdf」）。优先采信年份较新的来源。如果引用了较旧的文献（3年以上），请在文中注明其发表年份或标注'据20XX年研究'。",
+        "8) 简化标注：你只需使用两套标注——①自然语言引用「（据XXX）」用于标明来源文件，②【n】编号引用用于对标检索片段。两者可以同时出现在同一论断中。不再需要第三套标注系统。",
         "",
     ]
     # ── Type-specific instructions ──
@@ -225,6 +330,15 @@ def _build_section_prompt(
             "• 每个数据点后必须标注出处：「（据<材料名>）」。",
             "• 如果材料中数据不足，只写已有数据，禁止推测数值或编造比较对象。",
             "• 温度极低：行文可以干练，但数据必须精确。",
+            "",
+        ]
+    elif section_type == "experiment_setup":
+        parts += [
+            "🔧 本节为「实验设定/方法型」章节（含实验设计、数据集、实现细节），特别要求：",
+            "• 准确描述实验配置和参数设定，不遗漏关键超参数（学习率、batch size、epoch 等）。",
+            "• 数据集描述需包含规模、来源、划分方式，不可笼统说「使用公开数据集」。",
+            "• 方法描述要能复现：模型架构、训练策略、评估方案逐条写清。",
+            "• 可以引用材料中的配置表，但用自己的语言组织，标注出处。",
             "",
         ]
     elif section_type == "analysis":
@@ -268,6 +382,31 @@ def _build_section_prompt(
             "请特别注意上述反馈，在写作时针对性修正问题。",
             "",
         ]
+    # ── Coverage map: tell the LLM what we have / don't have ──
+    # Try to extract knowledge_points from enriched_context if not explicitly provided.
+    # Enriched context contains lines like "[章节素材: Title]\n知识点: kp1; kp2; kp3"
+    if not knowledge_points and enriched_context:
+        kps = _extract_kps_from_context(enriched_context, section_title)
+        if kps:
+            knowledge_points = kps
+
+    if knowledge_points:
+        coverage = _compute_coverage_map(knowledge_points, multimodal_digest)
+        if coverage:
+            parts.append("")
+            parts.append("## 知识覆盖度提示")
+            parts.append("以下知识点在当前检索材料中的覆盖情况：")
+            for kp, status in coverage:
+                icon = {"充足": "[FULL]", "有限": "[LIMITED]", "无": "[MISSING]"}.get(status, "?")
+                parts.append(f"  {icon} {status}: {kp}")
+            parts.append("")
+            parts.append("写作时请注意：")
+            parts.append("- [充足] 的知识点可以深入展开，引用具体数据。")
+            parts.append("- [有限] 的知识点只写材料中已有的内容，不要延伸推测。")
+            parts.append("- [无] 的知识点：如果跳过不影响章节完整性则跳过；")
+            parts.append("  如果必须提及，用一句话概括并标注 [需补充数据]。")
+            parts.append("")
+
     parts += [
         f"写作要求：本节建议 {lo}~{hi} 字。",
         "只输出本节正文，不要输出标题行。不要输出「本节」「本章」等元描述文字。",
@@ -329,6 +468,7 @@ def generate_section_content(
     feedback: str = "",
     target_words: int = 0,
     section_type: str = "",
+    enriched_context: str = "",
 ) -> str:
     # Auto-classify if caller didn't specify
     section_type = section_type or classify_section_type(section_title)
@@ -356,6 +496,7 @@ def generate_section_content(
         next_title=next_title,
         feedback=feedback,
         section_type=section_type,
+        enriched_context=enriched_context,
     )
 
     # Temperature by section type: data=0.1, analysis=0.4, review=0.2
@@ -408,6 +549,14 @@ def _llm_summarize_for_next(section_title: str, content: str) -> str:
 def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user_prompt: str,
                           *, task_id: str = "", feedback: str = "", enriched_context: str = "",
                           target_words: int = 0) -> str:
+    """Generate report body section by section, streaming progress to disk.
+
+    Why sequential? Each section's content depends on the previous section's summary
+    for coherence (cross-references, avoiding repetition). The previous_summary
+    carries forward key entities and conclusions so later sections can refer back
+    naturally. Sections are flushed to content.md after each write so the frontend
+    can show live preview via SSE polling.
+    """
     flat = parse_outline_sections(outline)
     if not flat:
         return ""
@@ -469,7 +618,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
         if level == 2:
             out_lines.append("")
             out_lines.append(f"## {title}")
-            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words)
+            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words, enriched_context=enriched_context)
             out_lines.append("")
             out_lines.append(body)
             previous_summary = _llm_summarize_for_next(title, body)
@@ -482,7 +631,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
         if level == 3:
             out_lines.append("")
             out_lines.append(f"### {title}")
-            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words)
+            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words, enriched_context=enriched_context)
             out_lines.append("")
             out_lines.append(body)
             previous_summary = _llm_summarize_for_next(title, body)
@@ -504,7 +653,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
         _flush_seq()
 
     raw = "\n".join(out_lines).strip() + "\n"
-    return _final_coherence_review(raw, multimodal_digest)
+    return raw  # _final_coherence_review replaced by Critic graph node
 
 
 def generate_content(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "", feedback: str = "") -> str:
@@ -607,7 +756,9 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
         multimodal_digest = f"[技能搜集到的补充信息]\n{enriched_context.strip()}\n\n{multimodal_digest}"
 
     results: dict[int, str] = {}
-    max_workers = max(1, min(int(MAX_WORKERS_DEFAULT), len(tasks)))
+    # Cap concurrent LLM calls to avoid overwhelming local models
+    _llm_limit = int(os.environ.get("CONCURRENT_LLM_CALLS", str(MAX_WORKERS_DEFAULT)))
+    max_workers = max(1, min(_llm_limit, len(tasks)))
 
     # Helper to write partial content and stream events
     base_dir = Path(__file__).resolve().parent.parent.parent  # pre-compute for both paths
@@ -737,7 +888,7 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
             out_lines.append(body)
 
     raw = "\n".join(out_lines).strip() + "\n"
-    return _final_coherence_review(raw, multimodal_digest)
+    return raw  # _final_coherence_review replaced by Critic graph node
 
 
 def regenerate_section(

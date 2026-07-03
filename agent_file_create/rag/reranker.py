@@ -211,16 +211,28 @@ def _dedup_before_rerank(hits: list[Hit]) -> list[Hit]:
     return out
 
 
-def _score_norm(hits: list[Hit]) -> None:
-    """Min-max normalize scores in-place so downstream consumers see consistent ranges."""
+def _score_norm(hits: list[Hit]) -> list[Hit]:
+    """Min-max normalize scores, returning new Hit objects (Hit is frozen).
+
+    Prefers meta["rerank_score"] over h.score when available (set by LLM listwise reranker).
+    """
     if len(hits) < 2:
-        return
-    vals = [float(h.score) for h in hits]
+        return hits
+    vals = [float(h.meta.get("rerank_score", h.score)) for h in hits]
     lo, hi = min(vals), max(vals)
     if hi <= lo:
-        return
+        return hits
+    result: list[Hit] = []
     for h in hits:
-        h.score = (float(h.score) - lo) / (hi - lo)
+        raw_score = float(h.meta.get("rerank_score", h.score))
+        new_score = (raw_score - lo) / (hi - lo)
+        result.append(Hit(
+            kb=h.kb, doc_id=h.doc_id, chunk_id=h.chunk_id,
+            chunk_index=h.chunk_index, section_path=h.section_path,
+            content=h.content, score=new_score, meta=dict(h.meta),
+            parent_chunk_id=h.parent_chunk_id,
+        ))
+    return result
 
 
 def rerank(query: str, hits: list[Hit], *, top_k: Optional[int] = None,
@@ -249,8 +261,7 @@ def rerank(query: str, hits: list[Hit], *, top_k: Optional[int] = None,
     final_k = top_k if top_k is not None else RERANK_FINAL_K
 
     if final_k >= len(cand):
-        _score_norm(cand)
-        return cand
+        return _score_norm(cand)
 
     model = RERANK_MODEL.strip()
     has_ce = model and model.lower() not in {"none", "false", "off", "llm"}
@@ -272,5 +283,4 @@ def rerank(query: str, hits: list[Hit], *, top_k: Optional[int] = None,
     else:
         result = _llm_listwise_rerank(query, cand, final_k)
 
-    _score_norm(result)
-    return result
+    return _score_norm(result)
