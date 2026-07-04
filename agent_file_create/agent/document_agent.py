@@ -7,8 +7,13 @@ human-in-the-loop, SqliteSaver checkpointing, and modular prompts.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import json as _json
 import logging
 import re
+import threading
+import time as _time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -16,6 +21,14 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
+from agent_file_create.errors import (
+    DocAgentError,
+    ExtractionError,
+    LLMCallError,
+    RAGRetrievalError,
+    StepFatalError,
+    StepRecoverableError,
+)
 from agent_file_create.prompts import CLARIFY_QUESTIONS_PROMPT
 from agent_file_create.agent.state import AgentState
 from agent_file_create.config import (
@@ -23,6 +36,7 @@ from agent_file_create.config import (
     CONTENT_API_KEY,
     CONTENT_API_STYLE,
     CONTENT_MODEL_NAME,
+    GRAPH_RECURSION_LIMIT,
     MODEL_NAME,
     MODEL_TIMEOUT,
     MODEL_TIMEOUT_SHORT,
@@ -34,18 +48,46 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_DB_PATH = "result/checkpoints.db"
 
-# ── Module-level SqliteSaver singleton ────────────────────────────────────────
+# ── Module-level SqliteSaver singleton (thread‑safe) ─────────────────────────
 
 _checkpointer: Optional[SqliteSaver] = None
 _checkpointer_cm: Optional[object] = None
+_checkpointer_lock = threading.Lock()
+
+# ── Module-level thread pool for _run_async (reused) ─────────────────────────
+
+_async_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_async_pool_lock = threading.Lock()
+
+
+def _get_async_pool() -> concurrent.futures.ThreadPoolExecutor:
+    global _async_pool
+    if _async_pool is None:
+        with _async_pool_lock:
+            if _async_pool is None:
+                _async_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    return _async_pool
 
 
 def _get_checkpointer() -> SqliteSaver:
     global _checkpointer, _checkpointer_cm
     if _checkpointer is None:
-        _checkpointer_cm = SqliteSaver.from_conn_string(CHECKPOINT_DB_PATH)
-        _checkpointer = _checkpointer_cm.__enter__()
+        with _checkpointer_lock:
+            if _checkpointer is None:
+                _checkpointer_cm = SqliteSaver.from_conn_string(CHECKPOINT_DB_PATH)
+                _checkpointer = _checkpointer_cm.__enter__()
     return _checkpointer
+
+
+def _prune_checkpoint(task_id: str) -> None:
+    """Delete a completed task's checkpoint data to prevent unbounded DB growth."""
+    try:
+        cp = _get_checkpointer()
+        # LangGraph SqliteSaver stores per-thread checkpoints
+        cp.delete_thread(task_id)
+        logger.debug("checkpoint_pruned task=%s", task_id)
+    except Exception as e:
+        logger.debug("checkpoint_prune_failed task=%s err=%s", task_id, e)
 
 
 # ── DocumentAgent ─────────────────────────────────────────────────────────────
@@ -90,15 +132,16 @@ class DocumentAgent:
 
     @staticmethod
     def _run_async(coro):
-        """Run an async coroutine safely in both sync and async contexts."""
+        """Run an async coroutine safely in both sync and async contexts.
+
+        Reuses a module-level ThreadPoolExecutor instead of creating one per call.
+        """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(coro)
         # Already in async context — use thread to avoid nested loop
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(asyncio.run, coro).result()
+        return _get_async_pool().submit(asyncio.run, coro).result()
 
     @staticmethod
     def _build_llm(timeout_s: int = MODEL_TIMEOUT_SHORT):
@@ -139,7 +182,8 @@ class DocumentAgent:
         builder.add_node("satisfaction_outline", self._node_satisfaction_outline)
         builder.add_node("research", self._node_research)
         builder.add_node("content", self._node_content)
-        builder.add_node("critic", self._node_critic)       # ★ Critic
+        builder.add_node("critic_analyze", self._node_critic_analyze)      # ★ Critic: analyze
+        builder.add_node("critic_auto_fix", self._node_critic_auto_fix)      # ★ Critic: auto-fix
         builder.add_node("satisfaction_content", self._node_satisfaction_content)
         builder.add_node("final_confirm", self._node_final_confirm)
         builder.add_node("render", self._node_render)
@@ -164,10 +208,14 @@ class DocumentAgent:
             {"outline": "outline", "research": "research", "content": "content", "error": "handle_error"},
         )
 
-        # research → content → critic → satisfaction_content → final_confirm (版本比对+段落重生成)
+        # research → content → critic_analyze → [conditional] → critic_auto_fix → satisfaction_content → final_confirm
         builder.add_edge("research", "content")
-        builder.add_edge("content", "critic")                # ★ content → critic
-        builder.add_edge("critic", "satisfaction_content")   # ★ critic → satisfaction
+        builder.add_edge("content", "critic_analyze")
+        builder.add_conditional_edges(
+            "critic_analyze", self._route_after_critic_analyze,
+            {"critic_auto_fix": "critic_auto_fix", "satisfaction_content": "satisfaction_content"},
+        )
+        builder.add_edge("critic_auto_fix", "satisfaction_content")
         builder.add_conditional_edges(
             "satisfaction_content", self._route_after_satisfaction_content,
             {"outline": "outline", "content": "content", "final_confirm": "final_confirm", "error": "handle_error"},
@@ -255,7 +303,6 @@ class DocumentAgent:
 
         from agent_file_create.document.extractor import extract_from_file
         from agent_file_create.config import MAX_WORKERS_DEFAULT
-        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         fps = state.get("file_paths", self.file_paths)
         results: List[dict] = [{}] * len(fps)
@@ -270,7 +317,13 @@ class DocumentAgent:
                 idx = futures[fut]
                 try:
                     res = fut.result()
+                except ExtractionError as e:
+                    logger.warning("extract file_failed task=%s file=%s err=%s",
+                                   self.task_id, Path(fps[idx]).name, e)
+                    res = {"error": str(e), "_file": Path(fps[idx]).name}
                 except Exception as e:
+                    logger.warning("extract file_failed task=%s file=%s err=%s",
+                                   self.task_id, Path(fps[idx]).name, e)
                     res = {"error": str(e), "_file": Path(fps[idx]).name}
                 if isinstance(res, dict):
                     res["_file"] = Path(fps[idx]).name
@@ -309,13 +362,14 @@ class DocumentAgent:
         )
 
         try:
+            from agent_file_create.utils import retry_call
             llm = self._build_llm(timeout_s=30)
-            response = llm.invoke(prompt)
+            response = retry_call(llm.invoke, prompt, max_retries=2, delay=1.0)
             raw = (
                 response.content if hasattr(response, "content")
                 else str(response)
             ).strip()
-        except Exception as e:
+        except LLMCallError as e:
             logger.warning("plan    llm_failed task=%s err=%s", self.task_id, e)
             raw = (
                 "- 分析材料提取关键信息 | 材料内容 | 高\n"
@@ -416,6 +470,9 @@ class DocumentAgent:
 
             registry = get_registry()
             registry.discover()
+        except RAGRetrievalError as exc:
+            logger.warning("enrich  registry_failed task=%s err=%s", self.task_id, exc)
+            return {"skills_used": [], "enriched_context": "", "skill_results": []}
         except Exception as exc:
             logger.warning("enrich  registry_failed task=%s err=%s", self.task_id, exc)
             return {"skills_used": [], "enriched_context": "", "skill_results": []}
@@ -440,8 +497,9 @@ class DocumentAgent:
         # Ask LLM to select skills
         llm = self._build_llm(timeout_s=40)
         try:
+            from agent_file_create.utils import retry_call
             import asyncio
-            response = llm.invoke(selection_prompt)
+            response = retry_call(llm.invoke, selection_prompt, max_retries=2, delay=1.0)
             raw = (
                 response.content
                 if hasattr(response, "content")
@@ -535,8 +593,9 @@ class DocumentAgent:
 
         llm = self._build_llm(timeout_s=40)
         try:
+            from agent_file_create.utils import retry_call
             import asyncio
-            response = llm.invoke(selection_prompt)
+            response = retry_call(llm.invoke, selection_prompt, max_retries=2, delay=1.0)
             raw = (
                 response.content
                 if hasattr(response, "content")
@@ -622,7 +681,7 @@ class DocumentAgent:
         question = question or "请补充你希望生成文档的侧重点/受众/篇幅/风格等信息。"
         logger.info("clarify_question  task=%s question_chars=%d", self.task_id, len(question))
 
-        question = "[STAGE:clarify]\n" + question
+        question = "[STAGE:clarify]\n在开始写报告之前，想先确认几个事情：\n\n" + question
 
         # Native LangGraph interrupt — pauses the graph here
         answer = interrupt(question)
@@ -668,7 +727,6 @@ class DocumentAgent:
 
         # Parse answer: user sends JSON-like structure via Command
         # The answer is a dict from the frontend: {"satisfied": bool, "feedback": "...", "scope": "outline|content_only"}
-        import json as _json
         try:
             if isinstance(answer, str):
                 ans = _json.loads(answer)
@@ -710,6 +768,30 @@ class DocumentAgent:
         ]
         if len(versions) > 1:
             prompt_parts.append(f"共 {len(versions)} 个历史版本，可切换对比")
+            # Build a quick version comparison table
+            prompt_parts.append("")
+            prompt_parts.append("📊 版本对比摘要：")
+            prompt_parts.append("| 版本 | 字数 | 段落数 | 章节数 | 评估分 |")
+            prompt_parts.append("|------|------|--------|--------|--------|")
+            _eval_report = state.get("eval_report") or {}
+            _current_score = ""
+            if _eval_report:
+                _combined = _eval_report.get("combined", {})
+                if _combined:
+                    _avg = (_combined.get("faithfulness", 0) + _combined.get("completeness", 0)
+                            + _combined.get("coherence", 0) + _combined.get("relevance", 0)) / 4.0
+                    _current_score = f"{_avg:.0%}"
+            for v in sorted(versions, key=lambda x: x.get("version", 0)):
+                _vc = str(v.get("content", ""))
+                _word_count = len(_vc.replace("\n", "").replace(" ", ""))
+                _para_count = len([p for p in _vc.split("\n\n") if p.strip()])
+                _section_count = len(re.findall(r"^##\s", _vc, re.MULTILINE))
+                _is_current = v.get("version") == current_ver
+                _marker = " ← 当前" if _is_current else ""
+                _score = _current_score if _is_current else "-"
+                prompt_parts.append(
+                    f"| V{v.get('version', '?')} | {_word_count} | {_para_count} | {_section_count} | {_score}{_marker} |"
+                )
 
         # ── ★ Critic 质检结果展示 ──
         critic_report = state.get("critic_report") or {}
@@ -745,6 +827,7 @@ class DocumentAgent:
         prompt_parts.append(
             "操作选项：\n"
             "  [满意] → 渲染最终报告\n"
+            "  [满意+备注] → 满意但留改进建议，不重跑流程\n"
             "  [不满意] → 重新生成正文\n"
             "  [编辑段落] → 点击预览区任意段落直接编辑\n"
             "  [版本对比] → 切换查看历史版本差异\n"
@@ -754,7 +837,6 @@ class DocumentAgent:
 
         answer = interrupt(question)
 
-        import json as _json
         try:
             if isinstance(answer, str):
                 ans = _json.loads(answer)
@@ -762,6 +844,15 @@ class DocumentAgent:
                 ans = answer if isinstance(answer, dict) else {}
         except Exception:
             ans = {"satisfied": True, "feedback": "", "scope": "content_only"}
+
+        # Detect "approve with note" mode
+        approval_mode = str(ans.get("mode") or "").strip()
+        approve_with_note = approval_mode == "approve_with_note"
+        if approve_with_note:
+            # User is satisfied but wants to leave a note — proceed without re-gen
+            ans["satisfied"] = True
+            logger.info("satisfaction_content approve_with_note task=%s note=%.100s",
+                        self.task_id, str(ans.get("feedback", "")))
 
         satisfied = bool(ans.get("satisfied", True))
         feedback = str(ans.get("feedback") or "").strip()
@@ -809,7 +900,6 @@ class DocumentAgent:
 
         answer = interrupt(question)
 
-        import json as _json
         try:
             if isinstance(answer, str):
                 ans = _json.loads(answer)
@@ -875,21 +965,20 @@ class DocumentAgent:
             # Version management
             versions = list(state.get("outline_versions") or [])
             current_ver = int(state.get("current_outline_version") or 0) + 1
-            import time
             versions.append({
                 "version": current_ver,
                 "content": outline,
                 "feedback": feedback,
                 "selected": False,
-                "ts": time.time(),
+                "ts": _time.time(),
             })
 
             # Persist version to disk
             try:
                 from agent_file_create.task.manager import TaskManager
                 TaskManager().save_version(self.task_id, "outline", current_ver, outline, feedback)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("save_outline_version_failed ver=%d err=%s", current_ver, e)
 
             logger.info("outline done   task=%s chars=%d ver=%d", self.task_id, len(outline or ""), current_ver)
             # Write outline.md early so frontend can preview during satisfaction
@@ -897,8 +986,8 @@ class DocumentAgent:
                 _out_path = Path(__file__).resolve().parent.parent.parent / "result" / str(self.task_id) / "outline.md"
                 _out_path.parent.mkdir(parents=True, exist_ok=True)
                 _out_path.write_text(str(outline or ""), encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("write_outline_preview_failed path=%s err=%s", _out_path, e)
             return {
                 "outline": outline,
                 "outline_versions": versions,
@@ -906,6 +995,9 @@ class DocumentAgent:
                 "outline_satisfied": False,  # reset for new version
                 "satisfaction_feedback": "",
             }
+        except StepRecoverableError as exc:
+            logger.warning("outline failed  task=%s err=%s", self.task_id, exc)
+            return {"error": f"大纲生成失败: {exc}"}
         except Exception as exc:
             logger.warning("outline failed  task=%s err=%s", self.task_id, exc)
             return {"error": f"大纲生成失败: {exc}"}
@@ -958,7 +1050,7 @@ class DocumentAgent:
                 _kb_stats = _kb.kb_stats(kb=_kb_name) if _kb_name else {}
                 if _kb_stats.get("doc_count", 0) > 0:
                     logger.info("content planner_start  task=%s kb=%s docs=%d", self.task_id, _kb_name, _kb_stats["doc_count"])
-                    t_plan = time.perf_counter()
+                    t_plan = _time.perf_counter()
                     _plan = plan_all_sections(
                         outline=outline, user_prompt=user_prompt,
                         kb=_kb, kb_name=_kb_name,
@@ -1018,11 +1110,15 @@ class DocumentAgent:
                             _citation_map = {}
                         _citation_refs = format_citation_list(_citation_map) if _citation_map else ""
                         logger.info("content planner_done sections=%d citations=%d annotated_chars=%d elapsed=%.1fs",
-                                    len(_plan), len(_citation_map), sum(len(p) for p in _annotated_parts), time.perf_counter() - t_plan)
+                                    len(_plan), len(_citation_map), sum(len(p) for p in _annotated_parts), _time.perf_counter() - t_plan)
                     else:
                         logger.warning("content planner_empty_plan  task=%s — no sections planned", self.task_id)
                         _citation_map = {}
                         _citation_refs = ""
+            except RAGRetrievalError as _pe:
+                logger.debug("content planner_skip err=%s", _pe)
+                _citation_map = {}
+                _citation_refs = ""
             except Exception as _pe:
                 logger.debug("content planner_skip err=%s", _pe)
                 _citation_map = {}
@@ -1037,21 +1133,20 @@ class DocumentAgent:
             # Version management
             versions = list(state.get("content_versions") or [])
             current_ver = int(state.get("current_content_version") or 0) + 1
-            import time
             versions.append({
                 "version": current_ver,
                 "content": content,
                 "feedback": feedback,
                 "selected": False,
-                "ts": time.time(),
+                "ts": _time.time(),
             })
 
             # Persist version to disk
             try:
                 from agent_file_create.task.manager import TaskManager
                 TaskManager().save_version(self.task_id, "content", current_ver, content, feedback)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("save_content_version_failed ver=%d err=%s", current_ver, e)
 
             # Citation post-processing: renumber + optionally append reference list
             if content:
@@ -1076,8 +1171,8 @@ class DocumentAgent:
                             if "references" in _get_template_placeholders(str(tp)):
                                 _template_has_refs = True
                                 break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("template_placeholder_check_failed err=%s", e)
 
             # Check if outline already has a references section
             _outline_has_refs = bool(re.search(r'^#+\s*(?:参考|引用|文献|来源)', outline or "", re.MULTILINE | re.IGNORECASE))
@@ -1096,21 +1191,27 @@ class DocumentAgent:
                 "citation_map": _citation_map,
                 "citation_refs": _citation_refs,
             }
+        except StepRecoverableError as exc:
+            logger.warning("content failed  task=%s err=%s", self.task_id, exc)
+            return {"error": f"正文生成失败: {exc}", "citation_map": {}, "citation_refs": ""}
         except Exception as exc:
             logger.warning("content failed  task=%s err=%s", self.task_id, exc)
             return {"error": f"正文生成失败: {exc}", "citation_map": {}, "citation_refs": ""}
 
-    # ── Node: critic (auto-review) ────────────────────────────────────────────
+    # ── Node: critic_analyze (auto-review — analysis only) ────────────────────
 
-    def _node_critic(self, state: AgentState) -> dict:
-        """Automated quality review + auto-fix for low/medium issues.
+    def _node_critic_analyze(self, state: AgentState) -> dict:
+        """Automated quality review — analysis phase.
 
         Runs after content generation, before human satisfaction check.
         1. Regex pre-filter: fast number/entity/year cross-check (0 LLM calls).
         2. LLM review: check content against outline & materials.
-        3. Auto-fix low/medium issues; leave high-severity for human review.
+        3. Citation verification: lightweight cross-reference.
+
+        Does NOT modify content — only produces a critic_report.
+        Auto-fix happens in the separate _node_critic_auto_fix node.
         """
-        logger.info("critic  start  task=%s", self.task_id)
+        logger.info("critic_analyze start  task=%s", self.task_id)
 
         content = str(state.get("content") or "")
         outline = str(state.get("outline") or "")
@@ -1129,8 +1230,11 @@ class DocumentAgent:
         materials = materials_full[:3000]
 
         if len(content) < 200:
-            logger.info("critic  skip   task=%s (content too short)", self.task_id)
-            return {"critic_report": {"issues": [], "passed": True}}
+            logger.info("critic_analyze skip   task=%s (content too short)", self.task_id)
+            return {
+                "critic_report": {"issues": [], "passed": True},
+                "content_hardened": content,
+            }
 
         # ── Layer 1: regex pre-filter + numerical hallucination hardening ──
         regex_issues: list[dict] = []
@@ -1160,27 +1264,26 @@ class DocumentAgent:
                         "severity": "中",
                     })
                 logger.info(
-                    "critic  regex_hardening patched=%d issues=%d",
+                    "critic_analyze regex_hardening patched=%d issues=%d",
                     len(patches), len(raw_issues),
                 )
             elif regex_issues:
-                logger.info("critic  regex_filter found=%d issues", len(regex_issues))
+                logger.info("critic_analyze regex_filter found=%d issues", len(regex_issues))
         except Exception as e:
-            logger.debug("critic  regex_filter skipped: %s", e)
+            logger.debug("critic_analyze regex_filter skipped: %s", e)
 
         try:
-            from agent_file_create.document._critic import run_critic, run_critic_fix
+            from agent_file_create.document._critic import run_critic
 
-            # Step 1: Review (on already-hardened content)
+            # LLM review (on already-hardened content)
             report = run_critic(content=content_patched, outline=outline, materials=materials)
         except Exception as e:
-            logger.warning("critic  failed task=%s err=%s", self.task_id, e)
+            logger.warning("critic_analyze failed task=%s err=%s", self.task_id, e)
             report = {"issues": [], "raw": "", "passed": True}
 
         issues = regex_issues + report.get("issues", [])
         n_issues = len(issues)
         high_issues = [i for i in issues if i.get("severity") == "高"]
-        fixable = [i for i in issues if i.get("severity") != "高"]
 
         # ── Citation verification (optional, lightweight) ──
         citation_warnings: list[dict] = []
@@ -1190,48 +1293,129 @@ class DocumentAgent:
                 from agent_file_create.rag.planner import verify_citations
                 citation_warnings = verify_citations(content_patched, _cit_map)
                 if citation_warnings:
-                    logger.info("critic  citation_warnings=%d", len(citation_warnings))
+                    logger.info("critic_analyze citation_warnings=%d", len(citation_warnings))
         except Exception as e:
-            logger.debug("critic  citation_verify skipped: %s", e)
+            logger.debug("critic_analyze citation_verify skipped: %s", e)
 
-        # Merge reports
+        # ── Quality Pipeline (optional, env-controlled) ─────────────────
+        quality_issues: list[dict] = []
+        try:
+            import os as _os
+            if _os.getenv("QUALITY_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}:
+                from agent_file_create.quality import QualityPipeline, QualityContext
+                _qp_ctx = QualityContext(
+                    content=content_patched,
+                    analysis_results=ar,
+                    task_id=self.task_id,
+                    output_dir=str(Path(__file__).resolve().parent.parent.parent / "result" / self.task_id),
+                )
+                _qp_result = QualityPipeline().run_parallel(_qp_ctx)
+                for _sr in _qp_result.step_results:
+                    if _sr.warnings:
+                        for _w in _sr.warnings:
+                            quality_issues.append({
+                                "type": "quality_check",
+                                "location": "",
+                                "description": _w,
+                                "severity": "中",
+                            })
+                if _qp_result.content and _qp_result.content != content_patched:
+                    content_patched = _qp_result.content
+                logger.info(
+                    "critic_analyze quality_pipeline task=%s steps=%d warnings=%d changed=%s",
+                    self.task_id, len(_qp_result.step_results),
+                    sum(len(sr.warnings) for sr in _qp_result.step_results),
+                    _qp_result.content != content,
+                )
+        except Exception as _qe:
+            logger.debug("critic_analyze quality_pipeline skipped: %s", _qe)
+
+        # Merge reports (no content modification)
         merged = dict(report)
-        merged["issues"] = issues
+        merged["issues"] = issues + quality_issues
         merged["regex_issues"] = len(regex_issues)
         merged["citation_warnings"] = citation_warnings
+        merged["quality_issues"] = len(quality_issues)
 
-        # Step 2: Auto-fix low/medium issues (regex + LLM)
-        # Start from already-hardened content (numerical patches applied)
-        fixed_content = content_patched
-        if fixable:
-            try:
-                fixed_content = run_critic_fix(
-                    content=content_patched, issues=fixable, materials=materials,
-                )
-                if fixed_content != content_patched:  # LLM did further changes
-                    logger.info(
-                        "critic  auto_fixed task=%s low_med=%d chars=%d->%d",
-                        self.task_id, len(fixable),
-                        len(content_patched), len(fixed_content),
-                    )
-            except Exception as e:
-                logger.warning("critic  auto_fix_failed task=%s err=%s", self.task_id, e)
-
-        _had_changes = fixed_content != content
         logger.info(
-            "critic  done   task=%s total=%d regex=%d llm=%d high=%d changed=%s",
-            self.task_id, n_issues, len(regex_issues),
-            len(report.get("issues", [])), len(high_issues),
-            _had_changes,
+            "critic_analyze done   task=%s total=%d regex=%d llm=%d quality=%d high=%d",
+            self.task_id, len(merged["issues"]), len(regex_issues),
+            len(report.get("issues", [])), len(quality_issues), len(high_issues),
         )
 
         return {
-            "content": fixed_content if _had_changes else content,
+            "content_hardened": content_patched,
             "critic_report": merged,
-            "critic_issues_count": n_issues,
+            "critic_issues_count": len(merged["issues"]),
             "critic_high_issues": len(high_issues),
             "suggested_queries": report.get("suggested_queries", []),
         }
+
+    def _route_after_critic_analyze(self, state: AgentState) -> str:
+        """Route: if there are fixable issues, run auto-fix; otherwise skip."""
+        report = state.get("critic_report") or {}
+        issues = report.get("issues", [])
+        fixable = [i for i in issues if i.get("severity") != "高"]
+        if fixable:
+            return "critic_auto_fix"
+        return "satisfaction_content"
+
+    # ── Node: critic_auto_fix (auto-fix only) ─────────────────────────────
+
+    def _node_critic_auto_fix(self, state: AgentState) -> dict:
+        """Apply auto-fixes for low/medium severity issues.
+
+        Only runs when _route_after_critic_analyze detects fixable issues.
+        Uses the content_hardened from critic_analyze as the base for fixes.
+        """
+        logger.info("critic_auto_fix start task=%s", self.task_id)
+
+        content = str(state.get("content") or "")
+        content_patched = str(state.get("content_hardened") or content)
+        report = state.get("critic_report") or {}
+        issues = report.get("issues", [])
+
+        fixable = [i for i in issues if i.get("severity") != "高"]
+        if not fixable:
+            logger.info("critic_auto_fix skip   task=%s (nothing fixable)", self.task_id)
+            return {}
+
+        # Build materials from analysis_results for context
+        ar = state.get("analysis_results") or []
+        materials_parts: list[str] = []
+        for r in ar[:8]:
+            if isinstance(r, dict):
+                title = str(r.get("title") or "").strip()
+                summary = str(r.get("summary") or "").strip()
+                if summary:
+                    materials_parts.append(f"[{title}] {summary}" if title else summary)
+        materials = "\n".join(materials_parts)[:3000]
+
+        fixed_content = content_patched
+        try:
+            from agent_file_create.document._critic import run_critic_fix
+
+            fixed_content = run_critic_fix(
+                content=content_patched, issues=fixable, materials=materials,
+            )
+            if fixed_content != content_patched:
+                logger.info(
+                    "critic_auto_fix applied task=%s low_med=%d chars=%d->%d",
+                    self.task_id, len(fixable),
+                    len(content_patched), len(fixed_content),
+                )
+            else:
+                logger.info("critic_auto_fix no_change task=%s (LLM returned same content)", self.task_id)
+        except Exception as e:
+            logger.warning("critic_auto_fix failed task=%s err=%s", self.task_id, e)
+
+        _had_changes = fixed_content != content
+        logger.info(
+            "critic_auto_fix done   task=%s fixed=%d changed=%s",
+            self.task_id, len(fixable), _had_changes,
+        )
+
+        return {"content": fixed_content if _had_changes else content}
 
     # ── Node: render ─────────────────────────────────────────────────────────
 
@@ -1249,7 +1433,6 @@ class DocumentAgent:
         )
         answer = interrupt(question)
 
-        import json as _json
         try:
             ans = _json.loads(answer) if isinstance(answer, str) else {}
         except Exception:
@@ -1284,17 +1467,93 @@ class DocumentAgent:
                 user_prompt=str(state.get("user_prompt") or ""),
             )
             scores = eval_report.combined
-            logger.info("quality_gate eval_done task=%s faith=%.2f comp=%.2f",
-                        self.task_id, scores.faithfulness, scores.completeness)
+            logger.info("quality_gate eval_done task=%s faith=%.2f comp=%.2f coh=%.2f rel=%.2f",
+                        self.task_id, scores.faithfulness, scores.completeness,
+                        scores.coherence, scores.relevance)
+
+            # ── Per-section evaluation breakdown ───────────────────────
+            section_evals: list[dict] = []
+            try:
+                from agent_file_create.evaluation.orchestrator import evaluate_by_section
+                section_evals = evaluate_by_section(
+                    content=new_content or content,
+                    outline=str(state.get("outline") or ""),
+                    analysis_results=ar,
+                    user_prompt=str(state.get("user_prompt") or ""),
+                    enable_llm=False,  # Decomposed only for speed
+                )
+                if section_evals:
+                    logger.info(
+                        "quality_gate sections task=%s n=%d weakest=%s(%.2f)",
+                        self.task_id, len(section_evals),
+                        section_evals[0]["title"], section_evals[0]["scores"].faithfulness,
+                    )
+            except Exception as _se:
+                logger.debug("quality_gate section_eval_failed err=%s", _se)
+
+            # ── Quality gate thresholds ───────────────────────────────
+            from agent_file_create.config import (
+                EVAL_MIN_FAITHFULNESS,
+                EVAL_MIN_COMPLETENESS,
+                EVAL_AUTO_RETRY,
+            )
+            below_threshold = []
+            if scores.faithfulness < EVAL_MIN_FAITHFULNESS:
+                below_threshold.append(f"忠实度({scores.faithfulness:.2f}<{EVAL_MIN_FAITHFULNESS})")
+            if scores.completeness < EVAL_MIN_COMPLETENESS:
+                below_threshold.append(f"完整性({scores.completeness:.2f}<{EVAL_MIN_COMPLETENESS})")
+
+            auto_remediate = False
+            remediation_target = ""
+            if below_threshold and EVAL_AUTO_RETRY:
+                auto_remediate = True
+                if scores.faithfulness < EVAL_MIN_FAITHFULNESS:
+                    remediation_target = "faithfulness"
+                if scores.completeness < EVAL_MIN_COMPLETENESS:
+                    remediation_target = (
+                        remediation_target + "+completeness"
+                        if remediation_target else "completeness"
+                    )
+                logger.info(
+                    "quality_gate below_threshold task=%s thresholds=%s target=%s",
+                    self.task_id, below_threshold, remediation_target,
+                )
 
             _eval_dict = eval_report.to_dict()
-            logger.info("quality_gate return task=%s eval_keys=%s", self.task_id, list(_eval_dict.keys()) if _eval_dict else [])
-            return {
+            _eval_dict["_thresholds"] = {
+                "min_faithfulness": EVAL_MIN_FAITHFULNESS,
+                "min_completeness": EVAL_MIN_COMPLETENESS,
+            }
+
+            result = {
                 "content": new_content if new_content != content else content,
                 "eval_applied": True,
                 "eval_metrics": _eval_dict,
                 "eval_report": _eval_dict,
+                "auto_remediate": auto_remediate,
+                "remediation_target": remediation_target,
+                "section_evals": [
+                    {"title": s["title"], "chars": s["chars"],
+                     "faithfulness": s["scores"].faithfulness,
+                     "completeness": s["scores"].completeness,
+                     "warnings": len(s.get("warnings", []))}
+                    for s in section_evals
+                ],
             }
+
+            # Persist eval report to result dir
+            try:
+                import json as _j
+                _eval_path = Path(__file__).resolve().parent.parent.parent / "result" / str(self.task_id) / "eval_report.json"
+                _eval_path.parent.mkdir(parents=True, exist_ok=True)
+                _eval_path.write_text(_j.dumps(_eval_dict, ensure_ascii=False, indent=2), encoding="utf-8")
+                logger.info("quality_gate eval_saved path=%s", _eval_path)
+            except Exception:
+                pass
+
+            logger.info("quality_gate return task=%s auto_remediate=%s target=%s",
+                        self.task_id, auto_remediate, remediation_target)
+            return result
         except Exception as e:
             logger.warning("quality_gate failed  task=%s err=%s", self.task_id, e)
             return {"eval_skipped": True}
@@ -1347,6 +1606,9 @@ class DocumentAgent:
                 "output_dir": output_dir,
                 "finished": True,
             }
+        except StepFatalError as exc:
+            logger.warning("render failed   task=%s err=%s", self.task_id, exc)
+            return {"error": f"文档渲染失败: {exc}"}
         except Exception as exc:
             logger.warning("render failed   task=%s err=%s", self.task_id, exc)
             return {"error": f"文档渲染失败: {exc}"}
@@ -1395,15 +1657,99 @@ class DocumentAgent:
 
     def _node_handle_error(self, state: AgentState) -> dict:
         err = state.get("error", "unknown error")
+        # Determine which node/phase failed from last_output or state context
+        failed_node = ""
+        last_out = str(state.get("last_output", ""))[:120]
+        if state.get("content") and not state.get("outline"):
+            failed_node = "outline"
+        elif state.get("outline") and not state.get("content"):
+            failed_node = "content"
+        elif not state.get("analysis_results"):
+            failed_node = "extract"
+        elif state.get("outputs"):
+            failed_node = "render"
+        else:
+            failed_node = "workflow"
+
+        context_snapshot = {
+            "stage": failed_node,
+            "has_outline": bool(state.get("outline")),
+            "has_content": bool(state.get("content")),
+            "has_analysis": bool(state.get("analysis_results")),
+            "files": len(state.get("file_paths", [])),
+            "last_output_preview": last_out,
+        }
+
         logger.error(
-            "workflow_error task=%s phase=%s err=%s",
+            "workflow_error task=%s node=%s err=%s ctx=%s",
             self.task_id,
-            state.get("last_output", "")[:80],
+            failed_node,
             err,
+            context_snapshot,
         )
+
+        # ── Save recovery snapshot ───────────────────────────────────────
+        # Persist enough state so the user can retry from the failure point
+        # without losing completed work (outline, extracted data, etc.).
+        recovery_data = {
+            "failed_node": failed_node,
+            "error": str(err)[:500],
+            "has_outline": bool(state.get("outline")),
+            "has_content": bool(state.get("content")),
+            "has_analysis": bool(state.get("analysis_results")),
+            "user_prompt": str(state.get("user_prompt", self.user_prompt))[:2000],
+            "retry_from": {
+                "extract": "extract",
+                "outline": "outline" if state.get("analysis_results") else "extract",
+                "content": "content" if state.get("outline") else "outline",
+                "render": "render" if state.get("content") else "content",
+            }.get(failed_node, "outline"),
+            "timestamp": _time.time(),
+        }
+        try:
+            import json as _j
+            _recovery_path = (
+                Path(__file__).resolve().parent.parent.parent
+                / "result" / str(self.task_id) / "recovery.json"
+            )
+            _recovery_path.parent.mkdir(parents=True, exist_ok=True)
+            _recovery_path.write_text(_j.dumps(recovery_data, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info("recovery_saved task=%s node=%s path=%s", self.task_id, failed_node, _recovery_path)
+        except Exception as _re:
+            logger.debug("recovery_save_failed err=%s", _re)
+
+        _prune_checkpoint(self.task_id)
+
+        # User-friendly message with actionable hint
+        stage_label = {
+            "extract": "文件抽取",
+            "outline": "大纲生成",
+            "content": "正文生成",
+            "render": "文档渲染",
+        }.get(failed_node, "文档生成")
+
+        # Build retry suggestion
+        retry_hint = ""
+        if failed_node in ("outline", "content"):
+            retry_hint = (
+                f"\n\n🔄 重试建议: 你可以修改需求描述后，在聊天框发送 "
+                f"/regen 来从「{stage_label}」阶段重新生成，已完成的步骤将被复用。"
+            )
+
         return {
             "finished": True,
-            "last_output": f"工作流异常终止：{err}",
+            "last_output": (
+                f"工作流在「{stage_label}」阶段异常终止：{err}\n\n"
+                f"📎 已完成步骤: "
+                + ("文件抽取 → " if state.get("analysis_results") else "")
+                + ("大纲生成 → " if state.get("outline") else "")
+                + ("正文生成 → " if state.get("content") else "")
+                + ("文档渲染 → " if state.get("outputs") else "")
+                + (f"❌ 失败于: {stage_label}"
+                   f"{retry_hint}\n\n"
+                   f"📋 恢复信息已保存到 result/{self.task_id}/recovery.json\n"
+                   f"💡 如问题持续，请联系管理员查看日志 (task={self.task_id})")
+            ),
         }
 
     # ── Public API ───────────────────────────────────────────────────────────
@@ -1437,7 +1783,7 @@ class DocumentAgent:
         if human_input_fn is not None:
             self._stored_human_input_fn = human_input_fn
 
-        config = {"configurable": {"thread_id": self.task_id}}
+        config = {"configurable": {"thread_id": self.task_id}, "recursion_limit": GRAPH_RECURSION_LIMIT}
 
         # Build initial graph state, folding in any caller‑set values
         external = self.state
@@ -1504,6 +1850,8 @@ class DocumentAgent:
 
         # Write final state back so callers can read agent.state["output_dir"] etc.
         self.state.update(result)
+        if self.state.get("finished"):
+            _prune_checkpoint(self.task_id)
         return dict(self.state)
 
     def resume(
@@ -1518,7 +1866,7 @@ class DocumentAgent:
         """
         from langgraph.types import Command
 
-        config = {"configurable": {"thread_id": self.task_id}}
+        config = {"configurable": {"thread_id": self.task_id}, "recursion_limit": GRAPH_RECURSION_LIMIT}
 
         try:
             result = self._graph.invoke(
@@ -1536,6 +1884,7 @@ class DocumentAgent:
                 "last_output": f"Agent error: {exc}",
                 "error": str(exc),
             })
+            _prune_checkpoint(self.task_id)
             return dict(self.state)
 
         snapshot = self._graph.get_state(config)
@@ -1543,6 +1892,8 @@ class DocumentAgent:
             return self._handle_interrupt(config, human_input_fn)
 
         self.state.update(result)
+        if self.state.get("finished"):
+            _prune_checkpoint(self.task_id)
         return dict(self.state)
 
     # ── Helpers ──────────────────────────────────────────────────────────────
