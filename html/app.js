@@ -1,4 +1,4 @@
-﻿/* ═══════════════════════════════════════════════════════════════════════
+﻿﻿﻿/* ═══════════════════════════════════════════════════════════════════════
    State
    ═══════════════════════════════════════════════════════════════════════ */
 
@@ -54,12 +54,14 @@ const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").
 
 function toast(msg, kind = "info", ms = 4000) {
   const box = $("toastBox");
+  if (!box) return null;
   const el = document.createElement("div");
   el.className = "toast " + kind;
   el.innerHTML = `<span>${esc(msg)}</span><span class="toast-close">&times;</span>`;
   el.querySelector(".toast-close").onclick = () => el.remove();
   box.appendChild(el);
   if (ms > 0) setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity .3s"; setTimeout(() => el.remove(), 300); }, ms);
+  return el;
 }
 
 /* ── Status ─────────────────────────────────────────────────────────── */
@@ -254,13 +256,25 @@ function setupTabs(containerId) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   API helpers
+   API helpers (with global error interception)
    ═══════════════════════════════════════════════════════════════════════ */
 
 async function apiGet(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `${r.status}`);
-  return r.json();
+  try {
+    const r = await fetch(url);
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      const msg = body.detail || body.error || `服务器错误 (${r.status})`;
+      if (r.status >= 500) toast(msg, "error", 6000);
+      throw new Error(msg);
+    }
+    return r.json();
+  } catch (e) {
+    if (e.name === "TypeError" && e.message.includes("fetch")) {
+      toast("网络连接失败，请检查服务是否运行", "error", 8000);
+    }
+    throw e;
+  }
 }
 
 async function apiPost(url, body) {
@@ -271,9 +285,22 @@ async function apiPost(url, body) {
     opts.headers = { "Content-Type": "application/json" };
     opts.body = JSON.stringify(body);
   }
-  const r = await fetch(url, opts);
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `${r.status}`);
-  return r.json();
+  try {
+    const r = await fetch(url, opts);
+    if (!r.ok) {
+      const resp = await r.json().catch(() => ({}));
+      const msg = resp.detail || resp.error || `服务器错误 (${r.status})`;
+      if (r.status >= 500) toast(msg, "error", 6000);
+      else if (r.status === 409) toast(msg, "warning", 5000);
+      throw new Error(msg);
+    }
+    return r.json();
+  } catch (e) {
+    if (e.name === "TypeError" && e.message.includes("fetch")) {
+      toast("网络连接失败，请检查服务是否运行", "error", 8000);
+    }
+    throw e;
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -2290,6 +2317,201 @@ function renderHistory(items) {
   }
 }
 
+/* ── Embedding health indicator ─────────────────────────────────────── */
+
+async function checkEmbedHealth() {
+  const dot = $("kbEmbedStatus");
+  if (!dot) return;
+  dot.className = "status-dot";
+  dot.title = "嵌入服务状态检测中…";
+  try {
+    const r = await fetch("/api/kb/health", { method: "POST" });
+    const data = await r.json();
+    if (data.ok) {
+      dot.classList.add("ok");
+      dot.title = `嵌入服务正常 (${data.model || "?"}, ${data.dim || "?"}维)`;
+    } else {
+      dot.classList.add("err");
+      dot.title = `嵌入服务异常：${data.error || "未知错误"}。KB 上传和检索功能不可用。`;
+    }
+  } catch (e) {
+    dot.classList.add("err");
+    dot.title = "嵌入服务检测失败，KB 功能可能不可用。";
+  }
+}
+
+/* ── Chat-bar KB controls ───────────────────────────────────────────── */
+
+async function loadChatKbList() {
+  try {
+    const data = await apiGet("/api/kb/list");
+    const sel = $("chatKbSelect");
+    const currentVal = sel.value;
+    sel.innerHTML = '<option value="">不使用KB</option>';
+    for (const kb of (data.kbs || [])) {
+      // Skip registry-only placeholder entries
+      const opt = document.createElement("option");
+      opt.value = kb;
+      opt.textContent = kb;
+      if (currentVal && currentVal === kb) opt.selected = true;
+      sel.appendChild(opt);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+async function onChatKbChange() {
+  const kb = $("chatKbSelect").value;
+  if (!kb) {
+    try {
+      await apiPost("/api/chat", {
+        task_id: S.taskId || "lobby",
+        action: { type: "kb_clear" }
+      });
+    } catch (e) { /* ignore */ }
+    toast("已取消知识库选择", "info", 2000);
+    return;
+  }
+  try {
+    await apiPost("/api/chat", {
+      task_id: S.taskId || "lobby",
+      action: { type: "kb_use", kb: kb }
+    });
+    toast("已切换到知识库：" + kb, "ok", 2000);
+  } catch (e) {
+    toast("切换失败：" + e.message, "error", 3000);
+  }
+}
+
+async function onCreateKb() {
+  const name = prompt("输入新知识库名称（中英文、数字、下划线）：");
+  if (!name || !name.trim()) return;
+  try {
+    await apiPost("/api/kb/create", { kb: name.trim() });
+    await loadChatKbList();
+    $("chatKbSelect").value = name.trim();
+    await onChatKbChange();
+    toast("知识库已创建：" + name.trim(), "ok");
+  } catch (e) {
+    toast("创建失败：" + e.message, "error");
+  }
+}
+
+async function onChatKbUpload() {
+  const files = $("chatKbFiles").files;
+  if (!files.length) return;
+  const kb = $("chatKbSelect").value;
+  if (!kb) { toast("请先选择知识库", "warn"); return; }
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f);
+  fd.append("kb", kb);
+
+  // Clear any stale "thinking" status from previous chat attempts
+  if (S._sending) { S._sending = false; $("btnSend").disabled = false; $("btnSend").textContent = "发送"; $("btnSend").classList.remove("btn-stop"); }
+  setStatus("上传中…", "busy");
+
+  // Show one persistent toast that transitions from "uploading" to "done" or "failed"
+  const progressEl = toast("正在上传 " + files.length + " 个文件到 " + kb + "...", "info", 60000);
+
+  try {
+    const data = await apiPost("/api/kb/upload", fd);
+    // Transition the SAME toast from "uploading" to "done"
+    if (progressEl && progressEl.parentNode) {
+      progressEl.className = "toast ok";
+      progressEl.querySelector("span").textContent = "已上传 " + (data.count || files.length) + " 个文件到知识库 " + kb;
+      setTimeout(() => { if (progressEl.parentNode) progressEl.remove(); }, 4000);
+    } else {
+      toast("已上传 " + (data.count || files.length) + " 个文件到知识库 " + kb, "ok");
+    }
+    $("chatKbFiles").value = "";
+    loadChatKbList().catch(() => {});
+  } catch (e) {
+    // Transition the SAME toast from "uploading" to "failed"
+    if (progressEl && progressEl.parentNode) {
+      progressEl.className = "toast error";
+      progressEl.querySelector("span").textContent = "上传失败：" + e.message;
+      setTimeout(() => { if (progressEl.parentNode) progressEl.remove(); }, 5000);
+    } else {
+      toast("上传失败：" + e.message, "error", 5000);
+    }
+  } finally {
+    setStatus("", "ok");
+  }
+}
+
+/* ── Slash command autocomplete ──────────────────────────────────────── */
+
+const SLASH_COMMANDS = [
+  { cmd: "/kb ask",    desc: "KB智能问答",   usage: "/kb ask <问题>" },
+  { cmd: "/kb use",    desc: "选择知识库",   usage: "/kb use <名称>" },
+  { cmd: "/kb list",   desc: "列出知识库",   usage: "/kb list" },
+  { cmd: "/kb clear",  desc: "取消知识库",   usage: "/kb clear" },
+  { cmd: "/kb stats",  desc: "KB统计信息",   usage: "/kb stats [名称]" },
+  { cmd: "/regen",     desc: "重新生成报告", usage: "/regen [doc|all|章节]" },
+  { cmd: "/gen",       desc: "开始生成报告", usage: "/gen <需求描述>" },
+  { cmd: "/prompt",    desc: "更新生成需求", usage: "/prompt <文本>" },
+  { cmd: "/prompt!",   desc: "更新并重跑",   usage: "/prompt! <文本>" },
+  { cmd: "/status",    desc: "查看任务状态", usage: "/status" },
+  { cmd: "/pause",     desc: "暂停任务",     usage: "/pause" },
+  { cmd: "/resume",    desc: "继续任务",     usage: "/resume" },
+  { cmd: "/cancel",    desc: "取消任务",     usage: "/cancel" },
+  { cmd: "/help",      desc: "查看所有指令", usage: "/help" },
+  { cmd: "/files",     desc: "查看上传文件", usage: "/files" },
+  { cmd: "/templates", desc: "查看可用模板", usage: "/templates" },
+  { cmd: "/append",    desc: "追加文件说明", usage: "/append" },
+];
+
+function onChatInput() {
+  const val = $("chatInput").value;
+  if (!val.startsWith("/")) { hideSlashPanel(); return; }
+
+  const query = val.slice(1).toLowerCase();
+  const matches = SLASH_COMMANDS.filter(c => c.cmd.includes(query) || c.desc.includes(query));
+  if (!matches.length) { hideSlashPanel(); return; }
+
+  const panel = $("slashPanel");
+  panel.innerHTML = matches.map((c, i) =>
+    `<div class="slash-item${i === 0 ? ' active' : ''}" data-cmd="${esc(c.usage || c.cmd)}" data-idx="${i}">
+      <span class="cmd">${esc(c.cmd)}</span>
+      <span class="desc">${esc(c.desc)}</span>
+    </div>`
+  ).join("");
+  panel.style.display = "block";
+
+  // Click to select
+  panel.querySelectorAll(".slash-item").forEach(el => {
+    el.addEventListener("click", () => {
+      $("chatInput").value = el.dataset.cmd + " ";
+      hideSlashPanel();
+      $("chatInput").focus();
+    });
+  });
+}
+
+function hideSlashPanel() { $("slashPanel").style.display = "none"; }
+function slashPanelVisible() { return $("slashPanel").style.display === "block"; }
+
+function moveSlashSelection(dir) {
+  if (!slashPanelVisible()) return;
+  const items = $("slashPanel").querySelectorAll(".slash-item");
+  const active = $("slashPanel").querySelector(".slash-item.active");
+  let idx = active ? parseInt(active.dataset.idx) : -1;
+  idx += dir;
+  if (idx < 0) idx = items.length - 1;
+  if (idx >= items.length) idx = 0;
+  items.forEach(el => el.classList.remove("active"));
+  items[idx].classList.add("active");
+  items[idx].scrollIntoView({ block: "nearest" });
+}
+
+function selectActiveSlashItem() {
+  const active = $("slashPanel").querySelector(".slash-item.active");
+  if (active) {
+    $("chatInput").value = active.dataset.cmd + " ";
+    hideSlashPanel();
+    $("chatInput").focus();
+  }
+}
+
 /* ── Send chat ──────────────────────────────────────────────────────── */
 
 async function sendChat() {
@@ -2429,25 +2651,68 @@ async function sendChat() {
 
   S.history.push({ role: "user", content: msg });
   setStatus("思考中…", "busy");
-  $("btnSend").disabled = true;
+
+  // ── Thinking indicator ──────────────────────────────────────────
+  let thinkingEl = null;
+  const chatBox = $("chatLog");
+  try {
+    thinkingEl = document.createElement("div");
+    thinkingEl.className = "msg-thinking";
+    thinkingEl.innerHTML = '<span>思考中</span><span class="dots"><span></span><span></span><span></span></span>';
+    if (chatBox) {
+      chatBox.appendChild(thinkingEl);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+  } catch (e) { console.error("showThinking failed:", e); }
+
+  // ── Cancel / stop button ─────────────────────────────────────────
+  const btn = $("btnSend");
+  const origText = btn.textContent;
+  btn.textContent = "停止";
+  btn.classList.add("btn-stop");
+  btn.disabled = false;
+
+  const abortCtrl = new AbortController();
+  let userStopped = false;
+  let timeoutFired = false;
+  const chatTimeout = setTimeout(() => {
+    timeoutFired = true;
+    abortCtrl.abort();
+  }, 60000);
+  function stopStream() {
+    userStopped = true;
+    abortCtrl.abort();
+    if (thinkingEl && thinkingEl.parentNode) thinkingEl.remove();
+    thinkingEl = null;
+    btn.textContent = origText;
+    btn.classList.remove("btn-stop");
+    btn.disabled = false;
+    btn.onclick = sendChat;
+    S._sending = false;
+    setStatus("", "ok");
+  }
+  btn.onclick = stopStream;
 
   try {
     const r = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task_id: S.taskId, message: msg, history: S.history }),
+      body: JSON.stringify({ task_id: S.taskId || "lobby", message: msg, history: S.history }),
+      signal: abortCtrl.signal,
     });
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
-      const err = d.error || "对话失败";
+      const err = d.error || d.detail || `对话失败 (${r.status})`;
       addMsg("assistant", "❌ " + err);
       setStatus(err, "err");
-      $("btnSend").disabled = false;
+      if (r.status >= 500) toast("对话服务异常: " + err, "error", 6000);
       return;
     }
 
-    // Detect action responses (JSON) vs SSE streaming
     const contentType = r.headers.get("content-type") || "";
+    // Remove thinking indicator as soon as we have a response
+    if (thinkingEl && thinkingEl.parentNode) { thinkingEl.remove(); thinkingEl = null; }
+
     if (contentType.includes("application/json")) {
       const data = await r.json();
       if (data.reply) {
@@ -2460,17 +2725,13 @@ async function sendChat() {
         $("previewBox").textContent = "";
         startPolling();
         await pollStatus();
-      } else {
-        setStatus("", "ok");
       }
-      $("btnSend").disabled = false;
       return;
     }
 
     const reader = r.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    setStatus("", "ok");
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -2483,24 +2744,45 @@ async function sendChat() {
         if (payload === "[DONE]") {
           const fullReply = finalizeStreamBubble();
           if (fullReply) S.history.push({ role: "assistant", content: fullReply });
-          setStatus("", "ok");
           break;
         }
         try {
           const obj = JSON.parse(payload);
           if (obj.token) appendStreamToken(obj.token);
           else if (obj.status === "streaming") { setStatus("输出中…", "ok"); ensureStreamBubble(); }
-          else if (obj.error) { addMsg("assistant", "❌ " + obj.error); setStatus(obj.error, "err"); }
+          else if (obj.error) { addMsg("assistant", "❌ " + obj.error); }
         } catch {}
       }
     }
     await pollStatus();
   } catch (e) {
-    addMsg("assistant", "❌ 请求异常: " + e.message);
-    setStatus(e.message, "err");
+    if (e.name === "AbortError") {
+      if (timeoutFired && !userStopped) {
+        const timeoutMsg = "对话响应超时（60s），请检查后端服务或模型连接后重试。";
+        addMsg("assistant", "❌ " + timeoutMsg);
+        setStatus("对话响应超时", "err");
+        toast(timeoutMsg, "warning", 6000);
+      }
+    } else if (e.name === "TypeError" && e.message.includes("fetch")) {
+      const netMsg = "网络连接失败，请确认服务已启动。";
+      addMsg("assistant", "❌ " + netMsg);
+      setStatus("连接失败", "err");
+      toast(netMsg, "error", 8000);
+    } else {
+      console.error("sendChat error:", e);
+      addMsg("assistant", "❌ 请求异常: " + e.message);
+      toast("对话异常: " + e.message, "error", 5000);
+    }
   } finally {
-    $("btnSend").disabled = false;
+    clearTimeout(chatTimeout);
+    if (thinkingEl && thinkingEl.parentNode) thinkingEl.remove();
+    thinkingEl = null;
+    btn.textContent = origText;
+    btn.classList.remove("btn-stop");
+    btn.disabled = false;
+    btn.onclick = sendChat;
     S._sending = false;
+    if (!timeoutFired || userStopped) setStatus("", "ok");
   }
 }
 
@@ -3229,7 +3511,29 @@ function init() {
 
   // Chat
   $("btnSend").addEventListener("click", sendChat);
-  $("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+  $("chatInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      if (slashPanelVisible()) { e.preventDefault(); selectActiveSlashItem(); return; }
+      sendChat();
+      return;
+    }
+    if (e.key === "ArrowDown") { e.preventDefault(); moveSlashSelection(1); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); moveSlashSelection(-1); return; }
+    if (e.key === "Escape") { hideSlashPanel(); return; }
+  });
+  $("chatInput").addEventListener("input", onChatInput);
+
+  // Chat-bar KB controls
+  loadChatKbList().catch(() => {});
+  checkEmbedHealth().catch(() => {});
+  $("chatKbSelect").addEventListener("change", onChatKbChange);
+  $("btnChatKbCreate").addEventListener("click", onCreateKb);
+  $("btnChatKbUpload").addEventListener("click", () => {
+    const kb = $("chatKbSelect").value;
+    if (!kb) { toast("请先选择或创建一个知识库", "warn"); return; }
+    $("chatKbFiles").click();
+  });
+  $("chatKbFiles").addEventListener("change", onChatKbUpload);
 
   // Task
   $("btnLoadTask").addEventListener("click", loadTaskById);

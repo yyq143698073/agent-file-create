@@ -1,0 +1,21 @@
+# ── .dockerignore ── keep the Docker image lean
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+result/
+*.db
+.env.local
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+test_doc/
+temp/
+.Dataset/
+*.pdf
+*.docx
+*.xlsx
+*.pptx

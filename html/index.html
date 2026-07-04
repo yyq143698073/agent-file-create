@@ -187,7 +187,7 @@
 
         <!-- KB Card -->
         <section class="card">
-          <h2 class="card-title">📚 知识库</h2>
+          <h2 class="card-title">📚 知识库 <span id="kbEmbedStatus" class="status-dot" title="嵌入服务状态检测中…"></span></h2>
           <div class="tabs" id="kbTabs">
             <button class="tab active" data-tab="kb-query">智能问答</button>
             <button class="tab" data-tab="kb-upload">文档入库</button>
@@ -272,7 +272,14 @@
               </div>
             </div>
           </div>
-          <div class="chat-bar">
+          <div class="chat-bar" style="position:relative">
+            <div id="slashPanel" class="slash-panel" style="display:none"></div>
+            <select id="chatKbSelect" class="select select-sm" title="选择对话使用的知识库" style="max-width:120px">
+              <option value="">不使用KB</option>
+            </select>
+            <button id="btnChatKbCreate" class="btn btn-outline btn-sm" title="新建知识库">+ 新建</button>
+            <button id="btnChatKbUpload" class="btn btn-outline btn-sm" title="上传文件到当前知识库">📎 上传</button>
+            <input type="file" id="chatKbFiles" class="file-in" multiple hidden />
             <input id="chatInput" type="text" class="input" placeholder="输入消息，Enter 发送..." />
             <button id="btnSend" class="btn btn-primary">发送</button>
           </div>
@@ -366,6 +373,9 @@
       </main>
     </div>
 
-    <script src="/static/app.js"></script>
+    <!-- ES Modules — state, api, bridge (exposes window.api / window.store) -->
+    <script type="module" src="/static/js/bridge.js?v=8"></script>
+    <!-- Legacy monolithic script (uses global S, $, esc, apiGet, apiPost) -->
+    <script src="/static/app.js?v=8"></script>
   </body>
 </html>

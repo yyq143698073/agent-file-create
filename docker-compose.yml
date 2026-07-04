@@ -1,0 +1,49 @@
+# ── Full-stack agent-file-create + Ollama ──────────────────────────────────
+# Start:  docker compose up -d
+# Stop:   docker compose down
+#
+# On first run, pull the embedding model:
+#   docker compose exec ollama ollama pull bge-m3:latest
+#
+# Configure via .env or environment variables in this file.
+
+version: "3.9"
+
+services:
+  # ── Ollama LLM service ────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: afc-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Remove the `deploy` block above if you don't have an NVIDIA GPU.
+
+  # ── agent-file-create web app ──────────────────────────────────────────
+  app:
+    build: .
+    container_name: afc-app
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ./result:/app/result
+      - ./resource:/app/resource
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
