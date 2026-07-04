@@ -72,3 +72,82 @@ RERANK_ENABLED = str(os.getenv("RERANK_ENABLED", "true")).strip().lower() in {"1
 RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3").strip()
 RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "20"))
 RERANK_FINAL_K = int(os.getenv("RERANK_FINAL_K", "8"))
+
+# ── Version retention ──
+VERSION_MAX_RETENTION = int(os.getenv("VERSION_MAX_RETENTION", "20"))
+
+# ── Content / prompt limits (centralized from scattered magic numbers) ──
+SOURCE_DIGEST_MAX_CHARS = int(os.getenv("SOURCE_DIGEST_MAX_CHARS", "3000"))
+CONTENT_PREVIEW_CHARS = int(os.getenv("CONTENT_PREVIEW_CHARS", "4000"))
+CHAT_MSG_MAX_CHARS = int(os.getenv("CHAT_MSG_MAX_CHARS", "2000"))
+SECTION_BODY_MAX_CHARS = int(os.getenv("SECTION_BODY_MAX_CHARS", "800"))
+ERROR_MSG_MAX_CHARS = int(os.getenv("ERROR_MSG_MAX_CHARS", "240"))
+SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "120"))
+CHAT_HISTORY_MAX_MSGS = int(os.getenv("CHAT_HISTORY_MAX_MSGS", "50"))
+RERANK_CHUNK_MAX_CHARS = int(os.getenv("RERANK_CHUNK_MAX_CHARS", "400"))
+
+# ── Graph execution limits ──
+GRAPH_RECURSION_LIMIT = int(os.getenv("GRAPH_RECURSION_LIMIT", "100"))
+
+# ── Quality gate thresholds ─────────────────────────────────────────────────
+EVAL_MIN_FAITHFULNESS = float(os.getenv("EVAL_MIN_FAITHFULNESS", "0.6"))
+EVAL_MIN_COMPLETENESS = float(os.getenv("EVAL_MIN_COMPLETENESS", "0.5"))
+EVAL_AUTO_RETRY = str(os.getenv("EVAL_AUTO_RETRY", "true")).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+# ── Startup validation ────────────────────────────────────────────────────
+
+def validate_config() -> list[str]:
+    """Validate configuration at startup. Returns list of error messages.
+
+    Call this from main() entry points before starting any work.
+    An empty list means all checks passed.
+    """
+    errors: list[str] = []
+
+    # ── Content LLM (primary generation path) ──
+    if CONTENT_API_STYLE in ("openai",):
+        if not CONTENT_API_KEY:
+            errors.append("CONTENT_API_KEY is required when CONTENT_API_STYLE=openai")
+    if not CONTENT_MODEL_NAME:
+        errors.append("CONTENT_MODEL_NAME is required (cannot be empty)")
+
+    # ── Outline LLM ──
+    if not OUTLINE_MODEL_NAME:
+        errors.append("OUTLINE_MODEL_NAME is required (cannot be empty)")
+
+    # ── Embedding ──
+    _valid_embed_styles = {"ollama", "openai", ""}
+    if EMBED_API_STYLE not in _valid_embed_styles:
+        errors.append(
+            f"EMBED_API_STYLE='{EMBED_API_STYLE}' is invalid. "
+            f"Valid values: {sorted(_valid_embed_styles)}"
+        )
+
+    # ── Planner LLM (optional but warn if unset) ──
+    if not PLANNER_API_STYLE:
+        import logging
+        _log = logging.getLogger(__name__)
+        _log.warning(
+            "PLANNER_API_STYLE is empty — planner features (RAG / skill selection) "
+            "will fall back to CONTENT_API_STYLE"
+        )
+
+    # ── Numeric range checks ──
+    if not (1 <= MAX_WORKERS_DEFAULT <= 64):
+        errors.append(
+            f"MAX_WORKERS_DEFAULT={MAX_WORKERS_DEFAULT} is out of range (1-64)"
+        )
+    if not (1 <= KB_HNSW_EF_SEARCH <= 1024):
+        errors.append(
+            f"KB_HNSW_EF_SEARCH={KB_HNSW_EF_SEARCH} is out of range (1-1024)"
+        )
+    for _name, _val in (
+        ("MODEL_TIMEOUT", MODEL_TIMEOUT),
+        ("MODEL_TIMEOUT_SHORT", MODEL_TIMEOUT_SHORT),
+        ("MODEL_TIMEOUT_LONG", MODEL_TIMEOUT_LONG),
+    ):
+        if not (5 <= _val <= 600):
+            errors.append(f"{_name}={_val} is out of range (5-600)")
+
+    return errors

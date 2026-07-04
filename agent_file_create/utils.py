@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from agent_file_create.errors import LLMCallError
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,7 +58,12 @@ def retry_call(
     backoff: float = 2.0,
     **kwargs: Any,
 ) -> Any:
-    """Call ``fn(*args, **kwargs)`` with exponential backoff on exception."""
+    """Call ``fn(*args, **kwargs)`` with exponential backoff on exception.
+
+    Raises LLMCallError if all retries are exhausted, so callers can catch
+    it uniformly and decide whether to use fallback content or abort.
+    """
+    fn_name = getattr(fn, "__name__", str(fn))
     last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
@@ -69,12 +76,15 @@ def retry_call(
                     "retry %d/%d for %s: %s, waiting %.1fs",
                     attempt + 1,
                     max_retries,
-                    getattr(fn, "__name__", str(fn)),
+                    fn_name,
                     exc,
                     wait,
                 )
                 time.sleep(wait)
-    raise last_error  # type: ignore[misc]
+    raise LLMCallError(
+        f"{fn_name} failed after {max_retries} retries: {last_error}",
+        attempt=max_retries,
+    ) from last_error
 
 
 def safe_json(obj: Any, max_len: int = 2000) -> str:
