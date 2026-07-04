@@ -43,6 +43,11 @@ class KnowledgeBase(SearchMixin, QueryMixin, AnswerMixin):
 
     # ── Admin / CRUD ──────────────────────────────────────────────────────────
 
+    def register_kb(self, kb: str) -> None:
+        """Register a new (empty) KB name. Idempotent — no-op if already exists."""
+        kb2 = _normalize_kb(kb)
+        self.store.register_kb(kb2)
+
     def list_kb(self) -> list[str]:
         return self.store.list_kb()
 
@@ -144,6 +149,41 @@ class KnowledgeBase(SearchMixin, QueryMixin, AnswerMixin):
 
     # ── Embedding Health ──────────────────────────────────────────────────────
 
+    def reembed_kb(self, *, kb: str, doc_id: str | None = None) -> dict:
+        """Re-embed all chunks with empty/null vectors in a KB (or specific doc).
+
+        Use this to repair data that was ingested while the embedding service was down.
+        """
+        from agent_file_create.rag.embedder import embed_texts
+
+        kb2 = _normalize_kb(kb)
+        # Health check first
+        health = self.check_embed_health()
+        if not health.get("ok"):
+            return {"kb": kb2, "ok": False, "fixed": 0, "error": "embedding 服务不可用，请先启动 Ollama 和 bge-m3"}
+
+        chunks = self.store.get_chunks_with_empty_embedding(kb=kb2, doc_id=doc_id)
+        if not chunks:
+            return {"kb": kb2, "ok": True, "fixed": 0, "message": "没有发现空向量 chunk"}
+
+        logger.info("reembed_start kb=%s chunks=%d", kb2, len(chunks))
+        texts = [c["content"] for c in chunks]
+        vecs = embed_texts(texts, timeout_s=90, max_batch=4)
+
+        fixed = 0
+        for i, c in enumerate(chunks):
+            if i < len(vecs) and vecs[i]:
+                try:
+                    self.store.update_chunk_embedding(kb=kb2, chunk_id=c["chunk_id"], embedding=vecs[i])
+                    fixed += 1
+                except Exception as e:
+                    logger.warning("reembed_chunk_failed chunk=%s err=%s", c["chunk_id"], str(e)[:100])
+            else:
+                logger.warning("reembed_empty_vector chunk=%s idx=%d", c["chunk_id"], i)
+
+        logger.info("reembed_done kb=%s fixed=%d/%d", kb2, fixed, len(chunks))
+        return {"kb": kb2, "ok": True, "fixed": fixed, "total": len(chunks)}
+
     def check_embed_health(self) -> dict:
         """Validate embedding model connectivity."""
         try:
@@ -188,7 +228,7 @@ class KnowledgeBase(SearchMixin, QueryMixin, AnswerMixin):
         if is_review and not is_methods:
             _tc, _oc = 1000, 150
         elif is_methods and not is_review:
-            _tc, _oc = 500, 80
+            _tc, _oc = 700, 120  # was 500,80 — too small, produced semantically weak chunks
         else:
             _tc, _oc = 700, 100
 
@@ -227,6 +267,17 @@ class KnowledgeBase(SearchMixin, QueryMixin, AnswerMixin):
                 uncached_idxs.append(i)
 
         embedding_ok = True
+
+        # ── P0: Health check before embedding ─────────────────────────
+        if uncached_idxs:
+            health = self.check_embed_health()
+            if not health.get("ok"):
+                logger.error("ingest_abort embedding_unavailable kb=%s file=%s", kb2, p.name)
+                return {
+                    "kb": kb2, "doc_id": did, "ok": False,
+                    "error": "embedding 服务不可用（请确认 Ollama 已启动且 bge-m3 模型已加载），文件未入库。",
+                }
+
         if uncached_idxs:
             logger.info(f"kb_embedding_start kb={kb2} file={p.name} new_chunks={len(uncached_idxs)} cached={len(chunks)-len(uncached_idxs)} total={len(chunks)}")
             try:
@@ -245,7 +296,15 @@ class KnowledgeBase(SearchMixin, QueryMixin, AnswerMixin):
                     logger.info(f"kb_embedding_mismatch kb={kb2} file={p.name} expected={len(uncached_idxs)} got={len(fresh_vecs)}")
             except Exception as e:
                 embedding_ok = False
-                logger.info(f"kb_embedding_failed kb={kb2} file={p.name} err={str(e)[:120]}")
+                logger.warning("kb_embedding_failed kb=%s file=%s err=%s", kb2, p.name, str(e)[:120])
+
+        # ── P0: Clean up on embedding failure — don't leave dead chunks with empty vectors ──
+        if not embedding_ok and uncached_idxs:
+            logger.warning("ingest_cleanup_empty_vectors kb=%s doc=%s chunks=%d", kb2, did, len(chunks))
+            return {
+                "kb": kb2, "doc_id": did, "ok": False,
+                "error": "embedding 生成失败，已跳过入库。请确认 Ollama/bge-m3 运行正常后重试。",
+            }
 
         dtype = str(doc_type or "").strip()
         meta_doc = {"file_name": p.name, "doc_type": dtype, "file_ext": p.suffix.lower().lstrip("."), "lang": "en" if re.search(r"[A-Za-z]", text[:800]) else "zh"}

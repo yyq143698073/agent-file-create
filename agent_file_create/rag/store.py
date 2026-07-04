@@ -56,6 +56,22 @@ class Hit:
 
 
 class SQLiteVectorStore:
+    def register_kb(self, kb: str) -> None:
+        """Register a new (empty) KB so it appears in list_kb()."""
+        import time as _time
+        conn = self._conn()
+        try:
+            ts = float(_time.time())
+            cur = conn.cursor()
+            cur.execute(
+                "insert or ignore into kb_docs(id,kb,title,source,meta_json,updated_at) "
+                "values(?,?,?,?,?,?)",
+                (f"__registry__{kb}", kb, kb, "", "{}", ts),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def __init__(self, *, db_path: str | None = None) -> None:
         base_dir = Path(__file__).resolve().parent.parent.parent
         p = str(db_path or KB_DB_PATH or "result/kb.db").strip()
@@ -135,6 +151,45 @@ class SQLiteVectorStore:
                 "insert or replace into kb_docs(id,kb,title,source,meta_json,updated_at) values(?,?,?,?,?,?)",
                 (doc_id, kb, title, source, _safe_json(meta or {}), ts),
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_chunks_with_empty_embedding(self, *, kb: str, doc_id: str | None = None) -> list[dict]:
+        """SQLite: return chunks whose embedding_json is empty/null."""
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            if doc_id:
+                cur.execute(
+                    "select id,kb,doc_id,chunk_index,section_path,content,embedding_json,meta_json "
+                    "from kb_chunks where kb=? and doc_id=? and (embedding_json='[]' or embedding_json is null or embedding_json='')",
+                    (kb, str(doc_id)),
+                )
+            else:
+                cur.execute(
+                    "select id,kb,doc_id,chunk_index,section_path,content,embedding_json,meta_json "
+                    "from kb_chunks where kb=? and (embedding_json='[]' or embedding_json is null or embedding_json='')",
+                    (kb,),
+                )
+            rows = cur.fetchall() or []
+            return [
+                {"chunk_id": str(r[0] or ""), "kb": str(r[1] or ""), "doc_id": str(r[2] or ""),
+                 "chunk_index": int(r[3] or 0), "section_path": str(r[4] or ""),
+                 "content": str(r[5] or ""), "embedding_json": str(r[6] or ""),
+                 "meta_json": str(r[7] or "")}
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def update_chunk_embedding(self, *, kb: str, chunk_id: str, embedding: list[float]) -> None:
+        """SQLite: update a single chunk's embedding_json."""
+        import json as _json
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("update kb_chunks set embedding_json=? where id=?", (_json.dumps(embedding), str(chunk_id)))
             conn.commit()
         finally:
             conn.close()
@@ -287,6 +342,7 @@ class SQLiteVectorStore:
         query_embedding: list[float],
         top_k: int = 8,
         doc_id: Optional[str] = None,
+        filters: Optional[dict] = None,
     ) -> list[Hit]:
         kb = str(kb or "").strip() or "default"
         top_k = max(1, int(top_k or 0))
@@ -306,6 +362,28 @@ class SQLiteVectorStore:
             rows = cur.fetchall() or []
         finally:
             conn.close()
+
+        # Apply post-query filters for doc_type, source, section_path (SQLite lacks WHERE clause support for these)
+        if filters:
+            import json as _json
+            filtered_rows = []
+            for r in rows:
+                try:
+                    meta = _json.loads(str(r[7] or "{}")) if r[7] else {}
+                except Exception:
+                    meta = {}
+                ok = True
+                if filters.get("doc_type") and str(meta.get("doc_type") or "") != str(filters["doc_type"]):
+                    ok = False
+                if filters.get("source") and str(meta.get("source") or "") != str(filters["source"]):
+                    ok = False
+                if filters.get("section_path"):
+                    sp = str(r[5] or "")
+                    if str(filters["section_path"]) not in sp:
+                        ok = False
+                if ok:
+                    filtered_rows.append(r)
+            rows = filtered_rows
 
         hits: list[Hit] = []
         for r in rows:
@@ -460,6 +538,23 @@ def _vec_literal(vec: list[float]) -> Optional[str]:
 
 
 class PostgresVectorStore:
+    def register_kb(self, kb: str) -> None:
+        """Register a new (empty) KB so it appears in list_kb()."""
+        import json as _json
+        from datetime import datetime, timezone
+        conn = self._conn()
+        try:
+            now = datetime.now(timezone.utc)
+            cur = conn.cursor()
+            cur.execute(
+                "insert into kb_docs(id,kb,title,source,doc_type,meta,updated_at) "
+                "values(%s,%s,%s,%s,%s,%s,%s) on conflict do nothing",
+                (f"__registry__{kb}", kb, kb, "", "", _json.dumps({}), now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def __init__(self, *, db_url: str | None = None, index_type: str | None = None) -> None:
         self.db_url = str(db_url or KB_DB_URL or DB_URL or "").strip()
         if not _is_postgres_url(self.db_url):
@@ -597,6 +692,43 @@ class PostgresVectorStore:
         try:
             cur = conn.cursor()
             cur.execute("delete from kb_chunks where kb=%s and doc_id=%s", (kb, did))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_chunks_with_empty_embedding(self, *, kb: str, doc_id: str | None = None) -> list[dict]:
+        """Postgres: return chunks whose embedding is null or zero-dimensional."""
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            if doc_id:
+                cur.execute(
+                    "select id,kb,doc_id,chunk_index,section_path,content,meta "
+                    "from kb_chunks where kb=%s and doc_id=%s and (embedding is null or vector_dims(embedding) = 0)",
+                    (kb, str(doc_id)),
+                )
+            else:
+                cur.execute(
+                    "select id,kb,doc_id,chunk_index,section_path,content,meta "
+                    "from kb_chunks where kb=%s and (embedding is null or vector_dims(embedding) = 0)",
+                    (kb,),
+                )
+            rows = cur.fetchall() or []
+            return [
+                {"chunk_id": str(r[0] or ""), "kb": str(r[1] or ""), "doc_id": str(r[2] or ""),
+                 "chunk_index": int(r[3] or 0), "section_path": str(r[4] or ""),
+                 "content": str(r[5] or ""), "meta": r[6] if r[6] else {}}
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def update_chunk_embedding(self, *, kb: str, chunk_id: str, embedding: list[float]) -> None:
+        """Postgres: update a single chunk's embedding vector."""
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("update kb_chunks set embedding=%s::vector where id=%s", (embedding, str(chunk_id)))
             conn.commit()
         finally:
             conn.close()

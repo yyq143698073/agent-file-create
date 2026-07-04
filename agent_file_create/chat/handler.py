@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import re
 import threading
 from pathlib import Path
@@ -9,6 +10,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
 from agent_file_create.chat.history import TaskChatMessageHistory
+from agent_file_create.chat.intent import ChatIntent, classify_intent
 from agent_file_create.prompts import (
     FOLLOWUPS_PROMPT,
     REWRITE_QUERY_PROMPT,
@@ -35,18 +37,29 @@ class ChatHandler:
         self._task_manager = task_manager or TaskManager()
         self._regenerate_fn = regenerate_fn  # callable(task_id, mode) -> (bool, str)
 
-        self._shared_llm = get_chat_model(
+        # Chat LLM — higher token budget for substantive replies
+        self._chat_llm = get_chat_model(
             style=CONTENT_API_STYLE,
             model=CONTENT_MODEL_NAME,
             endpoint=CONTENT_API_ENDPOINT,
             api_key=CONTENT_API_KEY,
             temperature=0.3,
-            max_tokens=420,
+            max_tokens=800,
             timeout_s=120,
         )
+        # Light LLM — for follow-ups, summaries, query rewriting (short outputs)
+        self._short_llm = get_chat_model(
+            style=CONTENT_API_STYLE,
+            model=CONTENT_MODEL_NAME,
+            endpoint=CONTENT_API_ENDPOINT,
+            api_key=CONTENT_API_KEY,
+            temperature=0.3,
+            max_tokens=200,
+            timeout_s=30,
+        )
 
-        _lobby_chain = lobby_prompt | self._shared_llm | StrOutputParser()
-        _task_chain = task_chat_prompt | self._shared_llm | StrOutputParser()
+        _lobby_chain = lobby_prompt | self._chat_llm | StrOutputParser()
+        _task_chain = task_chat_prompt | self._chat_llm | StrOutputParser()
 
         def _get_session_history(session_id: str):
             return TaskChatMessageHistory(session_id, self._task_manager)
@@ -77,8 +90,32 @@ class ChatHandler:
             return s[:max_len] + "…"
         return s
 
-    def _tokenize(self, text: str) -> list[str]:
-        xs = re.findall(r"[一-鿿A-Za-z0-9]{2,}", str(text or ""))
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        """Extract keywords via jieba (semantic) + regex (technical terms)."""
+        t = str(text or "").strip()
+        if not t:
+            return []
+        words: list[str] = []
+        try:
+            import jieba
+            for w in jieba.cut(t):
+                w = w.strip()
+                if len(w) >= 2 and not all(ch in "，。！？；：""''（）…— \t\n\r" for ch in w):
+                    words.append(w)
+        except ImportError:
+            pass
+        # Also extract technical tokens (English words, numbers, acronyms)
+        tech = re.findall(r"[A-Za-z0-9_-]{2,}", t)
+        # Deduplicate, cap at 18
+        seen = set()
+        out: list[str] = []
+        for w in words + tech:
+            wl = w.lower()
+            if wl not in seen and len(w) >= 2:
+                seen.add(wl)
+                out.append(w)
+        return out[:18]
         out: list[str] = []
         seen = set()
         for x in xs:
@@ -122,17 +159,30 @@ class ChatHandler:
         for title, body in secs:
             hay = (title + "\n" + body).lower()
             score = 0
+            # Title match bonus: if any token appears in the section title, it's likely relevant
+            title_lower = title.lower()
             for tok in q_tokens:
-                if tok and tok in hay:
+                tl = tok.lower()
+                if tl and len(tl) >= 2 and tl in hay:
                     score += 1
+                    if tl in title_lower:
+                        score += 2  # extra weight for title match
             if score > 0:
                 scored.append((score, title, body))
         scored.sort(key=lambda x: (-x[0], len(x[2])))
         out: list[str] = []
-        for _, title, body in scored[:max_sections]:
-            block = ("## " + title + "\n" + (body or "")).strip()
+        for idx, (_, title, body) in enumerate(scored[:max_sections]):
+            block = (f"## [{idx + 1}] {title}\n" + (body or "")).strip()
             if len(block) > max_chars:
-                block = block[:max_chars] + "…"
+                # Truncate at last sentence boundary
+                cut = block[:max_chars]
+                last_period = max(cut.rfind("。"), cut.rfind(".\n"), cut.rfind(".\r"))
+                last_break = max(cut.rfind("\n\n"), cut.rfind("\n"))
+                boundary = max(last_period, last_break)
+                if boundary > max_chars * 0.6:  # only use boundary if it's not too early
+                    block = cut[:boundary + 1] + "\n…"
+                else:
+                    block = cut + "…"
             out.append(block)
         return "\n\n".join(out).strip()
 
@@ -180,6 +230,43 @@ class ChatHandler:
                     pass
         return outline, content
 
+    _GEN_INTENT_PATTERNS = [
+        "生成", "写", "帮我写", "帮我做", "帮我生成", "写一份", "写一个",
+        "做一份", "做报告", "做文档", "出报告", "出文档",
+    ]
+
+    def _guide_task_creation(self, message: str) -> str | None:
+        """When user expresses intent to generate a report but has no task yet,
+        return a guided response instead of a generic chat reply."""
+        m = (message or "").strip()
+        if not m:
+            return None
+        if m.startswith("/"):
+            return None
+        # Check for generation intent keywords
+        if not any(kw in m for kw in self._GEN_INTENT_PATTERNS):
+            return None
+        # Only trigger for reasonably specific requests (not just "写报告")
+        if len(m) < 10:
+            return None
+
+        help_cmds = self._help_text()
+        return (
+            f"好的！我注意到你想要生成一份报告。按以下步骤开始：\n\n"
+            f"**1️⃣ 上传材料**\n"
+            f"将相关文件拖拽到左侧上传区域，或点击「选择文件」按钮。\n\n"
+            f"**2️⃣（可选）选择模板**\n"
+            f"在左侧上传区选择模板文件，或从已保存模板中挑选。\n\n"
+            f"**3️⃣ 发送生成命令**\n"
+            f"材料准备好后，发送：\n"
+            f"`/gen {m[:120]}`\n\n"
+            f"**💡 也可以先搜知识库**\n"
+            f"如果左侧有知识库，发送 `/kb use <知识库名>` 选择知识库，\n"
+            f"然后 `/kb ask <你的问题>` 查找相关资料。\n\n"
+            f"---\n"
+            f"其他可用指令：\n{help_cmds}"
+        )
+
     def _help_text(self) -> str:
         return "\n".join(
             [
@@ -196,7 +283,9 @@ class ChatHandler:
                 "- /files：查看已上传文件",
                 "- /templates：查看可用模板",
                 "- /append：提示如何追加文件/模板到当前任务",
+                "- /kb ask <问题>：在知识库中检索并回答",
                 "- /kb list：列出知识库",
+                "- /kb docs [kb]：查看知识库中已上传的文件",
                 "- /kb use <kb>：选择知识库用于问答",
                 "- /kb clear：取消知识库选择",
                 "- /kb stats [kb]：查看知识库统计（文档数、chunk数）",
@@ -272,6 +361,14 @@ class ChatHandler:
                 if sub == "stats":
                     name = (parts[2].strip() if len(parts) >= 3 else "default").strip() or "default"
                     return {"type": "kb_stats", "kb": name}
+                if sub in {"ask", "query", "q"}:
+                    question = " ".join(parts[2:]).strip() if len(parts) >= 3 else ""
+                    if not question:
+                        return {"type": "help"}
+                    return {"type": "kb_ask", "question": question}
+                if sub in {"docs", "files"}:
+                    name = (parts[2].strip() if len(parts) >= 3 else "").strip()
+                    return {"type": "kb_docs", "kb": name}
                 if sub == "delete":
                     name = (parts[2].strip() if len(parts) >= 3 else "").strip()
                     if not name:
@@ -334,10 +431,35 @@ class ChatHandler:
             if not kb:
                 return "用法：/kb use <kb>"
             self._task_manager.write_task_meta(task_id, {"active_kb": kb})
-            return f"已选择知识库：{kb}。后续提问会优先使用该知识库检索。"
+            return f"好，后面聊到相关问题时我会先去 {kb} 知识库里查一下。"
         if typ == "kb_clear":
             self._task_manager.write_task_meta(task_id, {"active_kb": ""})
-            return "已取消知识库选择。"
+            return "好，后面就不查知识库了，有问题再说。"
+        if typ == "kb_ask":
+            question = str(action.get("question") or "").strip()
+            if not question:
+                return "用法：/kb ask <你的问题>"
+            return self._handle_kb_ask(task_id, question)
+        if typ == "kb_docs":
+            kb = str(action.get("kb") or "").strip()
+            meta = self._task_manager.read_task_meta(task_id)
+            if not kb:
+                kb = str(meta.get("active_kb") or "").strip() or "default"
+            try:
+                docs = get_kb().list_docs(kb=kb)
+                if not docs:
+                    return f"知识库 {kb} 中还没有上传过文件。"
+                lines = [f"知识库 {kb} 中的文件（共 {len(docs)} 个）："]
+                for d in docs[:30]:
+                    title = str(d.get("title") or d.get("doc_id") or "未知文件")
+                    doc_type = str(d.get("doc_type") or "")
+                    line = f"  · {title}"
+                    if doc_type:
+                        line += f" [{doc_type}]"
+                    lines.append(line)
+                return "\n".join(lines)
+            except Exception as e:
+                return f"获取文件列表失败：{str(e)[:180]}"
         if typ == "kb_stats":
             kb = str(action.get("kb") or "").strip() or "default"
             try:
@@ -376,7 +498,7 @@ class ChatHandler:
                 task_id, "paused", stage=stage or "pause",
                 message="已暂停（发送 /resume 继续，/cancel 取消）", extra={}
             )
-            return "已暂停该任务。"
+            return "先停一下，等你准备好了跟我说一声就行。"
         if typ == "resume":
             self._task_manager.resume_task(task_id)
             if str(st.get("status") or "") == "paused":
@@ -384,14 +506,14 @@ class ChatHandler:
                     task_id, "processing", stage=stage or "resume",
                     message="已继续执行…", extra={}
                 )
-            return "已继续该任务。"
+            return "好，继续~"
         if typ == "cancel":
             self._task_manager.cancel_task(task_id)
             self._task_manager.write_status(
                 task_id, "canceled", stage=stage or "cancel",
                 message="已取消", extra={}
             )
-            return "已取消该任务。"
+            return "取消了，之前生成的内容还在，可以随时重新开始。"
         if typ == "list_files":
             fps = self._resolve_task_files(task_id)
             if not fps:
@@ -420,8 +542,8 @@ class ChatHandler:
             if bool(action.get("regen")):
                 fps = self._resolve_task_files(task_id)
                 tpl_override, tps = self._resolve_template_override(task_id)
-                return "已更新需求并重新生成。"
-            return "已更新需求（未自动重跑）。如需重跑，请发送：/regen doc"
+                return "好的，需求已更新，正在重新生成。"
+            return "好的，需求已更新。想重跑的话发 /regen doc 就行。"
         if typ == "append":
             return "\n".join(
                 [
@@ -482,6 +604,42 @@ class ChatHandler:
 
         return True, ""
 
+    # ── Clarify phase (moved from web layer into handler) ─────────────────
+
+    def _is_clarify_phase(self, st: dict) -> bool:
+        """Check if task is waiting for clarify answer, robust against stage race conditions."""
+        if str(st.get("status") or "") == "need_user" and str(st.get("stage") or "") == "clarify":
+            return True
+        has_questions = isinstance(st.get("clarify_questions"), list) and st.get("clarify_questions")
+        has_answer = bool(str(st.get("clarify_answers") or "").strip()) or bool(st.get("clarify_skip"))
+        return has_questions and not has_answer
+
+    def _handle_clarify_answer(self, task_id: str, message: str, st: dict) -> str | None:
+        """Process a clarify-phase answer. Returns reply string, or None if invalid.
+
+        Handles: skip, valid long answer, valid keyword-overlapping short answer.
+        """
+        import time as _time
+        m = message.strip()
+        low = m.lower()
+        if low in {"skip", "跳过", "略过", "不用了", "不需要"}:
+            self._task_manager.write_status(task_id, "processing", stage="clarify",
+                message="用户选择跳过澄清，继续生成…",
+                extra={"clarify_answers": "", "clarify_skip": True,
+                       "clarify_submitted_at": float(_time.time())})
+            return "好嘞，先跳过。我先继续往下写，你觉得哪里不对再跟我说。"
+
+        qs = st.get("clarify_questions") if isinstance(st.get("clarify_questions"), list) else []
+        is_valid, warning = self.validate_clarify_answer(m, qs)
+        if not is_valid:
+            return None  # caller should return warning to user
+
+        self._task_manager.write_status(task_id, "processing", stage="clarify",
+            message="已收到用户补充信息，继续生成…",
+            extra={"clarify_answers": m, "clarify_skip": False,
+                   "clarify_submitted_at": float(_time.time())})
+        return "记下了！我按你说的调整，写好了你看看。中间有什么想法随时说。"
+
     # ── Follow-up suggestions ────────────────────────────────────────────
 
     def _generate_followups(self, message: str, reply: str, task_id: str) -> str:
@@ -512,7 +670,7 @@ class ChatHandler:
         reply_summary = r[:500]
 
         try:
-            chain = FOLLOWUPS_PROMPT | self._shared_llm | StrOutputParser()
+            chain = FOLLOWUPS_PROMPT | self._short_llm | StrOutputParser()
             raw = (chain.invoke({
                 "question": q,
                 "reply_summary": reply_summary,
@@ -575,7 +733,7 @@ class ChatHandler:
             return
 
         try:
-            chain = SUMMARIZE_HISTORY_PROMPT | self._shared_llm | StrOutputParser()
+            chain = SUMMARIZE_HISTORY_PROMPT | self._short_llm | StrOutputParser()
             new_summary = (
                 chain.invoke({"transcript": transcript}) or ""
             ).strip()
@@ -603,7 +761,7 @@ class ChatHandler:
             return q
 
         try:
-            chain = REWRITE_QUERY_PROMPT | self._shared_llm | StrOutputParser()
+            chain = REWRITE_QUERY_PROMPT | self._short_llm | StrOutputParser()
             rewritten = (
                 chain.invoke({"question": q}) or ""
             ).strip()
@@ -659,30 +817,63 @@ class ChatHandler:
 
     # ── Trivial message detection ─────────────────────────────────────────
 
-    @staticmethod
-    def _is_trivial_message(message: str) -> Optional[str]:
+    _GREETINGS = {
+        "在吗", "在不在", "在了吗", "在不在呀",
+        "你好", "您好", "你好啊", "嗨", "hi", "hello", "hey",
+        "早上好", "下午好", "晚上好", "晚安", "中午好",
+    }
+    _GREETING_REPLIES = [
+        "嗨！有什么想生成的报告？或者想聊点别的也行。",
+        "来啦~ 今天要写什么？直接把文件拖进来，我帮你弄。",
+        "嘿！上传文件、搜知识库、直接提问，都行，看你想干嘛。",
+        "哈喽！有新材料要出报告，还是想问问之前的内容？",
+    ]
+    _THANKS = {
+        "我喜欢你", "我爱你", "爱你",
+        "能叫我宝贝吗", "叫我宝贝",
+        "你真棒", "太棒了", "厉害", "牛逼",
+        "谢谢", "谢谢你", "感谢", "thx", "thanks", "thank you",
+    }
+    _THANKS_REPLIES = [
+        "客气啥~ 还有什么需要调整的随时说。",
+        "应该的！有哪里不满意再跟我说。",
+        "有帮助就好。后续想改风格、加内容，说一声就行。",
+    ]
+    _FOLLOWUP_INTROS = [
+        "这几个问题可能对你有用：",
+        "顺着这个话题，你还想了解：",
+        "如果还想深入看看，可以试试问这些：",
+        "另外这几个点可能也值得关注：",
+    ]
+
+    @classmethod
+    def _is_trivial_message(cls, message: str) -> Optional[str]:
         """Return a short reply if the message is a pure greeting or social
         chat that doesn't warrant a full LLM invocation. Otherwise None."""
         m = (message or "").strip()
-        if not m or len(m) > 15:
-            return None
+        if not m:
+            return "请输入消息。你可以提问、发送指令，或输入 /help 查看可用命令。"
 
         low = m.lower()
 
-        if low in {
-            "在吗", "在不在", "在了吗", "在不在呀",
-            "你好", "您好", "你好啊", "嗨", "hi", "hello", "hey",
-            "早上好", "下午好", "晚上好", "晚安", "中午好",
-        }:
-            return "你好！有什么可以帮你的？你可以上传材料生成报告，或者直接在对话框中提问。"
+        # ── Single-char / meaningless input ──────────────────────────
+        if len(m) <= 2 and low not in {"hi", "ok", "好", "行", "是", "对", "嗯", "有", "no", "go", "嗯嗯"}:
+            return "请直接说出你的问题或需求，我会尽力帮你。\n\n💡 试试：/help 查看所有指令，或直接输入你想了解的内容。"
 
-        if low in {
-            "我喜欢你", "我爱你", "爱你",
-            "能叫我宝贝吗", "叫我宝贝",
-            "你真棒", "太棒了", "厉害", "牛逼",
-            "谢谢", "谢谢你", "感谢", "thx", "thanks", "thank you",
-        }:
-            return "谢谢你的反馈！有什么关于文档生成或报告的问题，随时可以问我。"
+        # ── Interjections / testing noise ─────────────────────────────
+        if low in {"喂", "喂喂", "有人吗", "在吗在吗", "test", "测试", "testing",
+                   "？？", "？？？", "?", "??", "???", "。。。", "…"}:
+            return "你好！有什么可以帮你的？你可以上传材料生成报告，或者直接在对话框中提问。\n\n💡 输入 /help 查看所有可用指令。"
+
+        # ── Greetings (random variant) — checked BEFORE length filter ──
+        if low in cls._GREETINGS:
+            return random.choice(cls._GREETING_REPLIES)
+
+        if low in cls._THANKS:
+            return random.choice(cls._THANKS_REPLIES)
+
+        if len(m) > 15:
+            return None
 
         return None
 
@@ -699,13 +890,18 @@ class ChatHandler:
     # ── Context builder (shared by chat_reply and chat_reply_stream) ─────
 
     def _build_context(
-        self, message: str, task_id: str
+        self, message: str, task_id: str, *, intent: "ChatIntent | None" = None,
     ) -> tuple[Optional[str], dict[str, str]]:
         """Check for immediate replies; if none, build the chain input dict.
 
         Returns (immediate_text, chain_input).
         If immediate_text is not None the caller should return it directly.
         Otherwise chain_input is ready for the LCEL chain.
+
+        The ``intent`` parameter controls context assembly:
+        - QUESTION_REPORT → loads report snippets + KB (full context)
+        - GENERAL_CHAT   → loads report snippets only (skip KB)
+        - MODIFY_REPORT / CLARIFY / CONTROL → never reach this method
         """
         greeting_reply = self._is_trivial_message(message)
         if greeting_reply is not None:
@@ -764,6 +960,12 @@ class ChatHandler:
                     return None, {"user_input": enriched}
                 except Exception as e:
                     return f"知识库检索失败：{str(e)[:180]}。请检查 EMBED_* 配置与 embedding 模型是否可用。", {}
+
+            # ── Guided task creation: detect generation intent without a task ──
+            guide = self._guide_task_creation(message)
+            if guide:
+                return guide, {}
+
             return None, {"user_input": self._safe_str(message, 1200) or "（空）"}
 
         # ── Task state checks ───────────────────────────────────────────
@@ -818,22 +1020,35 @@ class ChatHandler:
                     {},
                 )
 
-            if stage:
-                base = f"当前任务正在处理（task_id={task_id} stage={stage}）。"
-            else:
-                base = f"当前任务正在处理（task_id={task_id}）。"
+            _WAITING = {
+                "extract": "正在读你的文件，文件多的话会花点时间，不过我会并行处理，不会太慢。",
+                "plan": "读完了，正在想怎么组织这份报告的结构。",
+                "assess": "看了一下材料，可能需要问你几个问题。",
+                "clarify": "需要你补充一些信息才能继续，你看一下上面的问题。",
+                "enrich": "正在查资料补充内容，稍等~",
+                "outline": "大纲正在生成中，写好了会先给你过目。",
+                "content": "正在逐章写正文，写好的章节会陆续显示在右侧，你可以先看着。",
+                "research": "正在查一些参考资料来充实内容。",
+                "critic": "正在检查报告内容有没有问题。",
+                "render": "写好了，正在生成最终文件（Word/PDF），马上就能下载。",
+            }
+            base = _WAITING.get(stage, f"当前任务正在处理（task_id={task_id} stage={stage}）。")
             if msg:
-                base += "\n状态：" + msg
+                base += "\n" + msg
             return ("\n".join([base, "你可以继续提问，我会结合当前进度给建议。"]).strip(), {})
 
         # ── Build context for task-chat mode ────────────────────────────
-        snippets = self._pick_snippets(message, content) if content else ""
+        # Intent-based filtering: skip expensive operations when not needed
+        load_report = intent != ChatIntent.GENERAL_CHAT and intent != ChatIntent.KB_QUERY
+        load_kb = intent in (ChatIntent.QUESTION_REPORT, ChatIntent.KB_QUERY)
+
+        snippets = self._pick_snippets(message, content) if (content and load_report) else ""
         progress_hint = ""
         if status in {"queued", "processing", "need_user"}:
             progress_hint = "（提示：当前任务可能尚未完全生成，回答会基于现有内容，必要时我会提示缺失。）"
 
         kb_snippets = ""
-        if active_kb:
+        if active_kb and load_kb:
             try:
                 msg = str(message or "")
                 # For complex questions, expand via HyDE before retrieval
@@ -871,10 +1086,21 @@ class ChatHandler:
         context_blocks: list[str] = []
 
         if outline or content:
+            # Full outline TOC (titles only) — gives LLM a bird's-eye view
+            toc = ""
+            if outline:
+                toc_lines = []
+                for line in str(outline).splitlines():
+                    stripped = line.strip()
+                    if re.match(r"^#{1,6}\s+", stripped):
+                        toc_lines.append(stripped)
+                if toc_lines:
+                    toc = "报告章节一览：\n" + "\n".join(toc_lines[:40]) + "\n\n"
+
             context_blocks.append(
                 "【可信度：高】已生成的报告内容（优先参考）：\n"
-                + ("已生成的大纲：\n" + self._safe_str(outline, 1800) if outline else "")
-                + ("\n\n与问题相关的正文摘录：\n" + self._safe_str(snippets, 2000) if snippets else "")
+                + toc
+                + ("与问题相关的正文摘录（编号 [N] 对应章节一览中的第 N 节）：\n" + self._safe_str(snippets, 2000) if snippets else "")
             )
 
         if kb_snippets:
@@ -890,6 +1116,27 @@ class ChatHandler:
             )
 
         context_text = "\n\n".join(context_blocks).strip() if context_blocks else "（暂无可用上下文）"
+
+        # ── Multi-turn KB awareness: detect if user is following up on a prior KB search ──
+        try:
+            history = self._task_manager.read_chat_history(task_id)
+            last_kb_q = ""
+            last_kb_cites = ""
+            for entry in reversed(history[-10:]):
+                role = str(entry.get("role") or "")
+                content = str(entry.get("content") or "")
+                if role == "user" and content.startswith("[知识库:"):
+                    last_kb_q = content
+                    break
+                if role == "assistant" and entry.get("_kb_citations"):
+                    last_kb_cites = str(entry.get("_kb_citations") or "")
+            if last_kb_q and any(kw in (message or "") for kw in ("那", "这个", "刚才", "上面", "之前", "继续", "还有", "别的", "其他")):
+                progress_hint = (progress_hint or "") + (
+                    "\n（用户可能在追问之前的KB检索结果。上一轮检索问题：" + last_kb_q[-200:] +
+                    ("；检索命中文档：" + last_kb_cites[-200:] if last_kb_cites else "") + "）"
+                )
+        except Exception:
+            pass
 
         chain_input = {
             "user_input": self._safe_str(message, 1200) or "（空）",
@@ -926,7 +1173,56 @@ class ChatHandler:
     def chat_reply(
         self, message: str, task_id: str, history: Optional[list[dict]] = None
     ) -> str:
-        immediate, chain_input = self._build_context(message, task_id)
+        """Main chat entry point — classified intent routing.
+
+        Intent routing order:
+          1. CLARIFY_ANSWER → handle directly (no LLM)
+          2. MODIFY_REPORT  → write to task_meta, quick reply (no LLM)
+          3. CONTROL_TASK   → delegate to _handle_chat_action
+          4. Fast-path immediate (greetings, status checks) in _build_context
+          5. QUESTION_REPORT / GENERAL_CHAT → full LLM chain with filtered context
+        """
+        m = (message or "").strip()
+        st = self._task_manager.read_status(task_id)
+
+        # ── Intent classification ────────────────────────────────────
+        is_clarify = self._is_clarify_phase(st) if task_id != "lobby" else False
+        has_content = False
+        if task_id != "lobby":
+            try:
+                outline, content = self._load_task_text(task_id)
+                has_content = bool(outline or content)
+            except Exception:
+                has_content = False
+
+        intent = classify_intent(m, task_status=st, is_clarify_phase=is_clarify,
+                                 has_report_content=has_content)
+
+        # ── Route: CLARIFY_ANSWER ─────────────────────────────────────
+        if intent == ChatIntent.CLARIFY_ANSWER:
+            reply = self._handle_clarify_answer(task_id, m, st)
+            if reply is not None:
+                return reply
+            qs = st.get("clarify_questions") if isinstance(st.get("clarify_questions"), list) else []
+            _, warning = self.validate_clarify_answer(m, qs)
+            return warning
+
+        # ── Route: KB_QUERY ───────────────────────────────────────────
+        if intent == ChatIntent.KB_QUERY:
+            return self._handle_kb_ask(task_id, m)
+
+        # ── Route: MODIFY_REPORT ──────────────────────────────────────
+        if intent == ChatIntent.MODIFY_REPORT:
+            return self._handle_modification_quick(task_id, m)
+
+        # ── Route: CONTROL_TASK (slash commands) ──────────────────────
+        if intent == ChatIntent.CONTROL_TASK and m.startswith("/"):
+            act = self._parse_chat_action(m, None)
+            if act:
+                return self._handle_chat_action(task_id, act)
+
+        # ── Full LLM chain (QUESTION_REPORT / GENERAL_CHAT / lobby) ────
+        immediate, chain_input = self._build_context(message, task_id, intent=intent)
         if immediate is not None:
             return immediate
 
@@ -956,21 +1252,180 @@ class ChatHandler:
 
         self._maybe_summarize_history(task_id)
 
-        # Check for modification intent (higher priority, replaces follow-ups)
-        mod_suffix = self._handle_modification_intent(message, task_id)
-        if mod_suffix:
-            t = t.rstrip() + mod_suffix
-        else:
-            followups = self._generate_followups(message, t, task_id)
-            if followups:
-                t = t.rstrip() + "\n\n---\n💡 你可能还想问：\n" + followups
+        # Skip followups if retrieval was poor — KB results can't support meaningful followups
+        _skip_followups = "检索到的内容与问题的相关度较低" in t
+        followups = "" if _skip_followups else self._generate_followups(message, t, task_id)
+        if followups:
+            intro = random.choice(self._FOLLOWUP_INTROS)
+            t = t.rstrip() + "\n\n---\n💡 " + intro + "\n" + followups
 
         return t
+
+    def _handle_modification_quick(self, task_id: str, message: str) -> str:
+        """Handle MODIFY_REPORT intent — fast path, no LLM invocation.
+
+        Updates user_prompt in task_meta and returns a quick confirmation.
+        """
+        m = (message or "").strip()
+        try:
+            meta = self._task_manager.read_task_meta(task_id)
+            old_prompt = str(meta.get("user_prompt") or "").strip()
+            if m in old_prompt:
+                return "💡 你的需求中已包含类似要求，可发送 /regen doc 按最新需求重新生成。"
+            new_prompt = (old_prompt + "\n" + m).strip()
+            self._task_manager.write_task_meta(task_id, {"user_prompt": new_prompt})
+            logger.info("modify_intent task=%s msg_len=%d prompt_len=%d",
+                        task_id, len(m), len(new_prompt))
+            return "💡 已根据你的反馈更新生成需求。发送 /regen doc 即可按新要求重新生成报告。"
+        except Exception as e:
+            logger.warning("modify_intent_failed task=%s err=%s", task_id, e)
+            return "未能更新需求，请稍后重试。"
+
+    def _handle_kb_ask(self, task_id: str, question: str) -> str:
+        """Handle /kb ask command — uses answer_smart() for full KB QA pipeline.
+
+        This is the SAME chain used by the KB panel's /api/kb/query endpoint,
+        ensuring consistent answer quality regardless of entry point.
+        """
+        # Determine which KB to use
+        meta = self._task_manager.read_task_meta(task_id)
+        kb_name = str(meta.get("active_kb") or "").strip()
+        if not kb_name:
+            try:
+                available = get_kb().list_kb()
+            except Exception:
+                available = []
+            if available:
+                kb_name = available[0]
+            else:
+                return "当前没有可用的知识库。请在 KB 面板上传文档后重试，或使用 /kb use <名称> 选择知识库。"
+
+        try:
+            result = get_kb().answer_smart(kb=kb_name, question=question)
+        except Exception as e:
+            logger.warning("kb_ask_failed kb=%s err=%s", kb_name, e)
+            return f"知识库检索失败：{str(e)[:180]}。请检查知识库是否正常。\n\n💡 提示：发送 /kb list 查看可用知识库。"
+
+        # Format citations: group by document, show sections as sub-items
+        citations_lines = []
+        scores = [float(getattr(c, "score", 0) or 0) for c in (result.citations or [])[:5]]
+        logger.info("kb_ask_citations scores=%s", [round(s, 4) for s in scores])
+        by_doc: dict[str, list] = {}
+        for c in (result.citations or [])[:5]:
+            doc_label = (c.doc_name or c.doc_id or "未知文档")
+            section = (c.section_path or "").strip()
+            # Strip doc_name prefix from section_path if present
+            for prefix in [doc_label + " / ", doc_label + "/ "]:
+                if section.startswith(prefix):
+                    section = section[len(prefix):]
+                    break
+            score = float(getattr(c, "score", 0) or 0)
+            if len(section) > 40:
+                section = section[:37] + "…"
+            by_doc.setdefault(doc_label, []).append((section, score))
+        for doc_label, items in by_doc.items():
+            if len(by_doc) == 1:
+                # Single document: just doc name + score, no need for chunk excerpts
+                top_score = max(s for _, s in items)
+                line = f"· {doc_label}"
+                if top_score >= 0.01:
+                    line += f" · 相关度 {top_score:.2f}"
+                citations_lines.append(line)
+            else:
+                # Multiple documents: each gets its own line
+                for sec, score in items:
+                    line = f"· {doc_label}"
+                    if sec:
+                        line += f" · {sec}"
+                    if score >= 0.01:
+                        line += f" · 相关度 {score:.2f}"
+                    citations_lines.append(line)
+
+        reply = result.answer
+
+        # ── Low-quality retrieval: add visible disclaimer ────────────
+        avg_score = sum(scores) / len(scores) if scores else 0
+        max_score = max(scores) if scores else 0
+        retrieval_poor = avg_score < 0.05 and max_score < 0.1
+        if retrieval_poor:
+            reply += (
+                "\n\n---\n"
+                "⚠️ 检索到的内容与问题的相关度较低（平均 {:.3f}），"
+                "以上回答可能主要基于通用知识。建议上传相关文档获得更精准的答案。"
+            ).format(avg_score)
+        elif citations_lines:
+            reply += "\n\n📚 来源\n" + "\n".join(citations_lines)
+
+        # ── Write to chat history with structured citation info ──────
+        try:
+            cit_info = "; ".join(
+                f"{c.doc_name or c.doc_id or ''}:{c.section_path or ''}"
+                for c in (result.citations or [])[:3]
+            ) if result.citations else ""
+            self._task_manager.append_chat_history(task_id, [
+                {"role": "user", "content": f"[知识库:{kb_name}] {question}"},
+                {"role": "assistant", "content": reply, "_kb_citations": cit_info},
+            ])
+        except Exception:
+            pass
+
+        return reply
 
     def chat_reply_stream(
         self, message: str, task_id: str, history: Optional[list[dict]] = None
     ) -> Iterator[str]:
-        immediate, chain_input = self._build_context(message, task_id)
+        """Streaming variant of chat_reply with intent routing.
+
+        Mirrors chat_reply() routing:
+          - CLARIFY / MODIFY / CONTROL → yield directly, no LLM
+          - QUESTION / GENERAL → stream LLM tokens with filtered context
+        """
+        m = (message or "").strip()
+        st = self._task_manager.read_status(task_id)
+
+        # ── Intent classification ────────────────────────────────────
+        is_clarify = self._is_clarify_phase(st) if task_id != "lobby" else False
+        has_content = False
+        if task_id != "lobby":
+            try:
+                outline, content = self._load_task_text(task_id)
+                has_content = bool(outline or content)
+            except Exception:
+                has_content = False
+
+        intent = classify_intent(m, task_status=st, is_clarify_phase=is_clarify,
+                                 has_report_content=has_content)
+
+        # ── Route: CLARIFY_ANSWER ─────────────────────────────────────
+        if intent == ChatIntent.CLARIFY_ANSWER:
+            reply = self._handle_clarify_answer(task_id, m, st)
+            if reply is not None:
+                yield reply
+                return
+            qs = st.get("clarify_questions") if isinstance(st.get("clarify_questions"), list) else []
+            _, warning = self.validate_clarify_answer(m, qs)
+            yield warning
+            return
+
+        # ── Route: KB_QUERY ───────────────────────────────────────────
+        if intent == ChatIntent.KB_QUERY:
+            yield self._handle_kb_ask(task_id, m)
+            return
+
+        # ── Route: MODIFY_REPORT ──────────────────────────────────────
+        if intent == ChatIntent.MODIFY_REPORT:
+            yield self._handle_modification_quick(task_id, m)
+            return
+
+        # ── Route: CONTROL_TASK ──────────────────────────────────────
+        if intent == ChatIntent.CONTROL_TASK and m.startswith("/"):
+            act = self._parse_chat_action(m, None)
+            if act:
+                yield self._handle_chat_action(task_id, act)
+                return
+
+        # ── Full LLM chain with intent-filtered context ────────────────
+        immediate, chain_input = self._build_context(message, task_id, intent=intent)
         if immediate is not None:
             yield immediate
             return
@@ -1006,21 +1461,19 @@ class ChatHandler:
         if not full.strip():
             yield "当前对话生成失败，请稍后重试。"
 
-        # Check for modification intent (higher priority, replaces follow-ups)
-        mod_suffix = self._handle_modification_intent(message, task_id)
-        if mod_suffix:
-            yield mod_suffix
-        else:
-            # Collect follow-up suggestions
-            followups = ""
-            if followup_thread is not None:
-                followup_thread.join(timeout=10)
-                followups = followup_result[0] or ""
-            elif len(full) >= 30:
-                followups = self._generate_followups(message, full, task_id)
+        # Follow-up suggestions (modification intent is already handled above)
+        # Skip if retrieval was too poor to support meaningful followups
+        _skip = "检索到的内容与问题的相关度较低" in full or "⚠️ 检索到的内容" in full
+        followups = ""
+        if not _skip and followup_thread is not None:
+            followup_thread.join(timeout=10)
+            followups = followup_result[0] or ""
+        elif not _skip and len(full) >= 30:
+            followups = self._generate_followups(message, full, task_id)
 
-            if followups:
-                suffix = "\n\n---\n💡 你可能还想问：\n" + followups
-                yield suffix
+        if followups:
+            intro = random.choice(self._FOLLOWUP_INTROS)
+            suffix = "\n\n---\n💡 " + intro + "\n" + followups
+            yield suffix
 
         self._maybe_summarize_history(task_id)

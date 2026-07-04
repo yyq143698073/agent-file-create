@@ -212,6 +212,10 @@ def embed_texts(texts: Iterable[str], *, timeout_s: int = 60, max_batch: int = 3
                     except Exception:
                         time.sleep(3.0 + 2.0 * s_attempt)  # 3s, 5s, 7s, 9s — wait for Ollama recovery
                 if not single_ok:
+                    logger.warning(
+                        "embed_ollama_empty_vector text_len=%d — chunk will be invisible to vector search",
+                        len(single),
+                    )
                     out.append([])  # empty vector as last resort
         # Small gap between batches to let Ollama breathe
         if i + batch < len(xs):

@@ -68,7 +68,14 @@ def _cross_encoder_rerank(query: str, hits: list[Hit], model_name: str,
                     for j, s in enumerate(b_scores):
                         scores[off + j] = s
     except Exception as e:
-        logger.warning(f"cross_encoder_rerank_failed err={str(e)[:160]}, falling back to LLM reranker")
+        err_msg = str(e)[:160]
+        # If HuggingFace is unreachable (timeout, network), don't bother with LLM fallback —
+        # just normalize the existing RRF scores. LLM listwise is slow (~2-5s) and often
+        # produces similar results when all chunks are from the same document.
+        if any(kw in err_msg.lower() for kw in ("timeout", "connect", "unreachable", "network", "resolve", "name or service not known")):
+            logger.info("cross_encoder_unreachable hf=%s, using score_norm fallback", err_msg[:60])
+            return _score_norm(hits[:top_k])
+        logger.warning("cross_encoder_rerank_failed err=%s, falling back to LLM reranker", err_msg)
         return _llm_listwise_rerank(query, hits, top_k)
 
     for h, s in zip(hits, scores):
@@ -251,7 +258,8 @@ def rerank(query: str, hits: list[Hit], *, top_k: Optional[int] = None,
             - "none": skip reranking, just truncate
     """
     if not RERANK_ENABLED or mode == "none":
-        return hits[: (top_k or RERANK_FINAL_K)]
+        # Always normalize scores for readability, even when reranking is disabled
+        return _score_norm(hits[: (top_k or RERANK_FINAL_K)])
     if not hits:
         return hits
 

@@ -40,13 +40,20 @@ class TaskChatMessageHistory(BaseChatMessageHistory):
         items: list[dict] = []
         for m in messages:
             if isinstance(m, HumanMessage):
-                items.append({"role": "user", "content": str(m.content)})
+                item = {"role": "user", "content": str(m.content)}
             elif isinstance(m, AIMessage):
-                items.append({"role": "assistant", "content": str(m.content)})
+                item = {"role": "assistant", "content": str(m.content)}
             else:
-                items.append(
-                    {"role": "assistant", "content": str(getattr(m, "content", ""))}
-                )
+                item = {"role": "assistant", "content": str(getattr(m, "content", ""))}
+
+            # Dedup: skip if identical to the last stored message
+            if self._messages:
+                last = self._messages[-1]
+                if (isinstance(last, type(m))
+                        and str(getattr(last, "content", "")) == str(getattr(m, "content", ""))):
+                    continue
+
+            items.append(item)
             self._messages.append(m)
         if items:
             self._tm.append_chat_history(self._task_id, items)
