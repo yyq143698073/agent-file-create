@@ -590,6 +590,7 @@ def _create_chat_model(
         model=model,
         base_url=base_url,
         temperature=float(temperature) if temperature is not None else None,
+        timeout=int(timeout_s),
         model_kwargs=kwargs,
     )
 

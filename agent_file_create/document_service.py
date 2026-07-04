@@ -1,9 +1,21 @@
+"""Legacy document generation service — **DEPRECATED**.
+
+This module's `generate_document()` is the old monolithic pipeline.
+New code should use `agent_file_create.agent.DocumentAgent` instead,
+which provides the same functionality via a LangGraph StateGraph with
+proper human-in-the-loop, checkpointing, and error recovery.
+
+The helper functions imported from `_quality.py` are still used by the
+new agent's `_node_quality_gate` and remain supported.
+"""
+
 import logging
 import os
 import re
 import threading
 import time
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +40,11 @@ def generate_document(
     outline: Optional[str] = None,
     content: Optional[str] = None,
 ) -> Dict[str, Any]:
+    warnings.warn(
+        "generate_document() is deprecated. Use DocumentAgent instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not task_id:
         task_id = uuid.uuid4().hex[:8]
 
@@ -211,8 +228,8 @@ def generate_document(
     # Write clean content (without warning blocks)
     try:
         (output_dir / "content.md").write_text(_clean_content, encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("write_clean_content_failed path=%s/content.md err=%s", output_dir, e)
 
     return {
         "task_id": str(task_id),
@@ -244,346 +261,20 @@ def _run_faithfulness_checks(
     task_id: str,
     output_dir: str,
 ) -> str:
-    """Run faithfulness check and hallucination-triggered re-retrieval on content."""
-    try:
-        from agent_file_create.llm_client import call_llm as _f_call
-        source_text = ""
-        for _i, _ar in enumerate((analysis_results or [])[:8]):
-            _title = str(_ar.get("title") or _ar.get("filename") or "").strip()
-            _summary = str(_ar.get("summary") or "").strip()
-            if _title or _summary:
-                source_text += f"[{_i+1}] {_title}: {_summary[:300]}\n"
-        if not source_text:
-            logger.warning("faithfulness_check skip task=%s reason=no_source_text", task_id)
-            if content:
-                # Source materials are empty — mark entire report as unverifiable
-                _header = "> ⚠️ **事实核查无法执行**：未从上传材料中提取到足够内容，无法验证以下报告的事实准确性。所有数据和结论请以原始材料为准。\n\n"
-                annotated = _header + str(content or "")
-                try:
-                    (output_dir / "content.md").write_text(annotated, encoding="utf-8")
-                except Exception:
-                    pass
-                content = annotated
-        elif not content:
-            logger.warning("faithfulness_check skip task=%s reason=no_content", task_id)
-        elif source_text and content:
-            _check_prompt = (
-                "你是文档事实核查助手。请检查以下报告正文的每个 ## 章节，判断其内容是否能在来源材料中找到依据。\n\n"
-                f"来源材料摘要：\n{source_text[:3000]}\n\n"
-                f"报告正文：\n{str(content)[:4000]}\n\n"
-                "对于每个 ## 章节，判断其可信度：如果章节中的所有事实都能在来源材料中找到明确依据，标记OK；"
-                "如果章节中有部分推断或数据无法在来源材料中验证，标记 WARN: <原因>。\n"
-                "只输出有问题的章节（OK的不用输出），如果没有问题，回复ALL_OK。\n"
-                "格式：## 章节名\nWARN: 原因（简短一句）"
-            )
-            _check_result = _f_call(
-                _check_prompt, timeout_s=20, temperature=0.0, num_predict=300,
-                system="你是一个中文文档处理助手。只输出有问题的章节。")
-            _check_text = (_check_result or "").strip()
-            if not _check_text:
-                logger.warning("faithfulness_check empty_response task=%s", task_id)
-            elif _check_text.upper() in {"ALL_OK", "OK", "无", "NONE"}:
-                logger.info("faithfulness_check all_ok task=%s", task_id)
-            else:
-                # Parse warnings: collect (section_name, reason) pairs
-                import re as _re
-                _warnings: list[tuple[str, str]] = []
-                _cur_section = ""
-                for _line in _check_text.splitlines():
-                    _line = _line.strip()
-                    if _line.startswith("## "):
-                        _cur_section = _line[3:].strip()
-                    elif (_line.startswith("WARN:") or _line.startswith("WARN：")) and _cur_section:
-                        _reason = _line[5:].strip().lstrip(":：").strip()
-                        _warnings.append((_cur_section, _reason))
-                        _cur_section = ""
+    """Run faithfulness check and hallucination-triggered re-retrieval on content.
 
-                if _warnings:
-                    # ── Phase 1: Attempt re-retrieval to fix each warning ──
-                    _enable_retrieval = os.getenv("HALLUCINATION_RETRIEVAL_ENABLED", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
-                    _fixed_count = 0
-                    _unfixed: list[tuple[str, str]] = []
-                    try:
-                        from agent_file_create.rag.kb import KnowledgeBase
-                        _kb = KnowledgeBase() if _enable_retrieval else None
-                        _kb_name = str(task_id)
-                    except Exception:
-                        _kb = None
-                        _kb_name = ""
+    Delegates to QualityPipeline for structured, decomposable execution.
+    """
+    from agent_file_create.quality import QualityPipeline, QualityContext
 
-                    annotated = str(content or "")
-                    for _sec_name, _reason in _warnings:
-                        _did_fix = False
-                        if _kb:
-                            try:
-                                # Extract key claims from the section for re-retrieval
-                                _sec_body = ""
-                                _in_sec = False
-                                for _cl in annotated.splitlines():
-                                    if _cl.strip().startswith(f"## {_sec_name}"):
-                                        _in_sec = True
-                                        continue
-                                    if _in_sec:
-                                        if _cl.strip().startswith("## "):
-                                            break
-                                        if not _cl.strip().startswith("> ⚠️"):
-                                            _sec_body += _cl + "\n"
-                                _sec_body = _sec_body.strip()
-
-                                if _sec_body and len(_sec_body) > 50:
-                                    # ── Generate topic-based search queries (neutral, not verbatim claims) ──
-                                    _query_prompt = (
-                                        "你是一个搜索查询生成助手。以下段落的事实核查未通过，需要从知识库中检索正确的信息来验证。\n"
-                                        "请针对段落中涉及的每个关键主题，生成1-3个中性的搜索查询（不要重复段落的原话，\n"
-                                        "而是提取核心主题和实体，用不同的措辞表达）。\n\n"
-                                        f"段落：{_sec_body[:800]}\n\n"
-                                        "每行一个搜索查询，只输出查询本身。"
-                                    )
-                                    _queries_raw = _f_call(
-                                        _query_prompt, timeout_s=12, temperature=0.0, num_predict=200,
-                                        system="你是一个中文文档处理助手。只输出搜索查询，每行一个。")
-                                    _queries = [q.strip() for q in (_queries_raw or "").splitlines()
-                                                if q.strip() and len(q.strip()) > 3][:4]
-
-                                    # Also extract verbatim claims as fallback
-                                    _claim_prompt = (
-                                        "从以下段落中提取1-2个需要验证的关键事实主张。每行一个，只输出主张本身。\n\n"
-                                        f"段落：{_sec_body[:800]}"
-                                    )
-                                    _claims_raw = _f_call(
-                                        _claim_prompt, timeout_s=10, temperature=0.0, num_predict=150,
-                                        system="你是一个中文文档处理助手。只输出关键主张，每行一个。")
-                                    _claims = [c.strip() for c in (_claims_raw or "").splitlines()
-                                               if c.strip() and len(c.strip()) > 5][:3]
-
-                                    _all_queries = _queries + _claims  # topics first, then fallback claims
-
-                                    if _all_queries:
-                                        # Re-retrieve using topic-based queries + HyDE
-                                        _new_hits = []
-                                        _seen = set()
-                                        for _q in _all_queries:
-                                            try:
-                                                _h = _kb.search_hyde(kb=_kb_name, query=_q, top_k=3)
-                                                for _hit in _h:
-                                                    if _hit.chunk_id not in _seen:
-                                                        _seen.add(_hit.chunk_id)
-                                                        _new_hits.append(_hit)
-                                            except Exception:
-                                                try:
-                                                    _h = _kb.search_adaptive(kb=_kb_name, query=_q, top_k=3)
-                                                    for _hit in _h:
-                                                        if _hit.chunk_id not in _seen:
-                                                            _seen.add(_hit.chunk_id)
-                                                            _new_hits.append(_hit)
-                                                except Exception:
-                                                    pass
-
-                                        if _new_hits:
-                                            _new_ctx = ""
-                                            for _j, _h in enumerate(_new_hits[:5]):
-                                                _chunk = str(_h.content or "")[:400]
-                                                if _chunk:
-                                                    _new_ctx += f"[新检索{_j+1}] {_chunk}\n"
-
-                                            if _new_ctx:
-                                                # Attempt to fix the section
-                                                _fix_prompt = (
-                                                    "你是一个文档编辑助手。以下段落的事实核查未通过，"
-                                                    "因为部分内容在原始材料中找不到依据。请用新增检索到的材料重写该段落，"
-                                                    "只保留有材料支撑的内容。如果新材料能支撑原主张，保留它；"
-                                                    "如果不能，用新材料替换或删除无支撑的内容。\n\n"
-                                                    f"原始段落（有问题）：\n{_sec_body[:600]}\n\n"
-                                                    f"新增检索材料：\n{_new_ctx[:1200]}\n\n"
-                                                    "请输出修正后的段落（只输出正文，不使用HTML注释、不使用核查标记）："
-                                                )
-                                                _fixed_body = _f_call(
-                                                    _fix_prompt, timeout_s=15, temperature=0.2, num_predict=500,
-                                                    system="你是一个中文文档处理助手。只输出修正后的正文段落。")
-                                                # Strip HTML comments the LLM may have inserted
-                                                _fixed_body = _re.sub(r"<!--.*?-->", "", str(_fixed_body or ""), flags=_re.DOTALL).strip()
-                                                if _fixed_body and len(_fixed_body) > 20:
-                                                    # Replace the section body in annotated content
-                                                    _esc_sec = _re.escape(_sec_body[:120])
-                                                    _pat = _re.compile(_re.escape(_sec_body[:120]) + r".*", _re.DOTALL)
-                                                    # Simpler: find and replace by section boundaries
-                                                    _lines = annotated.splitlines()
-                                                    _new_lines = []
-                                                    _skip = False
-                                                    _found = False
-                                                    for _cl in _lines:
-                                                        if _cl.strip().startswith(f"## {_sec_name}"):
-                                                            _new_lines.append(_cl)
-                                                            _new_lines.append("")
-                                                            _new_lines.append(str(_fixed_body).strip())
-                                                            _skip = True
-                                                            _found = True
-                                                            continue
-                                                        if _skip:
-                                                            if _cl.strip().startswith("## "):
-                                                                _new_lines.append("")
-                                                                _new_lines.append(_cl)
-                                                                _skip = False
-                                                            continue
-                                                        _new_lines.append(_cl)
-                                                    if _found:
-                                                        annotated = "\n".join(_new_lines)
-                                                        _did_fix = True
-                                                        _fixed_count += 1
-                                                        logger.info(
-                                                            "faithfulness_fixed section=%s claims=%d",
-                                                            _sec_name, len(_claims))
-                            except Exception as _e:
-                                logger.warning("faithfulness_refix_failed section=%s err=%s",
-                                               _sec_name, str(_e)[:100])
-
-                        if not _did_fix:
-                            _unfixed.append((_sec_name, _reason))
-                            # Add ⚠️ marker for unfixed sections
-                            _marker = f"> ⚠️ **事实核查提醒**：{_reason}\n> 已尝试增量检索修正，仍未找到充分依据。请人工核实。\n\n"
-                            _esc_sec = _re.escape(f"## {_sec_name}")
-                            _repl = f"## {_sec_name}\n{_marker}"
-                            _new = _re.sub(_esc_sec, _repl, annotated, count=1)
-                            if _new != annotated:
-                                annotated = _new
-
-                    if annotated != content:
-                        # Final safety: strip any lingering HTML comments from the entire content
-                        annotated = _re.sub(r"<!--.*?-->", "", annotated, flags=_re.DOTALL)
-                        try:
-                            (output_dir / "content.md").write_text(annotated, encoding="utf-8")
-                        except Exception:
-                            pass
-                        content = annotated
-                        if _fixed_count:
-                            logger.info("faithfulness_summary fixed=%d unfixed=%d",
-                                        _fixed_count, len(_unfixed))
-    except Exception as _e:
-        logger.warning("faithfulness_check_failed err=%s", str(_e)[:200])
-
-    # ── Citation verification: check that cited claims match cited sources ──
-    _bad_cites: list = []  # Initialize to avoid NameError
-    try:
-        _raw_content = str(content or "")
-        _citations = re.findall(r"[（(]据(.+?)[）)]", _raw_content)
-        if _citations and analysis_results:
-            _source_map = {}
-            for _ar in (analysis_results or []):
-                _fn = str(_ar.get("filename") or _ar.get("title") or "").strip()
-                _summary = str(_ar.get("summary") or "").strip()
-                if _fn:
-                    _source_map[_fn] = _summary
-            from difflib import SequenceMatcher as _SM
-
-            _bad_cites = []
-            _last_good_cite = ""  # track last valid citation for auto-fill
-            for _cite in _citations:
-                _cite = _cite.strip()
-                # Auto-fill placeholder citations
-                _placeholder_patterns = ["同一材料", "同份材料", "同研究", "同一研究",
-                                          "同上", "同文献", "同来源", "据材料显示",
-                                          "据资料记载", "据文献", "据实验数据"]
-                _is_placeholder = any(_p in _cite for _p in _placeholder_patterns)
-                if _is_placeholder and _last_good_cite:
-                    # Replace placeholder with last valid citation in content
-                    _old = f"（据{_cite}）"
-                    _new = f"（据{_last_good_cite}）"
-                    if _old in _raw_content:
-                        _raw_content = _raw_content.replace(_old, _new, 1)
-                        _cite = _last_good_cite
-                        logger.info("citation_autofill %r → %r", _cite, _last_good_cite)
-                    _old2 = f"(据{_cite})"
-                    if _old2 in _raw_content:
-                        _raw_content = _raw_content.replace(_old2, f"(据{_last_good_cite})", 1)
-
-                # Find surrounding sentence for context
-                _idx = _raw_content.find(f"（据{_cite}）")
-                if _idx < 0:
-                    _idx = _raw_content.find(f"(据{_cite})")
-                if _idx >= 0:
-                    _start = max(0, _idx - 80)
-                    _end = min(len(_raw_content), _idx + len(_cite) + 80)
-                    _context = _raw_content[_start:_end].replace("\n", " ")
-                else:
-                    _context = _cite
-                # Find matching source: exact → fuzzy → word-level
-                _best_match = None
-                _best_score = 0.0
-                for _fn in _source_map:
-                    if _cite in _fn or _fn in _cite:
-                        _best_match = _fn; _best_score = 1.0; break
-                    # Fuzzy match for abbreviations / aliases
-                    _s = _SM(None, _cite, _fn).ratio()
-                    if _s > _best_score:
-                        _best_score = _s; _best_match = _fn
-                    # Word-level fallback
-                    if _best_score < 0.5:
-                        _cite_words = _cite.replace("、", " ").replace("，", " ").split()
-                        if any(_w in _fn for _w in _cite_words if len(_w) >= 2):
-                            _best_match = _fn; break
-                if _best_match and _best_score >= 0.35:
-                    _last_good_cite = _cite  # track for placeholder auto-fill
-                else:
-                    _bad_cites.append((_cite, _context))
-            # Write back auto-filled content
-            if _raw_content != str(content or ""):
-                content = _raw_content
-                try:
-                    (output_dir / "content.md").write_text(content, encoding="utf-8")
-                except Exception:
-                    pass
-
-            if _bad_cites:
-                # Group by citation label for dedup
-                _by_label = {}
-                for _bc in _bad_cites:
-                    _label = _bc[0]
-                    _by_label.setdefault(_label, []).append(_bc)
-
-                # Note: Warnings now collected separately at return - content stays clean
-                logger.info("citation_verify bad=%d total=%d", len(_bad_cites), len(_citations))
-            else:
-                logger.info("citation_verify all_ok count=%d", len(_citations))
-    except Exception as _e:
-        logger.warning("citation_verify_failed err=%s", str(_e)[:200])
-
-    # ── Contrastive claim verification ──
-    _contrastive: dict = {}  # Initialize to avoid NameError
-    try:
-        _contrastive = _verify_contrastive_claims(str(content or ""),
-                                                   source_text, task_id=str(task_id))
-        # Note: Warnings now collected separately at return - content stays clean
-        if _contrastive.get("flagged_count"):
-            logger.info("contrastive_verify_summary flagged=%d/%d",
-                        _contrastive.get("flagged_count", 0),
-                        _contrastive.get("total_count", 0))
-    except Exception as _e:
-        logger.warning("contrastive_verify_failed err=%s", str(_e)[:200])
-
-    # ── FActScore + Aspect Coverage evaluation ──
-    _coverage_results = {}
-    try:
-        _coverage_results = _compute_factscore_and_coverage(
-            str(content or ""), analysis_results or [], task_id=str(task_id))
-    except Exception as _e:
-        logger.warning("factscore_coverage_failed err=%s", str(_e)[:200])
-
-    # ── Coverage gap filling (if coverage < 0.8) ──
-    if (_coverage_results.get("coverage") or 1.0) < 0.8 and _coverage_results.get("uncovered_aspects"):
-        try:
-            _filled = _fill_coverage_gaps(str(content or ""),
-                                           _coverage_results["uncovered_aspects"],
-                                           analysis_results or [], task_id=str(task_id))
-            if _filled != content:
-                content = _filled
-                try:
-                    (output_dir / "content.md").write_text(content, encoding="utf-8")
-                except Exception:
-                    pass
-        except Exception as _e:
-            logger.warning("coverage_gap_fill_failed err=%s", str(_e)[:200])
-
-    return str(content or "")
+    ctx = QualityContext(
+        content=content,
+        analysis_results=analysis_results or [],
+        task_id=str(task_id),
+        output_dir=str(output_dir),
+    )
+    result = QualityPipeline().run(ctx)
+    return str(result.content or "")
 
 
 def render_document(

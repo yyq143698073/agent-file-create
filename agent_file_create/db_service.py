@@ -2,11 +2,110 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from agent_file_create.config import DB_PATH, DB_URL
 
 logger = logging.getLogger(__name__)
+
+# ── Schema migration ────────────────────────────────────────────────────────
+
+# Current schema version — bump when adding/changing tables.
+CURRENT_SCHEMA_VERSION = 1
+
+# Ordered list of migrations: (target_version, description, migration_fn)
+# Each migration_fn receives a live connection and must be idempotent.
+_migrations: list[tuple[int, str, Callable]] = []
+
+
+def _register_migration(version: int, description: str):
+    """Decorator to register a migration function for the given version."""
+    def decorator(fn: Callable):
+        _migrations.append((version, description, fn))
+        return fn
+    return decorator
+
+
+def _ensure_schema_version_table(conn) -> None:
+    """Create the schema_version tracking table if it doesn't exist."""
+    d = _dialect()
+    cur = conn.cursor()
+    if d == "postgres":
+        cur.execute(
+            "create table if not exists schema_version("
+            "  version integer primary key,"
+            "  description text,"
+            "  applied_at double precision"
+            ")"
+        )
+    else:
+        cur.execute(
+            "create table if not exists schema_version("
+            "  version integer primary key,"
+            "  description text,"
+            "  applied_at real"
+            ")"
+        )
+    conn.commit()
+
+
+def _get_current_version(conn) -> int:
+    """Get the current schema version, or 0 if no migrations have been applied."""
+    cur = conn.cursor()
+    try:
+        cur.execute("select max(version) from schema_version")
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        return 0
+
+
+def run_migrations(conn) -> int:
+    """Apply all pending migrations in order. Returns number of migrations applied."""
+    import time
+
+    _ensure_schema_version_table(conn)
+    current = _get_current_version(conn)
+    applied = 0
+
+    for version, description, fn in sorted(_migrations, key=lambda x: x[0]):
+        if version <= current:
+            continue
+        logger.info("db_migration applying v%d: %s", version, description)
+        try:
+            fn(conn)
+            ts = float(time.time())
+            cur = conn.cursor()
+            if _dialect() == "postgres":
+                cur.execute(
+                    "insert into schema_version(version, description, applied_at) "
+                    "values(%s, %s, %s)",
+                    (version, description, ts),
+                )
+            else:
+                cur.execute(
+                    "insert into schema_version(version, description, applied_at) "
+                    "values(?, ?, ?)",
+                    (version, description, ts),
+                )
+            conn.commit()
+            applied += 1
+            logger.info("db_migration applied v%d: %s", version, description)
+        except Exception as e:
+            logger.error("db_migration failed v%d: %s — %s", version, description, e)
+            raise
+
+    if applied == 0:
+        logger.debug("db_migration up-to-date at v%d", current)
+    return applied
+
+
+# ── V1: Initial schema (current tables) ─────────────────────────────────────
+
+@_register_migration(1, "Initial schema: document_tasks, outlines, contents, rendered_outputs, task_status")
+def _migration_v1(conn):
+    """Create all initial tables. Delegates to init_db() which uses IF NOT EXISTS."""
+    init_db(conn)
 
 
 def _dialect() -> str:
@@ -25,8 +124,8 @@ def get_db_connection():
     db_path = base / str(DB_PATH or "result/app.db")
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("db_mkdir_failed path=%s err=%s", db_path.parent, e)
     conn = sqlite3.connect(str(db_path))
     return conn
 
@@ -95,6 +194,18 @@ def init_db(conn) -> None:
             )
             """
         )
+        cur.execute(
+            """
+            create table if not exists task_status(
+              task_id text primary key,
+              status text not null default 'queued',
+              stage text default '',
+              message text default '',
+              meta_json text default '{}',
+              updated_at double precision not null
+            )
+            """
+        )
     else:
         cur.execute(
             """
@@ -156,7 +267,25 @@ def init_db(conn) -> None:
             )
             """
         )
+        cur.execute(
+            """
+            create table if not exists task_status(
+              task_id text primary key,
+              status text not null default 'queued',
+              stage text default '',
+              message text default '',
+              meta_json text default '{}',
+              updated_at real not null
+            )
+            """
+        )
     conn.commit()
+
+    # Auto-apply any pending migrations
+    try:
+        run_migrations(conn)
+    except Exception as e:
+        logger.warning("db_migration auto-apply failed: %s", e)
 
 
 def create_task(conn, *, task_id: str, title: str, document_type: str, user_prompt: str, status: str, output_dir: str, meta: Optional[dict] = None, now_ts: float = 0.0) -> None:
@@ -188,6 +317,80 @@ def update_task_status(conn, task_id: str, status: str) -> None:
     else:
         cur.execute("update document_tasks set status=?, updated_at=? where id=?", (status, ts, task_id))
     conn.commit()
+
+
+# ── Task status table (SQLite-based, atomic UPSERT) ──────────────────
+
+def upsert_task_status(
+    conn,
+    *,
+    task_id: str,
+    status: str = "queued",
+    stage: str = "",
+    message: str = "",
+    meta: Optional[dict] = None,
+) -> None:
+    """Atomically upsert a task status row.
+
+    Uses ON CONFLICT UPSERT for safe concurrent writes.
+    """
+    import time
+
+    ts = float(time.time())
+    meta_json = json.dumps(meta or {}, ensure_ascii=False)
+    cur = conn.cursor()
+    if _dialect() == "postgres":
+        cur.execute(
+            "insert into task_status(task_id,status,stage,message,meta_json,updated_at) "
+            "values(%s,%s,%s,%s,%s,%s) "
+            "on conflict(task_id) do update set "
+            "status=excluded.status, stage=excluded.stage, "
+            "message=excluded.message, meta_json=excluded.meta_json, "
+            "updated_at=excluded.updated_at",
+            (task_id, status, stage, message, meta_json, ts),
+        )
+    else:
+        cur.execute(
+            "insert into task_status(task_id,status,stage,message,meta_json,updated_at) "
+            "values(?,?,?,?,?,?) "
+            "on conflict(task_id) do update set "
+            "status=excluded.status, stage=excluded.stage, "
+            "message=excluded.message, meta_json=excluded.meta_json, "
+            "updated_at=excluded.updated_at",
+            (task_id, status, stage, message, meta_json, ts),
+        )
+    conn.commit()
+
+
+def read_task_status(conn, task_id: str) -> dict:
+    """Read a task status row from SQLite.
+
+    Returns empty dict if task_id not found.
+    """
+    cur = conn.cursor()
+    if _dialect() == "postgres":
+        cur.execute(
+            "select task_id,status,stage,message,meta_json,updated_at "
+            "from task_status where task_id=%s",
+            (task_id,),
+        )
+    else:
+        cur.execute(
+            "select task_id,status,stage,message,meta_json,updated_at "
+            "from task_status where task_id=?",
+            (task_id,),
+        )
+    row = cur.fetchone()
+    if row is None:
+        return {}
+    return {
+        "task_id": row[0],
+        "status": row[1],
+        "stage": row[2],
+        "message": row[3],
+        "meta": json.loads(row[4]) if row[4] else {},
+        "updated_at": row[5],
+    }
 
 
 def update_task_title(conn, task_id: str, title: str) -> None:

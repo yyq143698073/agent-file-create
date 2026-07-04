@@ -105,8 +105,8 @@ class TaskManager:
             base = self._result_dir / str(task_id)
             try:
                 base.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("mkdir_failed path=%s err=%s", base, e)
             payload: dict[str, Any] = {}
             try:
                 p = self._status_path(task_id)
@@ -116,13 +116,14 @@ class TaskManager:
                         payload.update(old)
             except Exception:
                 payload = {}
+            _ts = float(time.time())
             payload.update(
                 {
                     "task_id": str(task_id),
                     "status": str(status),
                     "stage": str(stage),
                     "message": str(message),
-                    "updated_at": float(time.time()),
+                    "updated_at": _ts,
                 }
             )
             if extra:
@@ -133,6 +134,26 @@ class TaskManager:
                 )
             except Exception:
                 return
+
+            # ── Dual-write to SQLite (best-effort, failure does not affect JSON path) ──
+            try:
+                from agent_file_create.db_service import get_db_connection, upsert_task_status
+                _conn = get_db_connection()
+                try:
+                    upsert_task_status(
+                        _conn,
+                        task_id=str(task_id),
+                        status=str(status),
+                        stage=str(stage),
+                        message=str(message),
+                        meta={k: v for k, v in payload.items()
+                               if k not in ("task_id", "status", "stage", "message", "updated_at")},
+                    )
+                finally:
+                    if hasattr(_conn, "close"):
+                        _conn.close()
+            except Exception as _e:
+                logger.debug("task_status_sqlite_write_failed task=%s err=%s", task_id, _e)
 
     def read_status(self, task_id: str) -> dict:
         p = self._status_path(task_id)
@@ -147,8 +168,8 @@ class TaskManager:
         base = self._result_dir / str(task_id)
         try:
             base.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("mkdir_failed path=%s err=%s", base, e)
         payload = self.read_task_meta(task_id)
         if isinstance(meta, dict):
             payload.update(meta)
@@ -175,8 +196,8 @@ class TaskManager:
         base = self._result_dir / str(task_id)
         try:
             base.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("mkdir_failed path=%s err=%s", base, e)
         try:
             self._analysis_results_path(task_id).write_text(
                 json.dumps(results or [], ensure_ascii=False), encoding="utf-8"
@@ -227,8 +248,8 @@ class TaskManager:
         base = self._result_dir / str(task_id)
         try:
             base.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("mkdir_failed path=%s err=%s", base, e)
         try:
             self._chat_summary_path(task_id).write_text(
                 (text or "").strip(), encoding="utf-8"
@@ -251,8 +272,8 @@ class TaskManager:
         base = self._result_dir / str(task_id)
         try:
             base.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("mkdir_failed path=%s err=%s", base, e)
         old = self.read_chat_history(task_id)
         for it in items or []:
             if not isinstance(it, dict):
@@ -319,14 +340,14 @@ class TaskManager:
         vdir = self._versions_dir(task_id)
         try:
             vdir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("mkdir_failed path=%s err=%s", vdir, e)
         # Save content file
         fname = f"{version_type}_v{version_num}.md"
         try:
             (vdir / fname).write_text(content or "", encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("save_version_write_failed file=%s err=%s", fname, e)
         # Update versions.json metadata
         meta = self._read_versions_meta(task_id)
         key = f"{version_type}_versions"
@@ -351,8 +372,56 @@ class TaskManager:
             self._versions_meta_path(task_id).write_text(
                 json.dumps(meta, ensure_ascii=False), encoding="utf-8"
             )
+        except Exception as e:
+            logger.warning("save_version_meta_write_failed task=%s err=%s", task_id, e)
+
+        # Enforce version retention (keep latest N + v1)
+        self._enforce_retention(task_id, version_type)
+
+    def _enforce_retention(self, task_id: str, version_type: str) -> None:
+        """Delete old versions exceeding VERSION_MAX_RETENTION.
+
+        Always keeps version 1 and the latest version.
+        Remaining slots are filled with newest-first versions.
+        """
+        try:
+            from agent_file_create.config import VERSION_MAX_RETENTION
+            _max = VERSION_MAX_RETENTION
         except Exception:
-            pass
+            _max = 20
+
+        if _max <= 0:
+            return
+
+        versions = self.list_versions(task_id, version_type)
+        if len(versions) <= _max:
+            return
+
+        # Sort by version number descending (newest first)
+        sorted_versions = sorted(versions, key=lambda x: x.get("version", 0), reverse=True)
+
+        # Always keep v1
+        keep = {1, sorted_versions[0].get("version")}
+
+        # Fill remaining slots with newest
+        for v in sorted_versions:
+            if len(keep) >= _max:
+                break
+            keep.add(v.get("version"))
+
+        deleted = 0
+        for v in sorted_versions:
+            vn = v.get("version")
+            if vn not in keep:
+                try:
+                    self.delete_version(task_id, version_type, vn)
+                    deleted += 1
+                except Exception as e:
+                    logger.debug("retention_delete_failed ver=%d type=%s err=%s", vn, version_type, e)
+
+        if deleted:
+            logger.info("version_retention task=%s type=%s deleted=%d kept=%d/%d",
+                        task_id, version_type, deleted, len(keep), len(sorted_versions))
 
     def _read_versions_meta(self, task_id: str) -> dict:
         p = self._versions_meta_path(task_id)
@@ -391,8 +460,8 @@ class TaskManager:
         try:
             if fp.exists():
                 fp.unlink()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("delete_version_unlink_failed file=%s err=%s", fp, e)
         meta = self._read_versions_meta(task_id)
         key = f"{version_type}_versions"
         items = list(meta.get(key) or [])
@@ -401,8 +470,8 @@ class TaskManager:
             self._versions_meta_path(task_id).write_text(
                 json.dumps(meta, ensure_ascii=False), encoding="utf-8"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("select_version_meta_write_failed task=%s err=%s", task_id, e)
         return True
 
     def select_version(self, task_id: str, version_type: str, version_num: int) -> bool:
@@ -424,8 +493,8 @@ class TaskManager:
             self._versions_meta_path(task_id).write_text(
                 json.dumps(meta, ensure_ascii=False), encoding="utf-8"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("delete_version_meta_write_failed task=%s err=%s", task_id, e)
 
         # Copy content to main file
         base = self._result_dir / str(task_id)
@@ -440,6 +509,11 @@ class TaskManager:
 
     def is_task_running(self, task_id: str) -> bool:
         return _task_running(task_id)
+
+    def list_running_tasks(self) -> list[str]:
+        """Return task_ids of all currently running tasks."""
+        with _TASK_LOCK:
+            return [tid for tid, th in _TASK_THREADS.items() if th.is_alive()]
 
     def start_task(
         self,
