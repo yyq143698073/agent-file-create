@@ -101,6 +101,18 @@ def _prepare_image_bytes(file_path: str) -> bytes:
     )
 
 
+def _prepare_image_bytes_compressed(file_path: str, quality: int = 30) -> bytes:
+    """???????????? LLM ????????"""
+    from agent_file_create.config import IMAGE_MAX_LONG_EDGE
+    from agent_file_create.preprocessor import preprocess_image_path
+
+    return preprocess_image_path(
+        file_path,
+        max_long_edge=IMAGE_MAX_LONG_EDGE,
+        jpeg_quality=quality,
+        profile="adaptive",
+    )
+
 def _ocr_text_for_image_bytes(image_bytes: bytes) -> str:
     from agent_file_create.preprocessor import easyocr_image, merge_ocr_texts, ocr_image
 
@@ -110,40 +122,64 @@ def _ocr_text_for_image_bytes(image_bytes: bytes) -> str:
 
 
 def _extract_docvqa_answer(file_path: str, question: str) -> str:
-    from agent_file_create.config import EXTRACT_API_STYLE, VISION_MODEL_NAME
+    from agent_file_create.config import EXTRACT_API_STYLE, IMAGE_JPEG_QUALITY, VISION_MODEL_NAME
     from agent_file_create.llm_client import call_llm
 
-    image_bytes = _prepare_image_bytes(file_path)
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    ocr_text = _ocr_text_for_image_bytes(image_bytes)
-    ocr_hint = ""
-    if ocr_text:
-        ocr_hint = (
-            "\nOCR 预识别文本如下，优先从中定位可核对实体、编号、日期、金额、地址，再结合视觉确认：\n"
-            + ocr_text[:3500]
+    # 3-tier fallback: full vision + OCR → vision only → reduced quality
+    attempts = [
+        {"desc": "full vision + OCR hint", "quality": IMAGE_JPEG_QUALITY, "simplify": False},
+        {"desc": "vision only, no OCR hint", "quality": IMAGE_JPEG_QUALITY, "simplify": True},
+        {"desc": "reduced quality + simplify", "quality": 25, "simplify": True},
+    ]
+    answer = ""
+    for attempt in attempts:
+        image_bytes = _prepare_image_bytes_compressed(file_path, quality=attempt["quality"])
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        ocr_hint = ""
+        if not attempt["simplify"]:
+            ocr_text = _ocr_text_for_image_bytes(image_bytes)
+            if ocr_text:
+                ocr_hint = (
+                    "\nOCR 预识别文本如下，优先从中定位可核对实体、编号、日期、金额、地址，再结合视觉确认：\n"
+                    + ocr_text[:3500]
+                )
+        prompt = (
+            "你在执行 DocVQA 文档视觉问答。"
+            "请只回答问题本身，输出尽量短的答案短语，不要输出 JSON，不要解释，不要复述题目。"
+            "如果答案是文档中的字段值，请尽量逐字保留原文。"
+            "若无法确定，输出空字符串。"
+            f"\n问题：{question.strip()}{ocr_hint}"
         )
-    prompt = (
-        "你在执行 DocVQA 文档视觉问答。"
-        "请只回答问题本身，输出尽量短的答案短语，不要输出 JSON，不要解释，不要复述题目。"
-        "如果答案是文档中的字段值，请尽量逐字保留原文。"
-        "若无法确定，输出空字符串。"
-        f"\n问题：{question.strip()}{ocr_hint}"
-    )
-    raw = call_llm(
-        prompt,
-        images_base64=[image_b64],
-        timeout_s=90,
-        api_style=EXTRACT_API_STYLE,
-        model_name=VISION_MODEL_NAME,
-        system="你是严格的文档视觉问答助手。",
-    )
-    answer = str(raw or "").strip()
+        raw = call_llm(
+            prompt,
+            images_base64=[image_b64],
+            timeout_s=90,
+            api_style=EXTRACT_API_STYLE,
+            model_name=VISION_MODEL_NAME,
+            system="你是严格的文档视觉问答助手。",
+        )
+        raw_str = str(raw or "").strip()
+        if not raw_str:
+            continue
+        # Accept plain-text answer
+        if not raw_str.startswith("{"):
+            answer = raw_str
+            break
+        # LLM occasionally returns JSON — try to extract answer field
+        try:
+            obj = json.loads(raw_str)
+            ans = str(obj.get("answer") or obj.get("response") or obj.get("text") or "")
+            if ans.strip():
+                answer = ans.strip()
+                break
+        except Exception:
+            pass  # unparseable JSON, try next attempt
+
+    answer = str(answer or "").strip()
     answer = re.sub(r"^```(?:text)?\s*", "", answer, flags=re.I).strip()
     answer = re.sub(r"\s*```$", "", answer).strip()
     answer = re.sub(r"^(答案|answer)[:：]\s*", "", answer, flags=re.I).strip()
     return answer
-
-
 def _extract_ocr_text(file_path: str) -> str:
     image_bytes = _prepare_image_bytes(file_path)
     return _ocr_text_for_image_bytes(image_bytes)
