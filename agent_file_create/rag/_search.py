@@ -15,6 +15,7 @@ from agent_file_create.config import (
     CONTENT_API_KEY,
     CONTENT_API_STYLE,
     CONTENT_MODEL_NAME,
+    RERANK_MODEL,
 )
 from agent_file_create.llm_client import call_llm
 from agent_file_create.rag.embedder import embed_texts
@@ -22,6 +23,7 @@ from agent_file_create.rag.store import Hit
 
 from agent_file_create.rag._utils import (
     bm25_scores as _bm25_scores,
+    compute_adaptive_rrf_k as _compute_adaptive_rrf_k,
     mmr_rerank as _mmr_rerank,
     normalize_kb as _normalize_kb,
     rrf_ranks as _rrf_ranks,
@@ -110,14 +112,16 @@ class SearchMixin:
                         enable_diversity: bool = True,
                         enable_title_boost: bool = True,
                         enable_adaptive_weights: bool = True,
+                        enable_rerank: bool = False,
                         hyde_query: str = "",
                         ) -> list[Hit]:
-        """Adaptive recall: auto-tune fusion weights based on query characteristics.
+        """Adaptive recall with optional chunk-level cross-encoder reranking.
 
         - Numbers/technical terms → more lexical + BM25 weight (exact match matters)
         - Abstract/long queries → more vector weight (semantic match matters)
         - Title keyword boost rewards chunks from documents with query-matching titles
         - MMR diversity ensures different sections are represented
+        - enable_rerank: cross-encoder rerank top-50 RRF candidates → top_k
         - hyde_query: if provided, used for vector embedding; original query for lexical
         """
         kb2 = _normalize_kb(kb)
@@ -128,16 +132,16 @@ class SearchMixin:
         vec_q = str(hyde_query or "").strip() or q
         profile = self._analyze_query(q)
 
-        cap = 180
+        cap = 240
         if profile["has_numbers"] or profile["has_tech_terms"]:
-            vec_cand = min(max(30, int(top_k or 0) * 8), cap)
-            lex_cand = min(max(40, int(top_k or 0) * 14), cap)
+            vec_cand = min(max(40, int(top_k or 0) * 10), cap)
+            lex_cand = min(max(50, int(top_k or 0) * 18), cap)
         elif profile["concreteness"] > 0.6:
-            vec_cand = min(max(40, int(top_k or 0) * 12), cap)
-            lex_cand = min(max(30, int(top_k or 0) * 10), cap)
+            vec_cand = min(max(50, int(top_k or 0) * 15), cap)
+            lex_cand = min(max(40, int(top_k or 0) * 12), cap)
         else:
-            vec_cand = min(max(50, int(top_k or 0) * 14), cap)
-            lex_cand = min(max(20, int(top_k or 0) * 6), cap)
+            vec_cand = min(max(60, int(top_k or 0) * 18), cap)
+            lex_cand = min(max(30, int(top_k or 0) * 8), cap)
 
         cache_key = vec_q if vec_q != q else q
         qv = self._cached_embed_query(cache_key)
@@ -201,7 +205,7 @@ class SearchMixin:
         lx_r = _rrf_ranks([(str(it["hit"].chunk_id or ""), float(it.get("lex") or 0.0)) for it in items])
 
         scored: list[tuple[float, Hit]] = []
-        k_rrf = 60.0
+        k_rrf = _compute_adaptive_rrf_k(profile) if enable_adaptive_weights else 60.0
         for it, braw, vraw in zip(items, bm25, vec):
             h = it["hit"]
             hid = str(h.chunk_id or "")
@@ -211,6 +215,7 @@ class SearchMixin:
             meta = dict(h.meta or {})
             meta_scores = {"vec": float(vraw), "bm25": float(braw), "lex": float(it.get("lex") or 0.0)}
             meta["scores"] = meta_scores
+            meta["rrf_k"] = k_rrf
             s = (w_vec / (k_rrf + rv)) + (w_bm / (k_rrf + rb)) + (w_lex / (k_rrf + rl))
             scored.append((float(s), Hit(
                 kb=h.kb, doc_id=h.doc_id, chunk_id=h.chunk_id,
@@ -221,11 +226,26 @@ class SearchMixin:
         scored.sort(key=lambda x: x[0], reverse=True)
         result = [h for _, h in scored[: max(1, int(top_k or 0))]]
 
+        # ── Chunk-level cross-encoder reranking (Top-50 → Top-K) ──────────
+        if enable_rerank and len(scored) >= 3:
+            from agent_file_create.rag.reranker import (
+                _cross_encoder_rerank as _ce_rerank,
+            )
+            rerank_candidates = [h for _, h in scored[: max(50, int(top_k or 0) * 6)]]
+            try:
+                result = _ce_rerank(q, rerank_candidates, RERANK_MODEL, max(1, int(top_k or 0)))
+                # Apply title boost and diversity on reranked results (lighter touch)
+                if enable_title_boost:
+                    result = _title_keyword_boost(result, q, boost_factor=0.08)
+                return result
+            except Exception:
+                pass  # fall through to default path
+
         if enable_title_boost:
-            result = _title_keyword_boost(result, q, boost_factor=0.10)
+            result = _title_keyword_boost(result, q, boost_factor=0.15)
 
         if enable_diversity and len(result) > 2:
-            result = _mmr_rerank(result, lambda_param=0.7, top_k=max(1, int(top_k or 0)))
+            result = _mmr_rerank(result, lambda_param=0.40, top_k=max(1, int(top_k or 0)))
 
         return result
 
@@ -500,7 +520,8 @@ class SearchMixin:
         bm_r = _rrf_ranks(list(zip(ids, bm25)))
         lx_r = _rrf_ranks([(str(it["hit"].chunk_id or ""), float(it.get("lex") or 0.0)) for it in items])
         scored: list[tuple[float, Hit]] = []
-        k_rrf = 60.0
+        profile = self._analyze_query(q)
+        k_rrf = _compute_adaptive_rrf_k(profile)
         for it, braw, vraw in zip(items, bm25, vec):
             h = it["hit"]
             hid = str(h.chunk_id or "")
@@ -510,6 +531,7 @@ class SearchMixin:
             meta = dict(h.meta or {})
             meta_scores = {"vec": float(vraw), "bm25": float(braw), "lex": float(it.get("lex") or 0.0)}
             meta["scores"] = meta_scores
+            meta["rrf_k"] = k_rrf
             s = (1.0 / (k_rrf + rv)) + (1.0 / (k_rrf + rb)) + (1.0 / (k_rrf + rl))
             scored.append((float(s), Hit(kb=h.kb, doc_id=h.doc_id, chunk_id=h.chunk_id, chunk_index=h.chunk_index, section_path=h.section_path, content=h.content, score=float(s), meta=meta)))
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -551,12 +573,14 @@ class SearchMixin:
         if len(variants) <= 1:
             return self.search(kb=kb, query=question, top_k=top_k, filters=filters)
 
+        profile = self._analyze_query(question)
+        mq_k = _compute_adaptive_rrf_k(profile)
         all_hits: dict[str, tuple[Hit, float]] = {}
         for rank, variant in enumerate(variants):
             hits = self.search(kb=kb, query=variant, top_k=max(10, top_k * 2), filters=filters)
             for hit in hits:
                 cid = str(hit.chunk_id or "")
-                rrf = 1.0 / (60.0 + float(rank + 1))
+                rrf = 1.0 / (mq_k + float(rank + 1))
                 if cid in all_hits:
                     _, prev = all_hits[cid]
                     all_hits[cid] = (hit, prev + rrf)
@@ -578,12 +602,14 @@ class SearchMixin:
         orig_hits = self.search(kb=kb, query=question, top_k=max(10, top_k * 2), filters=filters)
         sb_hits = self.search(kb=kb, query=stepback, top_k=max(10, top_k * 2), filters=filters)
 
+        profile = self._analyze_query(question)
+        sb_k = _compute_adaptive_rrf_k(profile)
         merged: dict[str, tuple[Hit, float]] = {}
         for rank, h in enumerate(orig_hits):
-            merged[h.chunk_id] = (h, 1.0 / (60.0 + rank + 1) * 1.2)
+            merged[h.chunk_id] = (h, 1.0 / (sb_k + rank + 1) * 1.2)
         for rank, h in enumerate(sb_hits):
             cid = str(h.chunk_id or "")
-            rrf = 1.0 / (60.0 + rank + 1)
+            rrf = 1.0 / (sb_k + rank + 1)
             if cid in merged:
                 hit, prev = merged[cid]
                 merged[cid] = (hit, prev + rrf)

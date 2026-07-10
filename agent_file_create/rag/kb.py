@@ -15,7 +15,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
-from agent_file_create.rag.chunker import chunk_text
+from agent_file_create.rag.chunker import chunk_text, _assign_parent_chunks
 from agent_file_create.rag.embedder import embed_texts
 from agent_file_create.rag.store import default_store
 
@@ -243,6 +243,9 @@ class KnowledgeBase(SearchMixin, QueryMixin, AnswerMixin):
         if not chunks:
             return {"kb": kb2, "doc_id": did, "ok": False, "error": "no_chunks"}
 
+        # Assign parent chunk groups for context-window retrieval
+        chunks = _assign_parent_chunks(chunks)
+
         logger.info(f"kb_chunked kb={kb2} file={p.name} chunks={len(chunks)} chunk_size={_tc}")
 
         def _augment(content: str, section: str) -> str:
@@ -326,6 +329,7 @@ class KnowledgeBase(SearchMixin, QueryMixin, AnswerMixin):
                     "section_path": c.section_path,
                     "content": c.content,
                     "embedding": v,
+                    "parent_chunk_id": getattr(c, "parent_chunk_id", "") or "",
                     "meta": {"source": src, "title": ttl, "doc_type": dtype, "file_ext": p.suffix.lower().lstrip("."), "lang": meta_doc.get("lang")},
                 }
             )

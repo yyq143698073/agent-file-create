@@ -249,6 +249,36 @@ class SQLiteVectorStore:
             ))
         return hits
 
+    def get_parent_context(self, *, kb: str, parent_chunk_id: str) -> list[Hit]:
+        """Fetch all chunks sharing the same parent_chunk_id.
+
+        Used for parent-document backtracking: when a child chunk is retrieved,
+        expand to the full parent paragraph for richer LLM context.
+        """
+        kb = str(kb or "").strip() or "default"
+        pid = str(parent_chunk_id or "").strip()
+        if not pid:
+            return []
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "select id,kb,doc_id,chunk_index,section_path,content,meta_json from kb_chunks where kb=? and parent_chunk_id=? order by chunk_index",
+                (kb, pid),
+            )
+            rows = cur.fetchall() or []
+        finally:
+            conn.close()
+        hits: list[Hit] = []
+        for r in rows:
+            meta = _safe_json_obj(r[6])
+            hits.append(Hit(
+                kb=str(r[1] or ""), doc_id=str(r[2] or ""), chunk_id=str(r[0] or ""),
+                chunk_index=int(r[3] or 0), section_path=str(r[4] or ""),
+                content=str(r[5] or ""), score=0.0, meta=meta or {},
+            ))
+        return hits
+
     def list_docs(self, *, kb: str) -> list[dict]:
         conn = self._conn()
         try:
@@ -279,7 +309,7 @@ class SQLiteVectorStore:
         conn = self._conn()
         try:
             cur = conn.cursor()
-            cur.execute("select count(distinct id) from kb_docs where kb=?", (kb,))
+            cur.execute("select count(distinct id) from kb_docs where kb=? and id not like '__registry__%'", (kb,))
             docs = int((cur.fetchone() or [0])[0] or 0)
             cur.execute("select count(*) from kb_chunks where kb=?", (kb,))
             chunks = int((cur.fetchone() or [0])[0] or 0)
@@ -314,10 +344,11 @@ class SQLiteVectorStore:
                 emb = it.get("embedding")
                 emb_json = _safe_json(emb if isinstance(emb, list) else [])
                 meta_json = _safe_json(it.get("meta") if isinstance(it.get("meta"), dict) else {})
+                pid = str(it.get("parent_chunk_id") or "").strip()
                 # Also strip NUL from section_path
                 section_path = str(it.get("section_path") or "").replace("\x00", "")
                 cur.execute(
-                    "insert or replace into kb_chunks(id,kb,doc_id,chunk_index,section_path,content,embedding_json,meta_json,created_at) values(?,?,?,?,?,?,?,?,?)",
+                    "insert or replace into kb_chunks(id,kb,doc_id,chunk_index,section_path,content,embedding_json,meta_json,parent_chunk_id,created_at) values(?,?,?,?,?,?,?,?,?,?)",
                     (
                         cid,
                         kb,
@@ -327,6 +358,7 @@ class SQLiteVectorStore:
                         content,
                         emb_json,
                         meta_json,
+                        pid,
                         ts,
                     ),
                 )
@@ -782,6 +814,32 @@ class PostgresVectorStore:
             ))
         return hits
 
+    def get_parent_context(self, *, kb: str, parent_chunk_id: str) -> list[Hit]:
+        """Fetch all chunks sharing the same parent_chunk_id (Postgres version)."""
+        kb = str(kb or "").strip() or "default"
+        pid = str(parent_chunk_id or "").strip()
+        if not pid:
+            return []
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "select id,kb,doc_id,chunk_index,section_path,content,meta from kb_chunks where kb=%s and parent_chunk_id=%s order by chunk_index",
+                (kb, pid),
+            )
+            rows = cur.fetchall() or []
+        finally:
+            conn.close()
+        hits: list[Hit] = []
+        for r in rows:
+            meta = r[6] if isinstance(r[6], dict) else {}
+            hits.append(Hit(
+                kb=str(r[1] or ""), doc_id=str(r[2] or ""), chunk_id=str(r[0] or ""),
+                chunk_index=int(r[3] or 0), section_path=str(r[4] or ""),
+                content=str(r[5] or ""), score=0.0, meta=meta,
+            ))
+        return hits
+
     def list_docs(self, *, kb: str) -> list[dict]:
         kb = str(kb or "").strip() or "default"
         conn = self._conn()
@@ -816,7 +874,7 @@ class PostgresVectorStore:
         conn = self._conn()
         try:
             cur = conn.cursor()
-            cur.execute("select count(distinct id) from kb_docs where kb=%s", (kb,))
+            cur.execute("select count(distinct id) from kb_docs where kb=%s and id not like '__registry__%%'", (kb,))
             docs = int((cur.fetchone() or [0])[0] or 0)
             cur.execute("select count(*) from kb_chunks where kb=%s", (kb,))
             chunks = int((cur.fetchone() or [0])[0] or 0)

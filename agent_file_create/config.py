@@ -58,6 +58,10 @@ IMAGE_MAX_LONG_EDGE = int(os.getenv("IMAGE_MAX_LONG_EDGE", "2048"))
 IMAGE_JPEG_QUALITY = int(os.getenv("IMAGE_JPEG_QUALITY", "85"))
 
 OCR_ENABLED = str(os.getenv("OCR_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "y", "on"}
+OCR_AUX_ENGINE = os.getenv("OCR_AUX_ENGINE", "easyocr").strip().lower()
+OCR_AUX_MODE = os.getenv("OCR_AUX_MODE", "auto").strip().lower()
+OCR_AUX_SCORE_THRESHOLD = float(os.getenv("OCR_AUX_SCORE_THRESHOLD", "78"))
+OCR_AUX_FORM_MARKERS = int(os.getenv("OCR_AUX_FORM_MARKERS", "5"))
 PDF_OCR_THRESHOLD_X = float(os.getenv("PDF_OCR_THRESHOLD_X", "0.6"))
 PDF_OCR_THRESHOLD_Y = float(os.getenv("PDF_OCR_THRESHOLD_Y", "0.6"))
 PDF_MAX_PAGES_VISION = int(os.getenv("PDF_MAX_PAGES_VISION", "8"))
@@ -66,7 +70,7 @@ MODEL_TIMEOUT = int(os.getenv("MODEL_TIMEOUT", "60"))
 MODEL_TIMEOUT_SHORT = int(os.getenv("MODEL_TIMEOUT_SHORT", "60"))
 MODEL_TIMEOUT_LONG = int(os.getenv("MODEL_TIMEOUT_LONG", "180"))
 
-MAX_WORKERS_DEFAULT = int(os.getenv("MAX_WORKERS_DEFAULT", "8"))
+MAX_WORKERS_DEFAULT = int(os.getenv("MAX_WORKERS_DEFAULT", "16"))
 
 RERANK_ENABLED = str(os.getenv("RERANK_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "y", "on"}
 RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3").strip()
@@ -149,5 +153,24 @@ def validate_config() -> list[str]:
     ):
         if not (5 <= _val <= 600):
             errors.append(f"{_name}={_val} is out of range (5-600)")
+
+    if OCR_AUX_ENGINE not in {"", "easyocr"}:
+        errors.append(
+            f"OCR_AUX_ENGINE='{OCR_AUX_ENGINE}' is invalid. "
+            "Valid values: ['', 'easyocr']"
+        )
+    if OCR_AUX_MODE not in {"off", "auto", "always"}:
+        errors.append(
+            f"OCR_AUX_MODE='{OCR_AUX_MODE}' is invalid. "
+            "Valid values: ['off', 'auto', 'always']"
+        )
+    if not (0 <= OCR_AUX_SCORE_THRESHOLD <= 200):
+        errors.append(
+            f"OCR_AUX_SCORE_THRESHOLD={OCR_AUX_SCORE_THRESHOLD} is out of range (0-200)"
+        )
+    if not (0 <= OCR_AUX_FORM_MARKERS <= 100):
+        errors.append(
+            f"OCR_AUX_FORM_MARKERS={OCR_AUX_FORM_MARKERS} is out of range (0-100)"
+        )
 
     return errors

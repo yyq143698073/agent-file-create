@@ -116,6 +116,33 @@ def bm25_scores(query_terms: list[str], docs_terms: list[list[str]]) -> list[flo
 
 # ── RRF ───────────────────────────────────────────────────────────────────────
 
+def compute_adaptive_rrf_k(
+    profile: dict,
+    base_k: float = 60.0,
+) -> float:
+    """Return an adaptive RRF k based on query characteristics.
+
+    - Numeric / technical queries  → smaller k (lexical matters more)
+    - Long / abstract queries      → larger  k (vector  matters more)
+    - Default (balanced)           → base_k
+    """
+    has_numbers = bool(profile.get("has_numbers"))
+    has_tech = bool(profile.get("has_tech_terms"))
+    concreteness = float(profile.get("concreteness", 0.5))
+    length = int(profile.get("length", 0))
+
+    if has_numbers or has_tech:
+        return max(30.0, base_k * 0.5)
+    if length > 60:
+        return min(120.0, base_k * 1.6)
+    if concreteness < 0.3:
+        return min(100.0, base_k * 1.4)
+    if concreteness > 0.7:
+        return max(35.0, base_k * 0.65)
+
+    return base_k
+
+
 def rrf_ranks(items: list[tuple[str, float]]) -> dict[str, int]:
     xs = [(k, float(v)) for k, v in (items or []) if str(k or "").strip()]
     xs.sort(key=lambda x: x[1], reverse=True)
