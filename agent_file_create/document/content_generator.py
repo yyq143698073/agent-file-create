@@ -1085,7 +1085,98 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
             out_lines.append(body)
 
     raw = "\n".join(out_lines).strip() + "\n"
-    return raw  # _final_coherence_review replaced by Critic graph node
+
+    # ── Q4 P2: Transition sentence injection between adjacent H2 sections ──
+    if _h2n >= 2:
+        raw = _inject_h2_transitions(raw, task_id)
+
+    return raw
+
+
+def _inject_h2_transitions(content: str, task_id: str) -> str:
+    """Check adjacent H2 sections for missing transition sentences, inject if absent.
+
+    A transition is a short sentence at the end of section N that logically
+    connects to section N+1.  Without transitions, the document reads as a
+    collection of standalone essays rather than a cohesive report.
+    """
+    # Parse into H2 blocks
+    blocks = re.split(r"\n(?=## )", content)
+    if len(blocks) < 2:
+        return content
+
+    result_blocks = [blocks[0]]
+    for i in range(1, len(blocks)):
+        prev = result_blocks[-1]
+        curr = blocks[i]
+
+        # Extract H2 titles
+        prev_title_match = re.search(r"^##\s+(.+)", prev, re.MULTILINE)
+        curr_title_match = re.search(r"^##\s+(.+)", curr, re.MULTILINE)
+        if not prev_title_match or not curr_title_match:
+            result_blocks.append(curr)
+            continue
+
+        prev_title = prev_title_match.group(1).strip()
+        curr_title = curr_title_match.group(1).strip()
+
+        # Check if a transition already exists: look for connector words in
+        # the last 2 sentences of the previous section
+        last_sentences = re.split(r"[。！？\n](?=\s*[^\s])", prev.strip())[-3:]
+        last_text = "".join(last_sentences[-2:])
+        connectors = ["接下来", "下面", "下一", "进一步", "在此基础", "基于以上",
+                      "承接", "前述", "综上所", "在此背景", "另一方"]
+        has_transition = any(c in last_text for c in connectors)
+
+        if not has_transition:
+            # Generate a lightweight transition via LLM
+            transition = _generate_transition(prev_title, curr_title, prev[-300:], task_id)
+            if transition:
+                # Insert before the next H2 heading
+                prev += "\n\n" + transition
+                result_blocks[-1] = prev
+
+        result_blocks.append(curr)
+
+    return "\n".join(result_blocks)
+
+
+def _generate_transition(prev_title: str, next_title: str,
+                         context: str, task_id: str) -> str:
+    """Generate a 1-2 sentence transition connecting two H2 sections."""
+    try:
+        from agent_file_create.llm_client import call_llm
+    except Exception:
+        return ""
+
+    prompt = (
+        "你是一个报告连贯性编辑。下面有两个相邻章节，请生成1个过渡句（15-40字），"
+        "自然地将上一章节引向下一章节。过渡句放在上一章节的末尾。\n\n"
+        f"上一章：{prev_title}\n"
+        f"下一章：{next_title}\n"
+        f"上一章末尾内容（参考）：\n{context[-300:]}\n\n"
+        "要求：只输出过渡句本身，不要加任何前缀、编号或解释。"
+        "过渡句应该自然流畅，不要生硬地写'下面我们来讨论...'。"
+    )
+    try:
+        text = call_llm(
+            prompt,
+            timeout_s=20,
+            temperature=0.3,
+            num_predict=60,
+            system="你是一个中文报告编辑助手。",
+            api_style=CONTENT_API_STYLE,
+            api_endpoint=CONTENT_API_ENDPOINT,
+            api_key=CONTENT_API_KEY,
+            model_name=CONTENT_MODEL_NAME,
+        )
+        result = str(text or "").strip()
+        # Validate: not too short, not too long, no markdown
+        if 10 <= len(result) <= 80 and not result.startswith("#"):
+            return result
+    except Exception:
+        pass
+    return ""
 
 
 def regenerate_section(
