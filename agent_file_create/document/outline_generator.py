@@ -1,7 +1,8 @@
 import logging
 import re
 import time
-from typing import Any, Dict, List
+from concurrent.futures import ThreadPoolExecutor, Future
+from typing import Any, Dict, List, Optional
 
 from agent_file_create.config import OUTLINE_API_ENDPOINT, OUTLINE_API_KEY, OUTLINE_API_STYLE, OUTLINE_MODEL_NAME, MODEL_TIMEOUT
 from agent_file_create.llm_client import call_llm
@@ -75,6 +76,132 @@ def _validate_outline(outline: str) -> List[str]:
     return issues
 
 
+# ── Q2 P0: Naming quality checks ─────────────────────────────────────────────
+
+_TEMPLATE_TITLE_PATTERNS = [
+    r"背景", r"概述", r"分析", r"建议", r"总结",
+    r"引言", r"展望", r"介绍", r"现状", r"意义",
+    r"讨论", r"结论", r"对策", r"方案", r"趋势",
+]
+
+
+def _check_naming_quality(outline: str) -> list[str]:
+    """Check outline naming quality — returns non-blocking warnings.
+
+    Detects:
+    - Template-like headings (空洞词: 背景/概述/分析/建议 etc.)
+    - Overly short headings (<4 characters)
+    - Adjacent similar headings (edit distance > 70%)
+    """
+    warnings: list[str] = []
+    headings: list[tuple[int, str]] = []
+    for line in (outline or "").splitlines():
+        m = re.match(r"^(#{2,3})\s+(.+)$", line.strip())
+        if m:
+            headings.append((len(m.group(1)), m.group(2).strip()))
+
+    if not headings:
+        return warnings
+
+    # 1. Template-like + short heading detection
+    for level, title in headings:
+        clean = re.sub(r"^[\d.]+\s*", "", title).strip()
+        if len(clean) < 4:
+            warnings.append(f"标题过短(<4字): '{title}'")
+        for pat in _TEMPLATE_TITLE_PATTERNS:
+            if re.search(pat, clean) and len(clean) <= 8:
+                warnings.append(f"模板化标题(含'{pat}'): '{title}'")
+                break
+
+    # 2. Adjacent heading similarity
+    for i in range(len(headings) - 1):
+        t1 = re.sub(r"^[\d.]+\s*", "", headings[i][1]).strip()
+        t2 = re.sub(r"^[\d.]+\s*", "", headings[i + 1][1]).strip()
+        dist = _levenshtein(t1, t2)
+        sim = 1.0 - dist / max(len(t1), len(t2), 1)
+        if sim > 0.70:
+            warnings.append(f"相邻标题高度相似({sim:.0%}): '{t1}' ↔ '{t2}'")
+
+    return warnings
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i]
+        for j, cb in enumerate(b, start=1):
+            curr.append(min(curr[-1] + 1, prev[j] + 1, prev[j - 1] + (0 if ca == cb else 1)))
+        prev = curr
+    return prev[-1]
+
+
+# ── Q2 P1: Critical section content check ────────────────────────────────────
+
+_CRITICAL_KEYWORDS = [
+    "局限", "不足", "限制", "缺口", "改进", "风险",
+    "挑战", "不确定性", "失败", "对比", "争议", "缺陷",
+]
+
+
+def _check_critical_section(outline: str) -> list[str]:
+    """Verify the critical/limitation chapter has concrete content.
+
+    Checks:
+    - A critical chapter exists in the last 2 H2 positions
+    - It contains at least one quantitative indicator or source reference
+    """
+    h2s: list[str] = []
+    for line in (outline or "").splitlines():
+        m = re.match(r"^##\s+(.+)$", line.strip())
+        if m:
+            h2s.append(m.group(1).strip())
+
+    if len(h2s) < 3:
+        return []  # structural validation handles this
+
+    # Check last 2 H2 positions
+    last_two = h2s[-2:]
+    has_critical = any(
+        any(kw in h for kw in _CRITICAL_KEYWORDS)
+        for h in last_two
+    )
+
+    if not has_critical:
+        return ["批判章节缺失：最后2个H2中未找到局限性/不足/挑战等关键词"]
+
+    # Check for quantitative indicators in headings
+    critical_h2 = [h for h in last_two if any(kw in h for kw in _CRITICAL_KEYWORDS)]
+    if critical_h2:
+        h3s_under_critical = []
+        capture = False
+        for line in (outline or "").splitlines():
+            m = re.match(r"^(#{2,3})\s+(.+)$", line.strip())
+            if m:
+                level = len(m.group(1))
+                title = m.group(2).strip()
+                if level == 2:
+                    capture = any(kw in title for kw in _CRITICAL_KEYWORDS)
+                elif level == 3 and capture:
+                    h3s_under_critical.append(title)
+
+        has_detail = any(
+            re.search(r"\d+[%％]|\d+[个项种类条]|[0-9]+(?:\.\d+)?", h)
+            for h in h3s_under_critical
+        )
+        if not has_detail and len(h3s_under_critical) <= 1:
+            return ["批判章节缺少具体子节：建议增加包含量化数据或具体技术细节的子节"]
+
+    return []
+
+
 def _clean_llm_output(text: str) -> str:
     out = (text or "").strip()
     out = re.sub(r"^```[a-zA-Z]*\s*", "", out).strip()
@@ -96,12 +223,24 @@ def _add_outline_numbering(outline: str) -> str:
 
     into::
 
-        # 1. 报告标题
+        # 报告标题               ← single H1: no number (document title)
         ## 1.1 背景分析
         ### 1.1.1 行业现状
         ## 1.2 数据解读
+
+    When there are 2+ ``#`` headings they become numbered chapters::
+
+        # 1. 营收分析
+        ## 1.1 产品线
+        # 2. 成本分析
+        ## 2.1 原材料
     """
     lines = (outline or "").splitlines()
+
+    # Only number H1 when the outline has multiple top-level chapters
+    h1_count = sum(1 for line in lines if re.match(r"^#\s", line.strip()))
+    number_h1 = h1_count > 1
+
     result: list[str] = []
     # counters[i] = current count at heading level i (1-indexed: counters[1] for #, counters[2] for ##, ...)
     counters: list[int] = [0] * 10
@@ -121,14 +260,19 @@ def _add_outline_numbering(outline: str) -> str:
         for lv in range(level + 1, len(counters)):
             counters[lv] = 0
 
-        # Build hierarchical number: e.g. "1.1.2" for level 3
-        number_parts = [str(counters[lv]) for lv in range(1, level + 1) if counters[lv] > 0]
-        number = ".".join(number_parts) + "."
+        # Build hierarchical number.  When H1 is not numbered (single-chapter
+        # report), shift the numbering baseline to level 2 so H2 gets "1."
+        # instead of the orphaned "1.1." that implies an invisible chapter.
+        start_lv = 1 if number_h1 else 2
+        number_parts = [str(counters[lv]) for lv in range(start_lv, level + 1) if counters[lv] > 0]
+        number = ".".join(number_parts) + "." if number_parts else ""
 
         # Preserve original indentation
         indent = line[:len(line) - len(line.lstrip())]
-        if level == 1:
+        if level == 1 and not number_h1:
             result.append(f"{indent}# {title}")
+        elif level == 1:
+            result.append(f"{indent}# {number} {title}")
         else:
             result.append(f"{indent}{'#' * level} {number} {title}")
 
@@ -140,7 +284,9 @@ def _build_outline_prompt(user_req: str, digest: str, feedback: str, target_word
         "你是一个专业报告的大纲生成助手。请基于参考材料与用户需求输出 Markdown 大纲。",
         "",
         "结构规则（必须遵守）：",
-        "1) # 一级标题 = 报告总标题（1个），应概括报告的核心主题。",
+        "1) # 一级标题 = 章标题（至少1个，内容丰富的报告可增加到不超过6个）。",
+        "   每个 # 代表一个独立的「章」（chapter），编号由系统自动生成（1. 2. 3. …）。",
+        "   单主题短报告使用 1 个 # 即可；多维度综合报告可将每个维度设为独立的 # 章。",
         "2) ## 二级标题 = 主章节（至少3个，建议不超过8个）。",
         "   命名原则：从材料中提取最突出的主题作为章节名，而不是套用「背景/分析/建议」的固定模板。",
         "   好的命名示例：「华东区Q3销售异常分析」「竞品A产品策略拆解」「供应链成本优化路径」",
@@ -151,6 +297,19 @@ def _build_outline_prompt(user_req: str, digest: str, feedback: str, target_word
         "5) 层级必须连续，禁止 # 直接跳 ###（跳过 ##）。",
         "6) 如果材料中没有支撑某类内容，不要强行编造该章节。宁可大纲短一些，也不要无中生有。",
         "7) 只输出 Markdown 大纲本身，不要解释、不要前言后语、不要代码块包裹。",
+        "8) 避免同质化结构：连续多个 ## 章节如果采用完全相同的「概述—拆解—数据」模式，请做结构调整——例如将某一章改为问题驱动型（以具体问题开头）、案例分析型（以实例贯穿）、或对比分析型（多方案并列）。相邻章节的结构类型不应完全相同。",
+        "9) 强制批判章节：大纲必须包含一个 ## 二级章节来讨论方法的局限性、失败场景、未解决的问题或与其他方法的对比差距。要求：a) 必须引用至少一个具体来源（标注材料编号如'根据材料1...'），b) 至少包含一项量化数据或具体技术细节，c) 不得使用'相关研究不足''数据有限'等无实质内容的表述。该章节放在大纲后半部分（倒数第1~2个 ## 的位置），不能是 ### 三级子节。",
+        "",
+        "【标题命名示例】",
+        "✅ 好的标题（具体、可从材料中定位）：",
+        "- 锂电池能量密度五年提升路径：从200Wh/kg到500Wh/kg",
+        "- Q3华东区销售异常的三重归因：价格、渠道、竞品",
+        "- 供应链成本优化：物流外包 vs 自建仓储的ROI对比",
+        "❌ 差的标题（空洞、模板化，请避免）：",
+        "- 第一章 背景分析",
+        "- 第二节 数据概况",
+        "- 相关技术概述",
+        "- 未来展望与建议",
         "",
         "用户需求：",
         user_req,
@@ -193,8 +352,9 @@ def _check_outline_coverage(outline: str, user_req: str, template_sections: list
 
     Returns a list of missing or inadequately covered section names (empty = all good).
     """
+    # Fast skip: no template sections → coverage check is redundant with format validation
     sections_to_check = (template_sections or [])[:]
-    if not sections_to_check and not user_req:
+    if not sections_to_check:
         return []
 
     check_prompt = (
@@ -274,19 +434,53 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
             out = "# 报告\n\n" + out
 
         best_outline = out
-        issues = _validate_outline(out)
+        # ── Run format validation + coverage check in parallel ──────
+        # Validation is pure regex (instant); coverage check is an LLM
+        # call (1-2 s).  Running them concurrently eliminates the serial
+        # wait for the LLM on the first (passing) attempt.
+        issues: list[str]
+        coverage_future: Optional[Future] = None
+        if template_sections:
+            with ThreadPoolExecutor(max_workers=2) as _pool:
+                _val_future = _pool.submit(_validate_outline, out)
+                coverage_future = _pool.submit(_check_outline_coverage, out, user_req, template_sections)
+                issues = _val_future.result()
+        else:
+            issues = _validate_outline(out)
+
+        # ── Q2: Run naming + critical-section checks (non-blocking) ──────
+        naming_warnings = _check_naming_quality(out)
+        critical_issues = _check_critical_section(out)
+
         if not issues:
-            # Format OK — check content coverage
-            coverage_issues = _check_outline_coverage(out, user_req, template_sections)
-            if not coverage_issues:
+            coverage_issues = coverage_future.result() if coverage_future else []
+            soft_warnings = naming_warnings + critical_issues
+            if not coverage_issues and not soft_warnings:
                 t1 = time.perf_counter()
                 logger.info(f"outline_done seconds={t1 - t0:.2f} prompt_chars={len(prompt)} outline_chars={len(out)} attempts={attempt + 1}")
                 return _add_outline_numbering(out)
-            last_issues = [f"内容覆盖不足，缺失或需加强：{'、'.join(coverage_issues)}"]
-            logger.warning(f"outline_coverage_failed attempt={attempt + 1} missing={coverage_issues}")
+
+            # Feed soft warnings back for retry (non-blocking: only trigger retry if coverage fails)
+            if coverage_issues:
+                fb = f"内容覆盖不足，缺失或需加强：{'、'.join(coverage_issues)}"
+                if soft_warnings:
+                    fb += f"；命名质量问题：{'；'.join(soft_warnings[:4])}"
+                last_issues = [fb]
+                logger.warning(f"outline_coverage_failed attempt={attempt + 1} missing={coverage_issues} naming_warnings={len(soft_warnings)}")
+            else:
+                # Only naming/critical warnings — accept but log
+                t1 = time.perf_counter()
+                logger.info(f"outline_done_with_naming_warnings seconds={t1 - t0:.2f} warnings={soft_warnings}")
+                return _add_outline_numbering(out)
         else:
-            last_issues = issues
-            logger.warning(f"outline_validation_failed attempt={attempt + 1} issues={issues}")
+            # Inject naming warnings into structural feedback
+            fb_parts = issues[:]
+            if naming_warnings:
+                fb_parts.append(f"命名质量建议：{'；'.join(naming_warnings[:3])}")
+            if critical_issues:
+                fb_parts.append(f"批判章节建议：{'；'.join(critical_issues[:2])}")
+            last_issues = fb_parts
+            logger.warning(f"outline_validation_failed attempt={attempt + 1} issues={issues} naming={len(naming_warnings)} critical={len(critical_issues)}")
 
     t1 = time.perf_counter()
     logger.warning(f"outline_done_with_issues seconds={t1 - t0:.2f} attempts=3 issues={last_issues}")
