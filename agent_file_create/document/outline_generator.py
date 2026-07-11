@@ -202,6 +202,51 @@ def _check_critical_section(outline: str) -> list[str]:
     return []
 
 
+# ── Q2 P2: Topic coverage check (jieba-based, no LLM call) ──────────────────
+
+
+def _check_topic_coverage(outline: str, user_prompt: str) -> dict:
+    """Check whether outline headings cover key topics from the user prompt.
+
+    Uses jieba token-frequency extraction on the user prompt and matches
+    against outline heading text.  Returns coverage ratio + uncovered terms.
+    Coverage < 0.5 triggers feedback injection for retry.
+    """
+    if not user_prompt or len(user_prompt.strip()) < 10:
+        return {"coverage": 1.0, "covered": [], "uncovered": []}
+
+    try:
+        import jieba
+    except Exception:
+        return {"coverage": 1.0, "covered": [], "uncovered": []}
+
+    # Extract key terms from user prompt (TF top-10, skip stopwords)
+    stop = set("的了吗呢吧啊是都在和与或对从到用把被让给为以而因但就这那也都还没又再很更太只就可会要能说看想他她它我你".split())
+    tokens = [t.strip() for t in jieba.lcut(user_prompt) if len(t.strip()) >= 2 and t.strip() not in stop]
+    freq: dict[str, int] = {}
+    for t in tokens:
+        freq[t] = freq.get(t, 0) + 1
+    user_terms = [t for t, _ in sorted(freq.items(), key=lambda x: x[1], reverse=True)[:10]]
+
+    if not user_terms:
+        return {"coverage": 1.0, "covered": [], "uncovered": []}
+
+    # Extract headings text
+    headings = re.findall(r"^#{1,3}\s+(.+)$", outline, re.MULTILINE)
+    heading_text = " ".join(headings)
+
+    covered = []
+    uncovered = []
+    for term in user_terms:
+        if term in heading_text or any(term in h for h in headings):
+            covered.append(term)
+        else:
+            uncovered.append(term)
+
+    cov = len(covered) / max(len(user_terms), 1)
+    return {"coverage": round(cov, 3), "covered": covered, "uncovered": uncovered}
+
+
 def _clean_llm_output(text: str) -> str:
     out = (text or "").strip()
     out = re.sub(r"^```[a-zA-Z]*\s*", "", out).strip()
@@ -448,9 +493,10 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
         else:
             issues = _validate_outline(out)
 
-        # ── Q2: Run naming + critical-section checks (non-blocking) ──────
+        # ── Q2: Run naming + critical + topic-coverage checks (non-blocking) ──
         naming_warnings = _check_naming_quality(out)
         critical_issues = _check_critical_section(out)
+        topic_cov = _check_topic_coverage(out, user_prompt)
 
         if not issues:
             coverage_issues = coverage_future.result() if coverage_future else []
@@ -460,27 +506,38 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
                 logger.info(f"outline_done seconds={t1 - t0:.2f} prompt_chars={len(prompt)} outline_chars={len(out)} attempts={attempt + 1}")
                 return _add_outline_numbering(out)
 
-            # Feed soft warnings back for retry (non-blocking: only trigger retry if coverage fails)
+            # Feed soft warnings back for retry
+            has_hard_issue = bool(coverage_issues)
+            soft_feedback: list[str] = []
+
             if coverage_issues:
-                fb = f"内容覆盖不足，缺失或需加强：{'、'.join(coverage_issues)}"
-                if soft_warnings:
-                    fb += f"；命名质量问题：{'；'.join(soft_warnings[:4])}"
-                last_issues = [fb]
-                logger.warning(f"outline_coverage_failed attempt={attempt + 1} missing={coverage_issues} naming_warnings={len(soft_warnings)}")
-            else:
-                # Only naming/critical warnings — accept but log
+                soft_feedback.append(f"内容覆盖不足，缺失或需加强：{'、'.join(coverage_issues)}")
+            if topic_cov["coverage"] < 0.50:
+                soft_feedback.append(
+                    f"用户需求关键词未覆盖：{'、'.join(topic_cov['uncovered'][:6])}"
+                )
+                has_hard_issue = True
+            if soft_warnings:
+                soft_feedback.append(f"命名质量/批判章节建议：{'；'.join(soft_warnings[:4])}")
+
+            if not has_hard_issue:
                 t1 = time.perf_counter()
-                logger.info(f"outline_done_with_naming_warnings seconds={t1 - t0:.2f} warnings={soft_warnings}")
+                logger.info(f"outline_done_with_soft_warnings seconds={t1 - t0:.2f} warnings={len(soft_warnings)} topic_cov={topic_cov['coverage']}")
                 return _add_outline_numbering(out)
+
+            last_issues = ["；".join(soft_feedback)]
+            logger.warning(f"outline_quality_retry attempt={attempt + 1} coverage={bool(coverage_issues)} topic_cov={topic_cov['coverage']:.2f}")
         else:
-            # Inject naming warnings into structural feedback
+            # Inject naming/critical/topic warnings into structural feedback
             fb_parts = issues[:]
             if naming_warnings:
                 fb_parts.append(f"命名质量建议：{'；'.join(naming_warnings[:3])}")
             if critical_issues:
                 fb_parts.append(f"批判章节建议：{'；'.join(critical_issues[:2])}")
+            if topic_cov["coverage"] < 0.40:
+                fb_parts.append(f"用户需求关键词未覆盖：{'、'.join(topic_cov['uncovered'][:6])}")
             last_issues = fb_parts
-            logger.warning(f"outline_validation_failed attempt={attempt + 1} issues={issues} naming={len(naming_warnings)} critical={len(critical_issues)}")
+            logger.warning(f"outline_validation_failed attempt={attempt + 1} issues={issues} naming={len(naming_warnings)} critical={len(critical_issues)} topic_cov={topic_cov['coverage']:.2f}")
 
     t1 = time.perf_counter()
     logger.warning(f"outline_done_with_issues seconds={t1 - t0:.2f} attempts=3 issues={last_issues}")
