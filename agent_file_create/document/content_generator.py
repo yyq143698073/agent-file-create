@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -32,13 +33,51 @@ class TaskCanceledException(Exception):
     pass
 
 
+# ── Module-level singletons ────────────────────────────────────────────
+# Avoids constructing TaskManager() and summary LLM chains on every call.
+_tm_instance: Any = None
+_tm_lock = threading.Lock()
+
+
+def _get_task_manager():
+    """Return a shared TaskManager singleton."""
+    global _tm_instance
+    if _tm_instance is None:
+        with _tm_lock:
+            if _tm_instance is None:
+                from agent_file_create.task.manager import TaskManager
+                _tm_instance = TaskManager()
+    return _tm_instance
+
+
+_summary_chain = None
+_summary_chain_lock = threading.Lock()
+
+
+def _get_summary_chain():
+    """Return a cached LLM chain for section summarization."""
+    global _summary_chain
+    if _summary_chain is None:
+        with _summary_chain_lock:
+            if _summary_chain is None:
+                llm = get_chat_model(
+                    style=CONTENT_API_STYLE,
+                    model=CONTENT_MODEL_NAME,
+                    endpoint=CONTENT_API_ENDPOINT,
+                    api_key=CONTENT_API_KEY,
+                    temperature=0.1,
+                    max_tokens=160,
+                    timeout_s=30,
+                )
+                _summary_chain = _SECTION_SUMMARY_PROMPT | llm | StrOutputParser()
+    return _summary_chain
+
+
 def _notify_section_progress(task_id: str, done: int, total: int, section_title: str) -> None:
     if not task_id or total <= 0:
         return
     try:
-        from agent_file_create.task.manager import TaskManager
-
-        TaskManager().write_status(
+        _get_task_manager().write_status(
             str(task_id),
             "processing",
             stage="document",
@@ -53,9 +92,7 @@ def _check_cancel(task_id: str) -> None:
     if not task_id:
         return
     try:
-        from agent_file_create.task.manager import TaskManager
-
-        _, cancel_ev = TaskManager().get_control_events(str(task_id))
+        _, cancel_ev = _get_task_manager().get_control_events(str(task_id))
         if cancel_ev.is_set():
             raise TaskCanceledException(f"Task {task_id} was canceled")
     except TaskCanceledException:
@@ -292,6 +329,45 @@ def _compute_coverage_map(
     return result
 
 
+# ── Section-writing system prompt ────────────────────────────────────
+# Static writing instructions reused across all sections via the system
+# message, cutting per-section prompt size by ~60%.  For a 15-section
+# report that saves ~30 KB of redundant input tokens.
+SECTION_SYSTEM_PROMPT = (
+    "你是一个资深行业分析师和顶级文案，正在撰写专业的深度报告。\n"
+    "\n"
+    "核心规则：\n"
+    "1) 用全新语言重构核心观点，严禁直接复制粘贴材料中的长句。\n"
+    "2) 用因果、递进、转折等连接词建立段落间关系。主章节(H2)开篇承接前文、结尾过渡到下一节。子节(H3)直接切入。去重：前文已详述的论点只做一句话回顾。\n"
+    "3) 优先引用定量内容（具体数值、超参数、指标），避免空洞定性描述。\n"
+    "4) 降低幻觉：不编造数字、机构名、人名、年份。材料中明确出现的数值可引用并标注具体来源。不确定就说「相关数据暂缺」。\n"
+    "5) 溯源简称：每个【n】编号从对应文件名取简短关键词作简称。不同编号必须有不同的简称。\n"
+    "6) 每个关键论断标注【n】（据XX），编号和口头引用一一对应。\n"
+    "7) 时效优先：优先采信年份较新的来源。引用3年以上文献需注明年份。\n"
+    "8) 标注格式：同一编号全文使用完全相同的口头引用文本。\n"
+    "9) 同一段落每个【n】编号最多出现1次，段落结尾统一标注。\n"
+    "10) 每章至少使用2种不同编号。通篇只用【1】判定为不合格。\n"
+    "11) 完成后数一数【n】种类，不到2种则重写。\n"
+    "12) 讨论方法局限时直接说明。首次英文缩写必须给全称。\n"
+    "\n"
+    "内容处理：表格数据用小段落描述趋势不逐行罗列。多方案对比用「相比之下」等短语。数据不足时说明「材料中暂缺该维度数据」不编造。"
+)
+
+
+def _build_system_prompt_for_section(section_type: str) -> str:
+    """Return the system prompt for a section, including type-specific hints."""
+    hints = {
+        "data": "【数据型章节】必须逐条引用来源数据，不可笼统概括。每个数据点标注出处。数据不足只写已有数据，禁止推测。",
+        "experiment_setup": "【实验设定型章节】准确描述实验配置和参数。数据集描述含规模、来源、划分。必须列出至少2个对比基线。评估指标必须具体。",
+        "analysis": "【分析型章节】可在材料事实基础上做合理推理延伸但标注「（分析推测）」。鼓励多材料综合对比。可提出推理观点但不可与材料事实矛盾。",
+    }
+    base = SECTION_SYSTEM_PROMPT
+    hint = hints.get(section_type, "")
+    if hint:
+        return base + "\n\n" + hint
+    return base
+
+
 def _build_section_prompt(
     *,
     section_title: str,
@@ -307,66 +383,29 @@ def _build_section_prompt(
     knowledge_points: list[str] | None = None,
     enriched_context: str = "",
 ) -> str:
+    """Build the per-section user prompt — variable content only.
+
+    Static writing rules live in SECTION_SYSTEM_PROMPT (module-level constant)
+    and are passed as the system message, avoiding ~2KB of redundant tokens
+    per section.
+    """
     lo, hi = target_range
-    parts = [
-        "你是一个资深行业分析师和顶级文案，正在撰写一份专业的深度报告。",
-        "",
-        "核心指令：",
-        "1) 拒绝复读：严禁直接复制粘贴参考材料中的长句，用全新语言重构核心观点。",
-        "2) 逻辑流与衔接：用因果、递进、转折等连接词建立段落间关系。开篇用1句话承接前文（如有），结尾用1句话自然过渡到下一节（如有），不要生硬地写「接下来我们将讨论……」。",
-        "3) 场景化扩写：解释数据和结论的业务含义，但场景必须是材料中有线索支撑的，不要凭空想象。",
-        "4) 降低幻觉：不要编造具体的数字、机构名、人名、年份。材料中明确出现的数值可以引用，但要标注具体来源（如「据某论文实验数据」），禁止使用「据材料显示」「据资料记载」等笼统表述。不确定就说「相关数据暂缺」。",
-        "5) 溯源要求：每个关键论断后，用「（据+来源文件具体关键词）」标注——如引用自「RAG技术综述_张三.pdf」则标注为「（据RAG技术综述）」。多个材料支撑时标注「（综合多份材料）」。无任何材料支撑的推论标注「（分析推测）」。",
-        "6) 编号引用：参考材料中的 【1】【2】 等编号对应来源文件。当你引用某个编号材料的具体数据时，在句末标注引用编号，如「实验显示准确率达95.3%【1】」。可同时使用自然语言引用和编号引用。注意使用【】而非[]，避免 Markdown 链接语法冲突。",
-        "7) 时效优先：参考材料标注了发表年份（如「2023, xxx.pdf」）。优先采信年份较新的来源。如果引用了较旧的文献（3年以上），请在文中注明其发表年份或标注'据20XX年研究'。",
-        "8) 简化标注：你只需使用两套标注——①自然语言引用「（据XXX）」用于标明来源文件，②【n】编号引用用于对标检索片段。两者可以同时出现在同一论断中。不再需要第三套标注系统。",
-        "",
-    ]
-    # ── Type-specific instructions ──
-    if section_type == "data":
-        parts += [
-            "⚠️ 本节为「数据型」章节（含实验、性能、对比数据），特别要求：",
-            "• 必须逐条引用来源材料中的数据，不可笼统概括（如材料说「35.1%」不要写成「约三分之一」）。",
-            "• 每个数据点后必须标注出处：「（据<材料名>）」。",
-            "• 如果材料中数据不足，只写已有数据，禁止推测数值或编造比较对象。",
-            "• 温度极低：行文可以干练，但数据必须精确。",
-            "",
-        ]
-    elif section_type == "experiment_setup":
-        parts += [
-            "🔧 本节为「实验设定/方法型」章节（含实验设计、数据集、实现细节），特别要求：",
-            "• 准确描述实验配置和参数设定，不遗漏关键超参数（学习率、batch size、epoch 等）。",
-            "• 数据集描述需包含规模、来源、划分方式，不可笼统说「使用公开数据集」。",
-            "• 方法描述要能复现：模型架构、训练策略、评估方案逐条写清。",
-            "• 可以引用材料中的配置表，但用自己的语言组织，标注出处。",
-            "",
-        ]
-    elif section_type == "analysis":
-        parts += [
-            "💡 本节为「分析型」章节（含讨论、展望、建议、启示），特别要求：",
-            "• 可以在材料事实基础上做合理的推理和延伸判断，但需标注「（分析推测）」。",
-            "• 鼓励多材料综合对比——如果材料A和材料B的结论有冲突或互补，主动指出来。",
-            "• 可以提出材料本身未明确表述但经你推理得出的观点，但不可与材料事实矛盾。",
-            "• 温度较高：鼓励有洞察力的分析，不追求逐句引用。",
-            "",
-        ]
-    # review type uses defaults (no extra instructions)
-    parts += [
-        "结构化内容处理：",
-        "- 如果材料中包含表格数据，用小段落描述关键趋势，不要逐行罗列。",
-        "- 如果涉及多方案对比，用「相比之下」「与之相反」等短语体现对比关系。",
-        "- 如果本节的论点需要数据支撑但材料中数据不足，说明「材料中暂缺该维度数据」而不是编造。",
-        "",
-        f"章节层级：{'## 主章节' if level==2 else '### 子节' if level==3 else '#'}",
-        f"父章节：{parent_title or '（无，此为顶级章节）'}",
-        f"当前章节：{section_title}",
-    ]
+    parts: list[str] = []
+    parts.append(f"章节层级：{'## 主章节' if level==2 else '### 子节' if level==3 else '#'}")
+    parts.append(f"父章节：{parent_title or '（无，此为顶级章节）'}")
+    parts.append(f"当前章节：{section_title}")
     if next_title:
         parts.append(f"下一章节：{next_title}（本节结尾请做好内容铺垫）")
+    else:
+        parts.append("⚠️ 这是本文最后一章（总结/展望/结论）。请提出 2-3 个具体的、可验证的未来研究方向或改进建议，不要停留在「需要进一步研究」的笼统陈述。")
     parts += [
         "",
         "前文摘要（用于保持连贯）：",
-        previous_summary.strip() or "（本节为开篇，无需承接前文）",
+        previous_summary.strip() or (
+            "（本节为子节，父章节正文正在并行生成中暂不可见，请直接围绕子主题展开，"
+            "无需写「承接前文」的过渡句）" if level == 3
+            else "（本节为开篇，无需承接前文）"
+        ),
         "",
         "参考材料摘要：",
         multimodal_digest.strip() or "（无相关材料，请基于章节标题做合理的框架性论述，不要编造细节）",
@@ -408,7 +447,7 @@ def _build_section_prompt(
             parts.append("")
 
     parts += [
-        f"写作要求：本节建议 {lo}~{hi} 字。",
+        f"写作要求：本节严格控制在 {lo}~{hi} 字以内。超出字数限制的内容会被截断。",
         "只输出本节正文，不要输出标题行。不要输出「本节」「本章」等元描述文字。",
         "",
         "正文：",
@@ -416,14 +455,15 @@ def _build_section_prompt(
     return "\n\n".join(parts).strip()
 
 
-def _call_qwen_text(prompt: str, *, timeout_s: int, num_predict: int, temperature: float = 0.4) -> str:
+def _call_qwen_text(prompt: str, *, timeout_s: int, num_predict: int, temperature: float = 0.4,
+                    system: str | None = None) -> str:
     text = call_llm(
         prompt,
         timeout_s=timeout_s,
         temperature=temperature,
         num_predict=num_predict,
         stop=["```"],
-        system="你是一个中文文档处理助手。",
+        system=system or "你是一个中文文档处理助手。",
         api_style=CONTENT_API_STYLE,
         api_endpoint=CONTENT_API_ENDPOINT,
         api_key=CONTENT_API_KEY,
@@ -455,6 +495,53 @@ def _fallback_section(section_title: str, parent_title: str, previous_summary: s
     return s
 
 
+# ── Q4 P0: Citation compliance checker ────────────────────────────────────────
+
+
+def _check_citation_compliance(text: str) -> list[str]:
+    """Post-generation check: does the section body follow citation rules?
+
+    Returns list of issue strings (empty = compliant).
+    Checks:
+    1. At least 2 different citation numbers (per Rule 10)
+    2. No duplicate 【n】 in the same paragraph (per Rule 9)
+    3. Each 【n】 has a corresponding verbal reference (据XX / 来源XX)
+    4. Citation numbers are ≤ 20 (sanity check against hallucination)
+    """
+    if not text or "【" not in text:
+        return ["缺少引用标注【n】：正文未使用任何引用标记"]
+
+    issues: list[str] = []
+
+    # 1. Count unique citation numbers
+    markers = re.findall(r"【(\d+)】", text)
+    unique_nums = set(int(m) for m in markers)
+    if len(unique_nums) < 2:
+        issues.append(f"引用来源过少：仅使用 {len(unique_nums)} 种引用编号（需≥2）")
+
+    # 2. Check for duplicate 【n】 in same paragraph
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    for i, para in enumerate(paragraphs):
+        para_markers = re.findall(r"【(\d+)】", para)
+        if len(para_markers) > len(set(para_markers)):
+            issues.append(f"同段重复引用：第{i+1}段中同一编号出现多次")
+
+    # 3. Check that 【n】 has verbal reference nearby
+    for m in re.finditer(r"【(\d+)】", text):
+        n = m.group(1)
+        # Check 30 chars after the marker for source text
+        after = text[m.end():m.end() + 40]
+        if not re.search(r"[据参来][^，。；\n]{2,20}", after):
+            issues.append(f"引用【{n}】缺少口头引用说明（如'据XX年报'）")
+            break  # one example is enough
+
+    # 4. Sanity check: citation numbers shouldn't be absurdly high
+    if unique_nums and max(unique_nums) > 20:
+        issues.append(f"引用编号异常：最大编号 {max(unique_nums)} > 20，可能存在幻觉")
+
+    return issues
+
+
 def generate_section_content(
     section_title: str,
     parent_title: str,
@@ -477,13 +564,14 @@ def generate_section_content(
         lo = max(80, target_words // 2)
         hi = max(120, target_words)
         target_range = (lo, hi)
-        num_predict = max(300, hi * 3)
+        # Chinese text ≈ 2 tokens / char; hi*2.2 gives ~10% headroom
+        num_predict = max(200, int(hi * 2.2))
     elif level == 2:
-        target_range = (120, 180)
+        target_range = (160, 260)
+        num_predict = 800
+    else:  # H3 sub-sections
+        target_range = (120, 190)
         num_predict = 500
-    else:
-        target_range = (180, 280)
-        num_predict = 600
 
     prompt = _build_section_prompt(
         section_title=section_title,
@@ -504,16 +592,54 @@ def generate_section_content(
     gen_temp = temp_map.get(section_type, 0.2)
     logger.info("section_type title=%s type=%s temp=%.2f", section_title[:40], section_type, gen_temp)
 
-    for attempt in range(2):
+    # Build system prompt with static writing rules (shared across all sections)
+    section_system = _build_system_prompt_for_section(section_type)
+
+    # ── Q4 P0: Citation compliance check + auto-retry ──────────────────────
+    citation_feedback = ""
+    for attempt in range(3):
         _check_cancel(task_id)
+        if citation_feedback and attempt > 0:
+            # Inject citation compliance feedback into the prompt
+            prompt = _build_section_prompt(
+                section_title=section_title,
+                parent_title=parent_title,
+                previous_summary=previous_summary,
+                multimodal_digest=multimodal_digest,
+                user_prompt=user_prompt,
+                level=level,
+                target_range=target_range,
+                next_title=next_title,
+                feedback=(feedback + "\n" + citation_feedback).strip(),
+                section_type=section_type,
+                enriched_context=enriched_context,
+            )
+
         t0 = time.perf_counter()
-        text = _call_qwen_text(prompt, timeout_s=MODEL_TIMEOUT, num_predict=num_predict, temperature=gen_temp)
+        text = _call_qwen_text(prompt, timeout_s=MODEL_TIMEOUT, num_predict=num_predict,
+                               temperature=gen_temp, system=section_system)
         t1 = time.perf_counter()
-        if text:
-            if t1 - t0 >= 8:
-                logger.info(f"section_slow title={section_title} seconds={t1 - t0:.2f} prompt_chars={len(prompt)}")
-            return text
-        time.sleep(0.6 + attempt * 0.6)
+        if not text:
+            time.sleep(0.6 + attempt * 0.6)
+            continue
+
+        if t1 - t0 >= 8:
+            logger.info(f"section_slow title={section_title} seconds={t1 - t0:.2f} prompt_chars={len(prompt)}")
+
+        # Q4 P0: Post-generation citation compliance check
+        if enriched_context and "【" in enriched_context:
+            cite_issues = _check_citation_compliance(text)
+            if cite_issues:
+                if attempt < 2:  # still have retries
+                    citation_feedback = "引用合规问题（请修正后重新输出）：\n" + "\n".join(
+                        f"- {issue}" for issue in cite_issues
+                    )
+                    logger.warning(f"section_citation_retry title={section_title} attempt={attempt+1} issues={len(cite_issues)}")
+                    continue  # retry with citation feedback
+                else:
+                    logger.warning(f"section_citation_failed title={section_title} issues={len(cite_issues)} giving_up")
+
+        return text
 
     logger.warning(f"section_generate_failed title={section_title} level={level}")
     return _fallback_section(section_title, parent_title, previous_summary, multimodal_digest)
@@ -528,16 +654,7 @@ def _llm_summarize_for_next(section_title: str, content: str) -> str:
     if len(s) <= 600:
         return s[:200] + ("…" if len(s) > 200 else "")
     try:
-        llm = get_chat_model(
-            style=CONTENT_API_STYLE,
-            model=CONTENT_MODEL_NAME,
-            endpoint=CONTENT_API_ENDPOINT,
-            api_key=CONTENT_API_KEY,
-            temperature=0.1,
-            max_tokens=160,
-            timeout_s=30,
-        )
-        chain = _SECTION_SUMMARY_PROMPT | llm | StrOutputParser()
+        chain = _get_summary_chain()
         summary = (chain.invoke({"title": section_title, "content": s[:2000]}) or "").strip()
         if summary and len(summary) >= 20:
             return summary[:280]
@@ -569,9 +686,16 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
             next_ci = content_indices[idx + 1]
             next_title_map[ci] = str(flat[next_ci].get("title") or "").strip()
 
-    # Count total sections for progress tracking
+    # Count total sections for progress tracking; weight H2 chapters 2× vs H3
     total_sections = sum(1 for item in flat if int(item.get("level") or 0) >= 2)
-    per_section_words = max(80, target_words // max(total_sections, 1)) if target_words and target_words > 0 else 0
+    _h2n = sum(1 for item in flat if int(item.get("level") or 0) == 2)
+    _h3n = sum(1 for item in flat if int(item.get("level") or 0) == 3)
+    _total_w = _h2n * 2 + _h3n
+    if target_words and target_words > 0 and _total_w > 0:
+        _h2_budget = max(100, (target_words * 2) // _total_w)
+        _h3_budget = max(80, target_words // _total_w)
+    else:
+        _h2_budget = _h3_budget = 0
     done_count = 0
 
     def _flush_seq():
@@ -618,7 +742,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
         if level == 2:
             out_lines.append("")
             out_lines.append(f"## {title}")
-            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words, enriched_context=enriched_context)
+            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=_h2_budget, enriched_context=enriched_context)
             out_lines.append("")
             out_lines.append(body)
             previous_summary = _llm_summarize_for_next(title, body)
@@ -631,7 +755,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
         if level == 3:
             out_lines.append("")
             out_lines.append(f"### {title}")
-            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words, enriched_context=enriched_context)
+            body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=_h3_budget, enriched_context=enriched_context)
             out_lines.append("")
             out_lines.append(body)
             previous_summary = _llm_summarize_for_next(title, body)
@@ -643,7 +767,7 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
 
         out_lines.append("")
         out_lines.append("#" * level + " " + title)
-        body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=per_section_words)
+        body = generate_section_content(title, parent_title, multimodal_results, user_prompt, previous_summary, level, next_title, task_id=task_id, feedback=feedback, target_words=_h2_budget)
         out_lines.append("")
         out_lines.append(body)
         previous_summary = _llm_summarize_for_next(title, body)
@@ -738,6 +862,17 @@ def _save_section_cache(task_id: str, cache: Dict[str, str]) -> None:
         pass
 
 
+def _find_parent_h2_index(flat: list[dict], h3_index: int) -> int:
+    """Find the parent H2 index for a given H3 section."""
+    target_level = flat[h3_index].get("level", 0) if h3_index < len(flat) else 0
+    if target_level != 3:
+        return -1
+    for i in range(h3_index - 1, -1, -1):
+        if flat[i].get("level") == 2:
+            return i
+    return -1
+
+
 def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, Any], user_prompt: str, *, task_id: str = "", feedback: str = "", enriched_context: str = "", target_words: int = 0) -> str:
     flat = parse_outline_sections(outline)
     if not flat:
@@ -748,7 +883,16 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
         return ""
 
     total_sections = len(tasks)
-    per_section_words = max(80, target_words // max(total_sections, 1)) if target_words and target_words > 0 else 0
+    # Weight H2 (chapter overview) sections 2× vs H3 (detail) so that
+    # the word budget is proportional to each section's structural role.
+    _h2n = sum(1 for _t in tasks if _t["level"] == 2)
+    _h3n = sum(1 for _t in tasks if _t["level"] == 3)
+    _total_w = _h2n * 2 + _h3n
+    if target_words and target_words > 0 and _total_w > 0:
+        _h2_budget = max(100, (target_words * 2) // _total_w)
+        _h3_budget = max(80, target_words // _total_w)
+    else:
+        _h2_budget = _h3_budget = 0
     done_count = 0
 
     multimodal_digest = _multimodal_summary(multimodal_results)
@@ -760,65 +904,87 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
     _llm_limit = int(os.environ.get("CONCURRENT_LLM_CALLS", str(MAX_WORKERS_DEFAULT)))
     max_workers = max(1, min(_llm_limit, len(tasks)))
 
-    # Helper to write partial content and stream events
-    base_dir = Path(__file__).resolve().parent.parent.parent  # pre-compute for both paths
+    # ── Incremental flush state ───────────────────────────────────────
+    # Instead of rebuilding content.md from flat+results on every section
+    # completion (O(N²) I/O), we build the skeleton once and patch bodies
+    # in-place.  A per-section lock ensures thread safety.
+    base_dir = Path(__file__).resolve().parent.parent.parent
+    _content_lines: list[str] = []
+    _section_body_line: dict[int, int] = {}  # flat_index → line index in _content_lines
+    _flush_lock = threading.Lock()
+    _section_titles: dict[int, str] = {}  # flat_index → title (for stream events)
+
+    # Build skeleton once
+    _pstack: list[str] = []
+    for _i, _item in enumerate(flat):
+        _lv = int(_item.get("level") or 0)
+        _ti = str(_item.get("title") or "").strip()
+        if not _ti or _lv < 1:
+            continue
+        while len(_pstack) >= _lv:
+            _pstack.pop()
+        _pstack.append(_ti)
+        if _lv == 1:
+            _content_lines.append(f"# {_ti}")
+        else:
+            _content_lines.append("")
+            _content_lines.append(f"{'#' * _lv} {_ti}")
+            _content_lines.append("")
+            _section_body_line[_i] = len(_content_lines)
+            _content_lines.append("（生成中…）")
+            _section_titles[_i] = _ti
+
     def _flush_partial():
+        """Write current _content_lines to content.md — O(1) per section body update."""
         if not task_id:
             return
-        try:
-            p = base_dir / "result" / str(task_id) / "content.md"
-            p.parent.mkdir(parents=True, exist_ok=True)
-            buf: list[str] = []
-            pstack: list[str] = []
-            completed_sections = []
-            for i, item in enumerate(flat):
-                lv = int(item.get("level") or 0)
-                ti = str(item.get("title") or "").strip()
-                if not ti or lv < 1:
-                    continue
-                while len(pstack) >= lv:
-                    pstack.pop()
-                pstack.append(ti)
-                if lv == 1:
-                    buf.append(f"# {ti}")
-                else:
-                    buf.append("")
-                    buf.append(f"{'#' * lv} {ti}")
-                    body = results.get(i, "")
-                    buf.append("")
-                    buf.append(body if body else "（生成中…）")
-                    if body and lv >= 2:
-                        completed_sections.append({"level": lv, "title": ti})
-            raw = "\n".join(buf).strip() + "\n"
-            p.write_text(raw, encoding="utf-8")
-            # Write stream event for SSE (append-only JSONL)
-            if completed_sections:
-                stream_p = base_dir / "result" / str(task_id) / "stream.jsonl"
-                with open(stream_p, "a", encoding="utf-8") as sf:
-                    for sec in completed_sections:
-                        sf.write(json.dumps({"type": "section_done", "title": sec["title"],
-                                             "level": sec["level"], "done": done_count,
-                                             "total": total_sections}, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+        with _flush_lock:
+            try:
+                p = base_dir / "result" / str(task_id) / "content.md"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                # Patch bodies for completed sections
+                newly_completed: list[dict] = []
+                for _idx, _body in results.items():
+                    if _body and _idx in _section_body_line:
+                        _li = _section_body_line[_idx]
+                        if _content_lines[_li] != _body:
+                            _content_lines[_li] = _body
+                            newly_completed.append({
+                                "level": int(flat[_idx].get("level") or 0) if _idx < len(flat) else 0,
+                                "title": _section_titles.get(_idx, ""),
+                            })
+                raw = "\n".join(_content_lines).strip() + "\n"
+                p.write_text(raw, encoding="utf-8")
+                if newly_completed:
+                    stream_p = base_dir / "result" / str(task_id) / "stream.jsonl"
+                    with open(stream_p, "a", encoding="utf-8") as sf:
+                        for sec in newly_completed:
+                            sf.write(json.dumps({
+                                "type": "section_done", "title": sec["title"],
+                                "level": sec["level"], "done": done_count,
+                                "total": total_sections,
+                            }, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
-    # ── Unified parallel phase: submit ALL sections (h2 + h3) at once ──
-    # h3 sections use empty parent_summary initially (h2 content not ready yet),
-    # but gain coherence from parent_title + multimodal_digest + user_prompt.
-    # This eliminates the h2→h3 serial barrier, cutting wall-clock time by ~40%.
+    # ── Q4 P1: Two-stage parallel generation (H2 first → then H3) ──────────
+    # Stage 1: H2 chapters generate in parallel; their summaries feed Stage 2.
+    # Stage 2: H3 sub-sections generate with parent H2 summaries for coherence.
+    # This provides H3 sections with actual context instead of empty placeholders.
 
     _flush_partial()  # skeleton for frontend
 
     section_cache = _load_section_cache(task_id)
     cache_hits = 0
 
-    # Check cache first for all tasks
-    uncached: list[dict] = []
+    # Check cache for all tasks
+    h2_tasks: list[dict] = []
+    h3_tasks: list[dict] = []
     for t in tasks:
-        parent_summary = ""  # always empty — h2 content may not be ready
+        _sec_budget = _h2_budget if t["level"] == 2 else _h3_budget
         key = _section_cache_key(
             t["title"], t["parent_title"], multimodal_digest,
-            user_prompt, parent_summary, t["level"], per_section_words, feedback)
+            user_prompt, "", t["level"], _sec_budget, feedback)
         if key in section_cache:
             results[t["index"]] = section_cache[key]
             done_count += 1
@@ -826,32 +992,63 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
             logger.info(f"section_cache_hit section={t['title'][:40]}")
         else:
             t["_cache_key"] = key
-            uncached.append(t)
+            if t["level"] == 2:
+                h2_tasks.append(t)
+            else:
+                h3_tasks.append(t)
 
-    if uncached:
+    def _generate_batch(task_list: list[dict], parent_summaries: dict[int, str] | None = None):
+        """Generate a batch of sections in parallel, returning {index: content}."""
+        if not task_list:
+            return {}
         _check_cancel(task_id)
-        section_names = [t["title"][:30] for t in uncached]
-        logger.info(f"content_generating sections={len(uncached)}/{total_sections} titles={section_names} task={task_id}")
+        names = [t["title"][:30] for t in task_list]
+        logger.info(f"content_generating sections={len(task_list)} titles={names} task={task_id}")
+        batch_results: dict[int, str] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {}
-            for t in uncached:
+            futs = {}
+            for t in task_list:
+                _sec_budget = _h2_budget if t["level"] == 2 else _h3_budget
+                ps = ""
+                if parent_summaries is not None and t["level"] == 3:
+                    # Find parent H2 index
+                    parent_idx = _find_parent_h2_index(flat, t["index"])
+                    ps = parent_summaries.get(parent_idx, "")
                 args = _build_section_args(t, multimodal_results, user_prompt,
-                                           parent_summary="",
+                                           parent_summary=ps,
                                            task_id=task_id, feedback=feedback,
-                                           target_words=per_section_words)
-                futures[pool.submit(generate_section_content, **args)] = t["index"]
-            for fut in as_completed(futures):
-                idx = futures[fut]
+                                           target_words=_sec_budget)
+                futs[pool.submit(generate_section_content, **args)] = t["index"]
+            for fut in as_completed(futs):
+                idx = futs[fut]
                 try:
-                    results[idx] = str(fut.result() or "")
+                    batch_results[idx] = str(fut.result() or "")
                 except Exception as e:
-                    results[idx] = f"（本节生成失败：{str(e)[:120]}）"
+                    batch_results[idx] = f"（本节生成失败：{str(e)[:120]}）"
                 _check_cancel(task_id)
+                nonlocal done_count
                 done_count += 1
-                section_title = str(flat[idx].get("title") or "") if idx < len(flat) else ""
-                logger.info(f"content_section_done {done_count}/{total_sections} title={section_title[:40]}")
-                _notify_section_progress(task_id, done_count, total_sections, section_title)
+                title = str(flat[idx].get("title") or "") if idx < len(flat) else ""
+                logger.info(f"content_section_done {done_count}/{total_sections} title={title[:40]}")
+                _notify_section_progress(task_id, done_count, total_sections, title)
                 _flush_partial()
+        return batch_results
+
+    # Stage 1: Generate all H2 in parallel
+    h2_results = _generate_batch(h2_tasks)
+    results.update(h2_results)
+
+    # Compute H2 summaries for Stage 2 (H3 sub-sections)
+    h2_summaries: dict[int, str] = {}
+    for t in h2_tasks:
+        idx = t["index"]
+        body = results.get(idx, "")
+        if body:
+            h2_summaries[idx] = _llm_summarize_for_next(t["title"], body)
+
+    # Stage 2: Generate all H3 in parallel (with parent H2 summary)
+    h3_results = _generate_batch(h3_tasks, parent_summaries=h2_summaries)
+    results.update(h3_results)
 
     # Update cache for all generated sections
     for t in tasks:
