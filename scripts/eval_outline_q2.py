@@ -55,11 +55,21 @@ def _load_pubmed_rct(sample_count: int) -> list[dict]:
     for aid, sentences in list(abstracts.items())[:sample_count]:
         sentences.sort(key=lambda x: x["sentence_id"])
         full_text = " ".join(s["text"] for s in sentences)
-        # Extract user prompt from the first sentence + label structure
+        # Build a topic-aware user prompt from the abstract content
+        try:
+            import jieba
+            stop = set("的了吗呢吧啊是都在和与或对从到用把被让给为以而因但就这那也都还没又再很更太只就可会要能说看想他她它我你the of and in to a is that for on with as by at from an are was were be this we which not or it their can has had been were may also between after using".split())
+            tokens = [t.strip() for t in jieba.lcut(full_text) if len(t.strip()) >= 2 and t.strip().lower() not in stop]
+            freq = {}
+            for t in tokens: freq[t] = freq.get(t, 0) + 1
+            top_terms = [t for t, _ in sorted(freq.items(), key=lambda x: x[1], reverse=True)[:8]]
+        except Exception:
+            top_terms = []
         sections_present = sorted(set(s["label_name"] for s in sentences))
+        topic_hint = f"，重点关注：{'、'.join(top_terms[:6])}" if top_terms else ""
         user_prompt = (
-            f"请基于以下生物医学摘要撰写一份结构化报告。摘要包含以下章节类型："
-            f"{'、'.join(sections_present)}。"
+            f"请基于以下生物医学摘要撰写一份结构化报告{topic_hint}。"
+            f"摘要涵盖：{'、'.join(sections_present)}。"
         )
         result.append({
             "abstract_id": aid,
@@ -102,7 +112,7 @@ def _evaluate_single(item: dict, idx: int) -> dict:
     issues = _validate_outline(outline)
     naming_warnings = _check_naming_quality(outline)
     critical_issues = _check_critical_section(outline)
-    topic_cov = _check_topic_coverage(outline, item["user_prompt"])
+    topic_cov = _check_topic_coverage(outline, item["user_prompt"], source_text=item.get("full_text", ""))
 
     # Count template-like headings
     headings = re.findall(r"^#{2,3}\s+(.+)$", outline, re.MULTILINE)
