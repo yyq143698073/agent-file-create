@@ -21,7 +21,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from agent_file_create.config import (
     CONTENT_API_ENDPOINT, CONTENT_API_KEY, CONTENT_API_STYLE, CONTENT_MODEL_NAME,
-    PLANNER_MODEL_NAME,
+    OUTLINE_MODEL_NAME, PLANNER_MODEL_NAME,
 )
 from agent_file_create.llm_client import call_llm
 from agent_file_create.llm_factory import get_chat_model
@@ -29,10 +29,14 @@ from agent_file_create.prompts import Citation
 
 logger = logging.getLogger(__name__)
 
-# Planner LLM model — uses a dedicated config if set, otherwise defaults to a
-# fast model.  Knowledge checklists and sentence filtering are lightweight tasks
-# that don't need the full reasoning power of the content-generation model.
-_PLANNER_MODEL = (PLANNER_MODEL_NAME or "").strip() or "deepseek-v4-flash"
+# Planner LLM model — uses a dedicated config if set, otherwise falls back
+# to the outline model (fast), then the content model, then a safe default.
+_PLANNER_MODEL = (
+    (PLANNER_MODEL_NAME or "").strip()
+    or (OUTLINE_MODEL_NAME or "").strip()
+    or (CONTENT_MODEL_NAME or "").strip()
+    or "qwen3.5:4b"
+)
 
 
 def _rerank_sentences(query: str, sentences: list[str], top_k: int = 8) -> list[int]:
@@ -732,15 +736,27 @@ def format_citation_list(citation_map: dict[int, Citation]) -> str:
     if not citation_map:
         return ""
 
-    lines = []
+    # Deduplicate by document id only — same document appears only once
+    # regardless of section_path (which varies per chunk).
+    seen: set[str] = set()
+    unique_labels: list[str] = []
     for n in sorted(citation_map):
         cit = citation_map[n]
+        key = (cit.doc_id or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
         label = (cit.doc_name or cit.doc_id or f"来源_{n}").replace(".pdf", "").replace(".docx", "")
         if "/" in label:
             label = label.rsplit("/", 1)[-1]
         if "\\" in label:
             label = label.rsplit("\\", 1)[-1]
-        lines.append(f"【{n}】{label}")
+        unique_labels.append(label)
+
+    # Always use consecutive numbering (1, 2, 3...) regardless of original keys
+    lines = []
+    for i, label in enumerate(unique_labels, 1):
+        lines.append(f"【{i}】{label}")
     return "\n".join(lines)
 
 
@@ -936,32 +952,49 @@ def _generate_expanded_queries(original_query: str) -> list[str]:
     return result
 
 
+# ── Retrieval cache ─────────────────────────────────────────────────────
+# Many queries (especially expanded variants) repeat across sections.
+# Caching avoids redundant vector searches for identical (kb, query) pairs.
+_retrieval_cache: dict[tuple[str, str], list] = {}
+
+
 def _multi_query_retrieve(kb, kb_name: str, queries: list[str], section_type: str, max_hits: int = 20) -> list:
     """Retrieve using multiple queries and merge results.
-    
+
     Returns deduplicated hits, preserving order of first occurrence.
+    Results are cached by (kb_name, query) to avoid redundant vector searches.
     """
     all_hits = []
     seen = set()
-    
+    cache_hits = 0
+
     for i, query in enumerate(queries):
-        try:
-            hits = _retrieve_by_section_type(kb, kb_name, query, section_type)
-            logger.debug("planner_multi_query idx=%d query=%s hits=%d", i, query[:30], len(hits))
-            
-            for h in hits:
-                if h.chunk_id not in seen:
-                    seen.add(h.chunk_id)
-                    all_hits.append(h)
-                    if len(all_hits) >= max_hits:
-                        break
-        except Exception as e:
-            logger.debug("planner_query_failed query=%s err=%s", query[:30], e)
-            continue
-        
+        cache_key = (kb_name, query)
+        if cache_key in _retrieval_cache:
+            hits = _retrieval_cache[cache_key]
+            cache_hits += 1
+        else:
+            try:
+                hits = _retrieve_by_section_type(kb, kb_name, query, section_type)
+                _retrieval_cache[cache_key] = hits
+            except Exception as e:
+                logger.debug("planner_query_failed query=%s err=%s", query[:30], e)
+                continue
+
+        logger.debug("planner_multi_query idx=%d query=%s hits=%d", i, query[:30], len(hits))
+
+        for h in hits:
+            if h.chunk_id not in seen:
+                seen.add(h.chunk_id)
+                all_hits.append(h)
+                if len(all_hits) >= max_hits:
+                    break
+
         if len(all_hits) >= max_hits:
             break
-    
+
+    if cache_hits:
+        logger.debug("planner_retrieval_cache hits=%d/%d", cache_hits, len(queries))
     return all_hits
 
 
@@ -1134,7 +1167,8 @@ def plan_section_knowledge(
                 seen.add(t)
                 all_queries.append(t)
 
-    # Deduplicate and limit
+    # Deduplicate and limit — 8 queries per section is sufficient for
+    # most retrieval needs; reduces search volume vs the old cap of 12.
     seen = set()
     queries: list[str] = []
     for q in all_queries:
@@ -1142,7 +1176,7 @@ def plan_section_knowledge(
         if q and q not in seen:
             seen.add(q)
             queries.append(q)
-            if len(queries) >= 12:
+            if len(queries) >= 8:
                 break
     
     if not queries:
@@ -1235,19 +1269,34 @@ def plan_section_knowledge(
             if re.search(r'\d+\.?\d*\s*[%％]|\d+\.?\d+\s*[倍秒时天]|GPU|epoch|batch|lr\b|learning.rate|accuracy|recall|NDCG|F1|BLEU|ROUGE', sent, re.IGNORECASE):
                 score += 2
             scored_sentences.append((score, idx, sent))
-        
+
         # Sort by score descending, keep top 25
         scored_sentences.sort(key=lambda x: (-x[0], x[1]))
         filtered_sentences: list[tuple[int, str]] = []  # (original_idx, sentence)
         for score, idx, sent in scored_sentences[:25]:
             filtered_sentences.append((idx, sent))
-        
+
         # Sort by original index to maintain context order
         filtered_sentences.sort(key=lambda x: x[0])
         filtered_sentence_list = [s for _, s in filtered_sentences]
         original_indices = [i for i, _ in filtered_sentences]
-        
-        logger.debug("planner_pre_filter section=%s all=%d filtered=%d", 
+
+        # ── Fast path: skip reranker/LLM when keyword quality is excellent ──
+        # If ≥70% of filtered sentences match ≥2 key terms, the keyword filter
+        # alone produces high-quality results — no need for the expensive LLM
+        # or cross-encoder reranker step.
+        high_quality_count = sum(1 for sc, _, _ in scored_sentences[:25] if sc >= 2)
+        # Lowered threshold from 0.7 to 0.5 — when half the sentences
+        # match ≥2 key terms, the keyword filter alone is good enough.
+        # This avoids the LLM fallback (which adds 2-5s per section)
+        # for the vast majority of well-structured documents.
+        if high_quality_count >= max(3, len(filtered_sentence_list) * 0.5):
+            logger.debug("planner_keyword_fastpath section=%s quality=%d/%d",
+                         section_title, high_quality_count, len(filtered_sentence_list))
+            result["materials"] = "。".join(filtered_sentence_list[:15])[:ctx_budget]
+            return result
+
+        logger.debug("planner_pre_filter section=%s all=%d filtered=%d",
                      section_title, len(all_sentences), len(filtered_sentence_list))
     else:
         # No key terms, use first 25
@@ -1290,9 +1339,9 @@ def plan_section_knowledge(
                 f"2. 句子提供有用的背景信息、数据或分析\n"
                 f"3. 句子与主题直接相关或有间接关联\n"
                 f"4. 如果没有完全匹配的句子，请选择最相关的3-5个句子\n\n"
-                f"句子列表：\n{sentences_text[:3000]}\n\n"
+                f"句子列表：\n{sentences_text[:1500]}\n\n"
                 f"输出格式：只输出相关句子的序号，用逗号分隔，例如：S1,S3,S5,S8",
-                timeout_s=15, temperature=0.0, num_predict=100,
+                timeout_s=10, temperature=0.0, num_predict=80,
                 model_name=_PLANNER_MODEL,
                 system="你是一个专业的文档处理助手，擅长从大量文本中提取与主题相关的内容。请严格按照要求只输出句子序号。")
 

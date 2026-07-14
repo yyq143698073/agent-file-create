@@ -9,6 +9,36 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+class _NullWriter:
+    """File-like object that discards all output."""
+
+    def write(self, s):
+        pass
+
+    def flush(self):
+        pass
+
+
+def _quiet_fitz():
+    """Globally suppress PyMuPDF's stdout/stderr noise.
+    find_tables prints "find_tables: exception occurred: ..." through
+    pymupdf.message() which writes to various internal channels depending
+    on the PyMuPDF version.  We try all known channels."""
+    try:
+        import fitz
+        import pymupdf
+        null = _NullWriter()
+        # Try all known output channels across PyMuPDF versions
+        for attr in ("_g_out_message", "_g_err_message", "_message_writer"):
+            for mod in (fitz, pymupdf):
+                try:
+                    setattr(mod, attr, null)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _feature_enabled(name: str, default: bool = True) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -31,11 +61,9 @@ def get_ocr(use_cuda: bool = True) -> Any:
         return _OCR_INSTANCE
     try:
         from rapidocr_paddle import RapidOCR
-
         _OCR_INSTANCE = RapidOCR(det_use_cuda=use_cuda, cls_use_cuda=use_cuda, rec_use_cuda=use_cuda)
     except ImportError:
         from rapidocr_onnxruntime import RapidOCR
-
         _OCR_INSTANCE = RapidOCR()
     return _OCR_INSTANCE
 
@@ -619,6 +647,7 @@ def extract_pdf_text_fast(file_path: str, max_chars: int = 20000) -> str:
     """Extract text layer from PDF using PyMuPDF (fitz)."""
     try:
         import fitz
+        _quiet_fitz()
     except Exception:
         return _extract_pdf_text_pypdf2_fallback(file_path, max_chars)
 
@@ -672,6 +701,7 @@ def _extract_page_range_text(file_path: str, start: int, end: int, max_chars: in
     """Extract text from a specific page range of a PDF (worker for parallel extraction)."""
     try:
         import fitz
+        _quiet_fitz()
     except Exception:
         return ""
     try:
@@ -702,6 +732,7 @@ def extract_pdf_text_parallel(file_path: str, max_chars: int = 30000,
     """
     try:
         import fitz
+        _quiet_fitz()
         doc = fitz.open(str(file_path))
         total_pages = len(doc)
         doc.close()
@@ -752,6 +783,7 @@ def extract_pdf_embedded_images(
     """
     try:
         import fitz
+        _quiet_fitz()
     except Exception:
         return ""
 
@@ -805,6 +837,7 @@ def render_pdf_pages(file_path: str, max_pages: int = 6) -> list[bytes]:
     """
     try:
         import fitz
+        _quiet_fitz()
     except Exception:
         return []
 
@@ -915,6 +948,7 @@ def _normalize_table_rows(rows: list[list[Any]], max_rows: int = 30) -> tuple[li
 def _guess_table_caption(page: Any, bbox: Any) -> str:
     try:
         import fitz
+        _quiet_fitz()
     except Exception:
         return ""
     if bbox is None:
@@ -958,75 +992,84 @@ def extract_pdf_tables_detailed(
     """Extract structured tables from PDF pages and validate basic structure."""
     try:
         import fitz
+        _quiet_fitz()
     except Exception:
         return []
 
     tables_out: list[dict[str, Any]] = []
+    doc = None
     try:
         doc = fitz.open(str(file_path))
-        for page_idx in range(len(doc)):
-            page = doc[page_idx]
-            try:
-                finder = page.find_tables()
-            except Exception:
-                continue
-            tables = list(getattr(finder, "tables", []) or [])
-            for table_idx, table in enumerate(tables, start=1):
+        import contextlib
+        _devnull = open(os.devnull, "w")
+        try:
+            for page_idx in range(len(doc)):
+                page = doc[page_idx]
                 try:
-                    rows = table.extract() or []
+                    with contextlib.redirect_stderr(_devnull):
+                        finder = page.find_tables()
                 except Exception:
                     continue
-                normalized_rows, checks = _normalize_table_rows(rows, max_rows=max_rows)
-                if not normalized_rows:
-                    continue
+                tables = list(getattr(finder, "tables", []) or [])
+                for table_idx, table in enumerate(tables, start=1):
+                    try:
+                        rows = table.extract() or []
+                    except Exception:
+                        continue
+                    normalized_rows, checks = _normalize_table_rows(rows, max_rows=max_rows)
+                    if not normalized_rows:
+                        continue
 
-                headers = normalized_rows[0]
-                body_rows = normalized_rows[1:]
-                if checks.get("empty_header"):
-                    body_rows = normalized_rows
-                    headers = []
+                    headers = normalized_rows[0]
+                    body_rows = normalized_rows[1:]
+                    if checks.get("empty_header"):
+                        body_rows = normalized_rows
+                        headers = []
 
-                item = {
-                    "page": page_idx + 1,
-                    "table_index": table_idx,
-                    "caption": _guess_table_caption(page, getattr(table, "bbox", None)),
-                    "headers": headers,
-                    "rows": body_rows,
-                    "dimensions": {
-                        "rows": len(body_rows),
-                        "cols": len(headers) or max(len(row) for row in normalized_rows),
-                    },
-                    "markdown": _table_to_markdown(normalized_rows),
-                    "validation": checks,
-                }
+                    item = {
+                        "page": page_idx + 1,
+                        "table_index": table_idx,
+                        "caption": _guess_table_caption(page, getattr(table, "bbox", None)),
+                        "headers": headers,
+                        "rows": body_rows,
+                        "dimensions": {
+                            "rows": len(body_rows),
+                            "cols": len(headers) or max(len(row) for row in normalized_rows),
+                        },
+                        "markdown": _table_to_markdown(normalized_rows),
+                        "validation": checks,
+                    }
 
-                if tables_out:
-                    prev = tables_out[-1]
-                    prev_dims = prev.get("dimensions", {}) if isinstance(prev.get("dimensions"), dict) else {}
-                    same_width = int(prev_dims.get("cols", 0) or 0) == int(item["dimensions"]["cols"] or 0)
-                    prev_page = int(prev.get("page", 0) or 0)
-                    if (
-                        checks.get("empty_header")
-                        and same_width
-                        and prev_page == page_idx
-                    ):
-                        prev_rows = prev.get("rows", [])
-                        if isinstance(prev_rows, list):
-                            prev_rows.extend(item["rows"])
-                            prev["rows"] = prev_rows
-                            prev["dimensions"]["rows"] = len(prev_rows)
-                            prev["continued_pages"] = sorted(set([*prev.get("continued_pages", []), page_idx + 1]))
-                            prev["validation"]["continued"] = True
-                            prev["markdown"] = _table_to_markdown(
-                                ([prev.get("headers", [])] if prev.get("headers") else []) + prev_rows
-                            )
-                            continue
+                    if tables_out:
+                        prev = tables_out[-1]
+                        prev_dims = prev.get("dimensions", {}) if isinstance(prev.get("dimensions"), dict) else {}
+                        same_width = int(prev_dims.get("cols", 0) or 0) == int(item["dimensions"]["cols"] or 0)
+                        prev_page = int(prev.get("page", 0) or 0)
+                        if (
+                            checks.get("empty_header")
+                            and same_width
+                            and prev_page == page_idx
+                        ):
+                            prev_rows = prev.get("rows", [])
+                            if isinstance(prev_rows, list):
+                                prev_rows.extend(item["rows"])
+                                prev["rows"] = prev_rows
+                                prev["dimensions"]["rows"] = len(prev_rows)
+                                prev["continued_pages"] = sorted(set([*prev.get("continued_pages", []), page_idx + 1]))
+                                prev["validation"]["continued"] = True
+                                prev["markdown"] = _table_to_markdown(
+                                    ([prev.get("headers", [])] if prev.get("headers") else []) + prev_rows
+                                )
+                                continue
 
-                tables_out.append(item)
-                if len(tables_out) >= max_tables:
-                    doc.close()
-                    return tables_out
-        doc.close()
+                    tables_out.append(item)
+                    if len(tables_out) >= max_tables:
+                        doc.close()
+                        _devnull.close()
+                        return tables_out
+            doc.close()
+        finally:
+            _devnull.close()
     except Exception as e:
         logger.warning(f"pdf_table_extract_failed err={str(e)[:160]}")
         return []

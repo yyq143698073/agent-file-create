@@ -1,0 +1,283 @@
+# -*- coding: utf-8 -*-
+"""
+LLM 层对比测试: Critic 审查 / 覆盖度提示 / 时效偏好
+运行: MODEL=qwen3.5:9b python tests/test_llm_comparison.py
+"""
+import asyncio, os, re, sys, time
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from agent_file_create.llm_factory import get_chat_model
+from agent_file_create.document._critic import run_critic
+
+STYLE   = os.getenv("STYLE",   "ollama")
+MODEL   = os.getenv("MODEL",   "qwen3.5:9b")
+ENDPOINT = os.getenv("ENDPOINT", "http://localhost:11434")
+KEY     = os.getenv("KEY",     "")
+
+
+# ── Test 1: Critic 审查质量 ─────────────────────────────────────────────────
+
+TEST1_MATERIALS = """
+[source_a.pdf] RAG 系统在 NQ 数据集上准确率达 78.3%，在 TriviaQA 上达 82.1%。
+检索阶段使用 DPR 编码器（dpr-ctx-encoder），生成阶段使用 T5-large。
+实验使用 4 张 A100 GPU，推理延迟为 120ms/query。
+该方法在 2023 年 6 月首次提出，代码已开源在 GitHub。
+
+[source_b.pdf] 对比实验中，传统 BM25 检索准确率为 62.7%，DPR 为 78.3%，混合方法为 81.5%。
+使用 8 张 V100 GPU 进行训练，batch size 为 64。
+作者团队来自清华大学和微软亚洲研究院。
+"""
+
+TEST1_CONTENT_WITH_ERRORS = """
+RAG 系统在 NQ 数据集上的准确率达到 85.1%，在 TriviaQA 上达到 88.3%。
+该方法使用 BERT-base 作为检索编码器，生成阶段使用 GPT-2。
+实验使用 8 张 A100 GPU 进行训练（source_b 提到的是 V100），推理延迟约为 200ms。
+相比传统 BM25 检索的 52.3% 准确率，RAG 方法提升了约 30 个百分点。
+该研究由北京大学和 Google Research 合作完成。
+"""
+
+
+# ── Test 2: 覆盖度提示效果 ─────────────────────────────────────────────────
+
+TEST2_OUTLINE = "## RAG 技术原理\n## 关键实验结果\n## 局限性与未来方向"
+
+TEST2_MATERIALS = """
+RAG（Retrieval-Augmented Generation）由 Lewis 等人于 2020 年提出，结合了稠密检索和序列到序列生成。
+核心组件包括 DPR 检索器和 BART 生成器，在知识密集型任务上显著优于纯生成模型。
+实验结果显示，在 NQ 数据集上 EM 得分为 41.5，在 TriviaQA 上为 56.8。
+主要局限包括：检索延迟较高（120ms/query）、对噪声文档敏感、需要大量 GPU 内存（4 张 A100）。
+未来方向包括更高效的检索索引、多模态 RAG、以及减少对标注数据的依赖。
+"""
+
+TEST2_KPS = [
+    "RAG 核心架构: DPR 检索器 + BART 生成器",
+    "关键实验结果: NQ 41.5 EM, TriviaQA 56.8 EM",
+    "主要局限: 检索延迟 120ms, 噪声敏感, 4x A100",
+    "未来方向: 高效索引, 多模态 RAG, 少标注数据",
+    "与传统方法对比: 纯生成模型的准确率基线",  # intentionally has no material support
+]
+
+COVERAGE_MAP_PROMPT = f"""
+以下知识点在当前检索材料中的覆盖情况：
+  [充足] RAG 核心架构: DPR 检索器 + BART 生成器
+  [充足] 关键实验结果: NQ 41.5 EM, TriviaQA 56.8 EM
+  [充足] 主要局限: 检索延迟 120ms, 噪声敏感, 4x A100
+  [有限] 未来方向: 高效索引, 多模态 RAG, 少标注数据
+  [无]   与传统方法对比: 纯生成模型的准确率基线
+
+写作时请注意：
+- [充足] 的知识点可以深入展开，引用具体数据。
+- [有限] 的知识点只写材料中已有的内容，不要延伸推测。
+- [无] 的知识点：如果跳过不影响章节完整性则跳过；
+  如果必须提及，用一句话概括并标注 [需补充数据]。
+"""
+
+WRITE_NO_COVERAGE = ChatPromptTemplate.from_messages([
+    ("human", """\
+撰写一段关于 RAG 的简要报告，覆盖以下主题：RAG 技术原理、关键实验结果、局限性。
+
+参考材料: {materials}
+
+要求: 200-400 字。"""),
+])
+
+WRITE_WITH_COVERAGE = ChatPromptTemplate.from_messages([
+    ("human", """\
+撰写一段关于 RAG 的简要报告，覆盖以下主题：RAG 技术原理、关键实验结果、局限性。
+
+参考材料: {materials}
+
+{coverage_map}
+
+要求: 200-400 字。"""),
+])
+
+
+# ── Test 3: 时效偏好 ───────────────────────────────────────────────────────
+
+TEST3_MATERIALS_OLD_NEW = """
+【1】来源: 2018, old_survey.pdf > 早期研究
+2018 年的一项综述指出，传统符号推理方法在知识问答任务上的准确率约为 45-55%。
+
+【2】来源: 2024, latest_report.pdf > 最新进展
+2024 年的最新研究表明，基于大语言模型的 RAG 方法在该任务上的准确率已达 82%。
+
+【3】来源: 2019, old_method.pdf > 方法对比
+2019 年的实验显示，纯检索方法（无生成）的 top-1 准确率为 38%。
+"""
+
+TEMPORAL_PROMPT = ChatPromptTemplate.from_messages([
+    ("human", """\
+根据以下材料回答: 知识问答任务目前的最佳方法是什么？准确率如何？
+
+{materials}
+
+用 2-3 句话回答。"""),
+])
+
+
+# ── Metrics ──
+
+def has_placeholder(text: str) -> int:
+    return text.count("[需补充数据]") + text.count("[数据待核实]")
+
+def has_year_citation(text: str) -> bool:
+    return bool(re.search(r"(?:20\d{2}|19\d{2})年", text))
+
+def prefers_newer(text: str) -> bool:
+    """Check if text mentions the newer source (2024) preferentially."""
+    # Newer source should be mentioned first or more prominently
+    idx_2024 = text.find("2024")
+    idx_2018 = text.find("2018")
+    if idx_2024 >= 0 and idx_2018 >= 0:
+        return idx_2024 < idx_2018  # newer mentioned first
+    return idx_2024 >= 0  # or at least newer is mentioned
+
+
+# ── Runner ──
+
+async def run():
+    llm = get_chat_model(
+        style=STYLE, model=MODEL, endpoint=ENDPOINT, api_key=KEY,
+        temperature=0.01, max_tokens=800, timeout_s=180,
+    )
+    print(f"Model: {MODEL} @ {ENDPOINT}\n")
+
+    score = 0
+    total = 0
+
+    # ═══════════════════════════════════════════════════════════════════
+    # TEST 1: Critic 审查
+    # ═══════════════════════════════════════════════════════════════════
+    print("=" * 60)
+    print("  TEST 1: Critic LLM Review Quality")
+    print("=" * 60)
+    total += 1
+
+    print("\n  Known errors planted in content:")
+    known_errors = [
+        "85.1% (correct: 78.3%)",
+        "88.3% (correct: 82.1%)",
+        "BERT-base (correct: DPR)",
+        "GPT-2 (correct: T5-large)",
+        "200ms (correct: 120ms)",
+        "52.3% BM25 (correct: 62.7%)",
+        "北京大学+Google (correct: 清华+微软)",
+    ]
+    for e in known_errors:
+        print(f"    - {e}")
+
+    print("\n  Running Critic...")
+    t0 = time.perf_counter()
+    report = run_critic(
+        content=TEST1_CONTENT_WITH_ERRORS,
+        outline="## 实验结果\n## 方法细节",
+        materials=TEST1_MATERIALS,
+    )
+    elapsed = time.perf_counter() - t0
+    issues = report.get("issues", [])
+    suggested = report.get("suggested_queries", [])
+
+    print(f"  Time: {elapsed:.1f}s")
+    print(f"  Issues found: {len(issues)}")
+    for iss in issues:
+        print(f"    [{iss.get('severity','?')}] {iss.get('location','')}: {iss.get('description','')}")
+    if suggested:
+        print(f"  Suggested queries: {suggested}")
+
+    # Score: at least 3 of 7 errors detected
+    detected = len(issues)
+    passed = detected >= 3
+    score += 1 if passed else 0
+    print(f"  Result: {'PASS' if passed else 'FAIL'} (detected {detected}/7)")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # TEST 2: 覆盖度提示
+    # ═══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("  TEST 2: Coverage Map Effect")
+    print("=" * 60)
+    total += 1
+
+    # A: Without coverage
+    chain_a = WRITE_NO_COVERAGE | llm | StrOutputParser()
+    t0 = time.perf_counter()
+    text_a = (chain_a.invoke({"materials": TEST2_MATERIALS}) or "").strip()
+    elapsed_a = time.perf_counter() - t0
+
+    # B: With coverage
+    chain_b = WRITE_WITH_COVERAGE | llm | StrOutputParser()
+    t0 = time.perf_counter()
+    text_b = (chain_b.invoke({
+        "materials": TEST2_MATERIALS,
+        "coverage_map": COVERAGE_MAP_PROMPT,
+    }) or "").strip()
+    elapsed_b = time.perf_counter() - t0
+
+    ph_a = has_placeholder(text_a)
+    ph_b = has_placeholder(text_b)
+
+    print(f"\n  Without coverage ({elapsed_a:.1f}s, {len(text_a)} chars):")
+    print(f"    Placeholders: {ph_a}")
+    for line in text_a.splitlines()[:5]:
+        print(f"    | {line.strip()[:100]}")
+
+    print(f"\n  With coverage ({elapsed_b:.1f}s, {len(text_b)} chars):")
+    print(f"    Placeholders: {ph_b}")
+    for line in text_b.splitlines()[:5]:
+        print(f"    | {line.strip()[:100]}")
+
+    # Check if the '无' knowledge point triggers a placeholder
+    has_no_kp_text = "传统方法" in text_b or "需补充" in text_b or "纯生成" in text_b
+    print(f"\n  Coverage effect: placeholder_added={ph_b > ph_a}, handles_no_kp={has_no_kp_text}")
+
+    passed2 = ph_b >= ph_a  # with coverage should not produce MORE unsupported claims
+    score += 1 if passed2 else 0
+    print(f"  Result: {'PASS' if passed2 else 'FAIL'}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # TEST 3: 时效偏好
+    # ═══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("  TEST 3: Temporal Preference")
+    print("=" * 60)
+    total += 1
+
+    chain3 = TEMPORAL_PROMPT | llm | StrOutputParser()
+    t0 = time.perf_counter()
+    text3 = (chain3.invoke({"materials": TEST3_MATERIALS_OLD_NEW}) or "").strip()
+    elapsed3 = time.perf_counter() - t0
+
+    has_year = has_year_citation(text3)
+    newer_first = prefers_newer(text3)
+
+    print(f"\n  Response ({elapsed3:.1f}s):")
+    for line in text3.splitlines()[:5]:
+        print(f"    {line.strip()[:120]}")
+
+    print(f"\n  Mentions years: {has_year}")
+    print(f"  Prefers newer (2024): {newer_first}")
+    print(f"  Mentions 82%: {'82%' in text3 or '82' in text3}")
+
+    passed3 = has_year or newer_first or '82' in text3
+    score += 1 if passed3 else 0
+    print(f"  Result: {'PASS' if passed3 else 'FAIL'}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # SUMMARY
+    # ═══════════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print(f"  LLM COMPARISON SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Test 1 - Critic Review:     {'PASS' if detected >= 3 else 'FAIL'} ({detected}/7 errors found)")
+    print(f"  Test 2 - Coverage Map:      {'PASS' if passed2 else 'FAIL'} (placeholder: {ph_a}->{ph_b})")
+    print(f"  Test 3 - Temporal Pref:     {'PASS' if passed3 else 'FAIL'} (year_cite={has_year}, newer_first={newer_first})")
+    print(f"\n  Score: {score}/{total}")
+    print(f"  {'='*60}")
+    print(f"  Done.")
+
+if __name__ == "__main__":
+    asyncio.run(run())

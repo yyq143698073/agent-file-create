@@ -367,6 +367,92 @@ def _compute_factscore_and_coverage(content: str, analysis_results: list,
             "aspects_count": len(aspects), "uncovered_aspects": uncovered}
 
 
+# ── Cross-section data repetition scan ─────────────────────────────────────────
+
+
+def _scan_data_repetition(content: str, task_id: str = "") -> list[dict]:
+    """Post-generation scan: detect the same numerical value repeated across sections.
+
+    LLM prompt rules (rule 9) ask the model to avoid repetition, but LLM output is
+    non-deterministic.  This regex-based scan is a deterministic safety net: it
+    extracts all ``XX%`` / ``XX.X%`` / key integer patterns, groups them by value,
+    and flags any value appearing in more than 3 different sections.
+
+    Returns a list of warnings, each with the repeated value, section count, and
+    the sections it appears in.
+    """
+    if not content or len(content) < 200:
+        return []
+
+    # Split into sections by ## headings
+    sections: list[tuple[str, str]] = []  # [(title, body)]
+    current_title = "（开篇）"
+    current_body: list[str] = []
+    for line in content.splitlines():
+        m = re.match(r"^##\s+(.+)", line.strip())
+        if m:
+            if current_body:
+                sections.append((current_title, "\n".join(current_body)))
+            current_title = m.group(1).strip()
+            current_body = []
+        else:
+            current_body.append(line)
+    if current_body:
+        sections.append((current_title, "\n".join(current_body)))
+
+    if len(sections) < 2:
+        return []
+
+    # Extract patterns: percentages and standalone numbers ≥ 2 digits
+    pattern_pct = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+    pattern_num = re.compile(r"(?<!\d)(\d{2,}(?:\.\d+)?)(?!\d)")
+
+    # For each numeric value, record which sections mention it
+    value_sections: dict[str, set[str]] = {}
+    for title, body in sections:
+        found: set[str] = set()
+        for m in pattern_pct.finditer(body):
+            found.add(m.group(0))
+        for m in pattern_num.finditer(body):
+            val = m.group(0)
+            # Skip years and common numbers
+            if re.match(r"^(19|20)\d{2}$", val):
+                continue
+            if len(val) >= 2:
+                found.add(val)
+        for v in found:
+            if v not in value_sections:
+                value_sections[v] = set()
+            value_sections[v].add(title)
+
+    # Flag values appearing in >3 sections (repetition threshold)
+    warnings: list[dict] = []
+    repeat_threshold = 3
+    for value, secs in sorted(value_sections.items(),
+                              key=lambda x: -len(x[1])):
+        if len(secs) > repeat_threshold:
+            warnings.append({
+                "value": value,
+                "section_count": len(secs),
+                "sections": sorted(secs),
+            })
+
+    if warnings:
+        logger.warning(
+            "data_repetition task=%s repeated_values=%d top_offender=%s sections=%d",
+            task_id, len(warnings),
+            warnings[0]["value"], warnings[0]["section_count"],
+        )
+        for w in warnings[:5]:
+            logger.debug(
+                "data_repetition_detail task=%s value=%s count=%d sections=%s",
+                task_id, w["value"], w["section_count"],
+                ", ".join(w["sections"][:5]),
+            )
+
+    return warnings
+
+
 # ── Hallucination-triggered re-retrieval (main faithfulness hook) ──────────────
 
 def _run_faithfulness_checks(
@@ -389,4 +475,19 @@ def _run_faithfulness_checks(
         output_dir=str(output_dir),
     )
     result = QualityPipeline().run(ctx)
-    return str(result.content or "")
+    content = str(result.content or "")
+
+    # ── Cross-section data repetition scan (deterministic safety net) ──
+    _scan_data_repetition(content, task_id=str(task_id))
+
+    # ── Clean up construction markers that should never reach the final output ──
+    # Prompt instructs LLM to use [需补充数据] for missing knowledge points,
+    # but the model occasionally invents variants with Chinese parentheses or
+    # halfwidth brackets.  Strip all of them and replace with a reader-facing phrase.
+    for _pattern in [
+        r'[\[【]\s*需补充[^\]】]*[\]】]',   # [需补充…]  【需补充…】
+        r'[（(]\s*需补充[^）)]*[）)]',        # （需补充…）  (需补充…)
+    ]:
+        content = re.sub(_pattern, '（该维度在现有材料中暂未覆盖）', content)
+
+    return content

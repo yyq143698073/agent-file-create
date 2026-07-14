@@ -1,4 +1,8 @@
 import logging
+import os
+# Suppress the "Consider using the pymupdf_layout package" advertisement.
+# Must be set before PyMuPDF's first import (it checks once on first use).
+os.environ.setdefault("PYMUPDF_SUGGEST_LAYOUT_ANALYZER", "0")
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -40,5 +44,5 @@ def setup_logging() -> None:
     root.addHandler(ch)
 
     # Silence noisy third-party libs
-    for lib in ("urllib3", "httpx", "fastapi", "uvicorn", "langchain", "jieba"):
+    for lib in ("urllib3", "httpx", "fastapi", "uvicorn", "langchain", "jieba", "fitz", "pymupdf"):
         logging.getLogger(lib).setLevel(logging.WARNING)

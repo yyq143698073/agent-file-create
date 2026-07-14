@@ -202,17 +202,67 @@ def _check_critical_section(outline: str) -> list[str]:
     return []
 
 
-# ── Q2 P2: Topic coverage check (jieba-based, no LLM call) ──────────────────
+# ── Q2 P2: Topic coverage check ──────────────────────────────────────────────
 
 
-def _check_topic_coverage(outline: str, user_prompt: str) -> dict:
-    """Check whether outline headings cover key topics from the user prompt.
+def _check_topic_coverage_llm(outline: str, user_prompt: str, source_text: str = "") -> dict:
+    """LLM-based topic coverage: can understand synonyms and paraphrases.
 
-    Uses jieba token-frequency extraction on the user prompt and matches
-    against outline heading text.  Returns coverage ratio + uncovered terms.
-    Coverage < 0.5 triggers feedback injection for retry.
+    Called as a fallback when the fast jieba-based check shows low coverage.
+    Returns same dict format: {coverage, covered, uncovered}.
     """
     if not user_prompt or len(user_prompt.strip()) < 10:
+        return {"coverage": 1.0, "covered": [], "uncovered": []}
+
+    src_hint = ""
+    if source_text and len(str(source_text).strip()) > 20:
+        src_hint = f"\n参考源材料（前1500字）：\n{str(source_text)[:1500]}"
+
+    prompt = (
+        "你是大纲覆盖度审查助手。请判断以下大纲是否充分覆盖了用户需求和源材料中的核心主题。\n\n"
+        f"用户需求：{user_prompt[:500]}{src_hint}\n\n"
+        f"大纲：\n{outline[:2000]}\n\n"
+        "如果大纲充分覆盖了关键主题（考虑同义词和近义表述），回复 OK。"
+        "如果有缺失的主题，只回复缺失的主题名称（每行一个），不要任何解释。"
+        "注意：主题名称应该是中文词汇，长度 2-8 字，从用户需求或源材料中提取。"
+    )
+
+    try:
+        text = call_llm(
+            prompt,
+            timeout_s=20,
+            temperature=0.0,
+            num_predict=150,
+            system="你是中文文档质量审查助手。",
+            api_style=OUTLINE_API_STYLE,
+            api_endpoint=OUTLINE_API_ENDPOINT,
+            api_key=OUTLINE_API_KEY,
+            model_name=OUTLINE_MODEL_NAME,
+        )
+        result = (text or "").strip()
+        if result.upper() in {"OK", "OK。", "无", "无缺失", "NONE", "N/A", "无"}:
+            return {"coverage": 1.0, "covered": [], "uncovered": []}
+        missing = [line.strip().lstrip("-•·1234567890. ") for line in result.splitlines()]
+        missing = [m for m in missing if m and len(m) > 1][:8]
+        cov = 1.0 - len(missing) / 10.0  # rough estimate
+        return {"coverage": round(max(0.0, cov), 3), "covered": [], "uncovered": missing}
+    except Exception:
+        return {"coverage": 1.0, "covered": [], "uncovered": []}
+
+
+def _check_topic_coverage(outline: str, user_prompt: str, source_text: str = "") -> dict:
+    """Check whether outline headings cover key topics from the prompt + source.
+
+    Uses jieba TF extraction on both the user prompt and (when available)
+    the source material text, then matches against outline headings.
+    Returns coverage ratio + uncovered terms.
+    Coverage < 0.5 triggers feedback injection for retry.
+    """
+    combined = str(user_prompt or "")
+    if source_text and len(str(source_text).strip()) > 20:
+        combined += " " + str(source_text)[:2000]
+
+    if not combined or len(combined.strip()) < 10:
         return {"coverage": 1.0, "covered": [], "uncovered": []}
 
     try:
@@ -220,13 +270,13 @@ def _check_topic_coverage(outline: str, user_prompt: str) -> dict:
     except Exception:
         return {"coverage": 1.0, "covered": [], "uncovered": []}
 
-    # Extract key terms from user prompt (TF top-10, skip stopwords)
+    # Extract key terms from combined text (TF top-15, skip stopwords)
     stop = set("的了吗呢吧啊是都在和与或对从到用把被让给为以而因但就这那也都还没又再很更太只就可会要能说看想他她它我你".split())
-    tokens = [t.strip() for t in jieba.lcut(user_prompt) if len(t.strip()) >= 2 and t.strip() not in stop]
+    tokens = [t.strip() for t in jieba.lcut(combined) if len(t.strip()) >= 2 and t.strip() not in stop]
     freq: dict[str, int] = {}
     for t in tokens:
         freq[t] = freq.get(t, 0) + 1
-    user_terms = [t for t, _ in sorted(freq.items(), key=lambda x: x[1], reverse=True)[:10]]
+    user_terms = [t for t, _ in sorted(freq.items(), key=lambda x: x[1], reverse=True)[:15]]
 
     if not user_terms:
         return {"coverage": 1.0, "covered": [], "uncovered": []}
@@ -245,6 +295,25 @@ def _check_topic_coverage(outline: str, user_prompt: str) -> dict:
 
     cov = len(covered) / max(len(user_terms), 1)
     return {"coverage": round(cov, 3), "covered": covered, "uncovered": uncovered}
+
+
+def _strip_non_headings(outline: str) -> str:
+    """Remove non-heading lines from the outline.
+
+    The LLM sometimes adds descriptive sentences like
+    "根据材料1，粗粒度易引入噪声..." under headings despite
+    the prompt explicitly forbidding body text.
+    """
+    lines = outline.splitlines()
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            result.append("")
+        elif re.match(r"^#{1,6}\s+\S", stripped):
+            result.append(line)
+        # else: skip non-heading lines (descriptive text)
+    return "\n".join(result).strip()
 
 
 def _clean_llm_output(text: str) -> str:
@@ -332,7 +401,9 @@ def _build_outline_prompt(user_req: str, digest: str, feedback: str, target_word
         "1) # 一级标题 = 章标题（至少1个，内容丰富的报告可增加到不超过6个）。",
         "   每个 # 代表一个独立的「章」（chapter），编号由系统自动生成（1. 2. 3. …）。",
         "   单主题短报告使用 1 个 # 即可；多维度综合报告可将每个维度设为独立的 # 章。",
-        "2) ## 二级标题 = 主章节（至少3个，建议不超过8个）。",
+        f"2) ## 二级标题 = 主章节。目标总字数约 {target_words} 字——请据此控制章节数量："
+        f"3000字以内建议不超过4个 ##，每3000字增加1-2个 ##。"
+        f"宁可章节少但每节内容充实，也不要章节多但每节只有两三句话。",
         "   命名原则：从材料中提取最突出的主题作为章节名，而不是套用「背景/分析/建议」的固定模板。",
         "   好的命名示例：「华东区Q3销售异常分析」「竞品A产品策略拆解」「供应链成本优化路径」",
         "   差的命名示例：「第一章 背景」「第一部分 概述」（过于空洞）",
@@ -341,7 +412,7 @@ def _build_outline_prompt(user_req: str, digest: str, feedback: str, target_word
         "4) 最多到 ### 三级标题。禁止使用 #### 或更深的标题。如果内容需要更细粒度，用列表项或粗体文本组织，不要增加标题层级。",
         "5) 层级必须连续，禁止 # 直接跳 ###（跳过 ##）。",
         "6) 如果材料中没有支撑某类内容，不要强行编造该章节。宁可大纲短一些，也不要无中生有。",
-        "7) 只输出 Markdown 大纲本身，不要解释、不要前言后语、不要代码块包裹。",
+        "7) 只输出纯标题层级结构。每一行必须是 # / ## / ### 开头，禁止在任何标题下添加正文、描述句、说明文字、引用标注（如【1】）。错了：标题后跟一段解释文字。正确：标题下一行必须是另一个标题或空行。",
         "8) 避免同质化结构：连续多个 ## 章节如果采用完全相同的「概述—拆解—数据」模式，请做结构调整——例如将某一章改为问题驱动型（以具体问题开头）、案例分析型（以实例贯穿）、或对比分析型（多方案并列）。相邻章节的结构类型不应完全相同。",
         "9) 强制批判章节：大纲必须包含一个 ## 二级章节来讨论方法的局限性、失败场景、未解决的问题或与其他方法的对比差距。要求：a) 必须引用至少一个具体来源（标注材料编号如'根据材料1...'），b) 至少包含一项量化数据或具体技术细节，c) 不得使用'相关研究不足''数据有限'等无实质内容的表述。该章节放在大纲后半部分（倒数第1~2个 ## 的位置），不能是 ### 三级子节。",
         "",
@@ -475,6 +546,10 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
         )
         out = _clean_llm_output(text)
 
+        # Strip non-heading lines — the LLM sometimes adds descriptive
+        # sentences under headings despite the prompt telling it not to.
+        out = _strip_non_headings(out)
+
         if not out.startswith("#"):
             out = "# 报告\n\n" + out
 
@@ -496,7 +571,12 @@ def generate_outline(multimodal_results: Dict[str, Any], user_prompt: str,
         # ── Q2: Run naming + critical + topic-coverage checks (non-blocking) ──
         naming_warnings = _check_naming_quality(out)
         critical_issues = _check_critical_section(out)
-        topic_cov = _check_topic_coverage(out, user_prompt)
+        topic_cov = _check_topic_coverage(out, user_prompt, source_text=digest)
+        # Fallback: if jieba coverage is low, run LLM-based coverage check
+        if topic_cov["coverage"] < 0.50 and not coverage_future:
+            llm_cov = _check_topic_coverage_llm(out, user_prompt, digest)
+            if llm_cov["coverage"] > topic_cov["coverage"]:
+                topic_cov = llm_cov
 
         if not issues:
             coverage_issues = coverage_future.result() if coverage_future else []

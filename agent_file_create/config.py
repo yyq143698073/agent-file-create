@@ -1,12 +1,15 @@
 import os
 from pathlib import Path
 
-# Auto-load .env from project root (fallback defaults, overridden by real env vars)
+# Auto-load .env from project root
+# override=True: .env file values take precedence over system env vars.
+# This lets developers pin model versions per-project without touching
+# global environment settings.
 try:
     from dotenv import load_dotenv
     _env_path = Path(__file__).resolve().parent.parent / ".env"
     if _env_path.exists():
-        load_dotenv(_env_path)
+        load_dotenv(_env_path, override=True)
 except ImportError:
     pass
 

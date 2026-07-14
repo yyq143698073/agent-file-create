@@ -244,7 +244,7 @@ class KnowledgeBase(SearchMixin, QueryMixin, AnswerMixin):
             return {"kb": kb2, "doc_id": did, "ok": False, "error": "no_chunks"}
 
         # Assign parent chunk groups for context-window retrieval
-        chunks = _assign_parent_chunks(chunks)
+        _assign_parent_chunks(chunks, did)
 
         logger.info(f"kb_chunked kb={kb2} file={p.name} chunks={len(chunks)} chunk_size={_tc}")
 

@@ -24,6 +24,7 @@ from agent_file_create.rag.store import Hit
 from agent_file_create.rag._utils import (
     bm25_scores as _bm25_scores,
     compute_adaptive_rrf_k as _compute_adaptive_rrf_k,
+    doc_level_aggregate as _doc_level_aggregate,
     mmr_rerank as _mmr_rerank,
     normalize_kb as _normalize_kb,
     rrf_ranks as _rrf_ranks,
@@ -113,6 +114,7 @@ class SearchMixin:
                         enable_title_boost: bool = True,
                         enable_adaptive_weights: bool = True,
                         enable_rerank: bool = False,
+                        enable_doc_agg: bool = True,
                         hyde_query: str = "",
                         ) -> list[Hit]:
         """Adaptive recall with optional chunk-level cross-encoder reranking.
@@ -225,6 +227,11 @@ class SearchMixin:
 
         scored.sort(key=lambda x: x[0], reverse=True)
         result = [h for _, h in scored[: max(1, int(top_k or 0))]]
+
+        # ── Document-level aggregation: chunk hits → doc rerank → top chunks ──
+        if enable_doc_agg and len(scored) >= 3:
+            all_chunk_hits = [h for _, h in scored]
+            result = _doc_level_aggregate(all_chunk_hits, max(1, int(top_k or 0)))
 
         # ── Chunk-level cross-encoder reranking (Top-50 → Top-K) ──────────
         if enable_rerank and len(scored) >= 3:
@@ -535,7 +542,14 @@ class SearchMixin:
             s = (1.0 / (k_rrf + rv)) + (1.0 / (k_rrf + rb)) + (1.0 / (k_rrf + rl))
             scored.append((float(s), Hit(kb=h.kb, doc_id=h.doc_id, chunk_id=h.chunk_id, chunk_index=h.chunk_index, section_path=h.section_path, content=h.content, score=float(s), meta=meta)))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [h for _, h in scored[: max(1, int(top_k or 0))]]
+        result = [h for _, h in scored[: max(1, int(top_k or 0))]]
+
+        # ── Document-level aggregation ──
+        if len(scored) >= 3:
+            all_chunk_hits = [h for _, h in scored]
+            result = _doc_level_aggregate(all_chunk_hits, max(1, int(top_k or 0)))
+
+        return result
 
     def search_auto(self, *, kb: str, query: str, top_k: int = 8,
                     filters: Optional[dict] = None, **kw) -> list[Hit]:

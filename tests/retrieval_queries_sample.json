@@ -1,0 +1,17 @@
+[
+  {
+    "query": "风险管理政策的核心内容是什么？",
+    "relevant_doc_ids": ["风险管理政策_v2.pdf"],
+    "relevant_chunk_ids": ["风险管理政策_v2.pdf:2", "风险管理政策_v2.pdf:3"]
+  },
+  {
+    "query": "2024年财务预算如何分配？",
+    "relevant_doc_ids": ["2024年度预算报告.xlsx"],
+    "relevant_chunk_ids": []
+  },
+  {
+    "query": "员工入职流程包括哪些步骤？",
+    "relevant_doc_ids": ["员工手册_2024.docx", "入职流程指南.pdf"],
+    "relevant_chunk_ids": []
+  }
+]

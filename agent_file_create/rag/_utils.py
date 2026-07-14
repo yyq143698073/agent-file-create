@@ -348,6 +348,42 @@ def split_sentences(text: str) -> list[str]:
 
 # ── Multi-format file reader ──────────────────────────────────────────────────
 
+def doc_level_aggregate(hits: list[Hit], top_k: int) -> list[Hit]:
+    """Aggregate chunk-level hits to document level, then return top chunks.
+
+    Groups hits by doc_id, computes doc score as sum of top-3 chunk scores,
+    re-ranks documents, then returns top chunks (max 2 per doc) from top docs.
+    """
+    if not hits or top_k <= 0:
+        return hits[:top_k] if hits else []
+
+    # Group by doc_id
+    doc_hits: dict[str, list[Hit]] = {}
+    for h in hits:
+        did = str(h.doc_id or "unknown")
+        doc_hits.setdefault(did, []).append(h)
+
+    # Score each doc by sum of top-3 chunk scores
+    doc_scores: list[tuple[str, float]] = []
+    for did, dhits in doc_hits.items():
+        dhits.sort(key=lambda x: x.score, reverse=True)
+        doc_score = sum(h.score for h in dhits[:3])
+        doc_scores.append((did, doc_score))
+
+    # Rank documents
+    doc_scores.sort(key=lambda x: x[1], reverse=True)
+
+    # Return top chunks from top documents (max 2 per doc)
+    result: list[Hit] = []
+    for did, _ in doc_scores:
+        if len(result) >= top_k:
+            break
+        doc_chunks = doc_hits[did][:2]  # max 2 chunks per doc
+        result.extend(doc_chunks)
+
+    return result[:top_k]
+
+
 def read_any_text(path: str) -> str:
     """Read text content from any supported file format (PDF/DOCX/PPTX/XLSX/image/plain)."""
     from agent_file_create.preprocessor import (

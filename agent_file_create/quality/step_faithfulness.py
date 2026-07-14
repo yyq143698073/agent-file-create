@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # Patterns for severity classification based on issue description keywords
 _SEVERITY_PATTERNS: list[tuple[str, str]] = [
     (r"(虚假|编造|伪造|完全不?存在|严重错误|数据错误|虚构)", "严重"),
-    (r"(无依据|找不到|未在.*中[发出]现|无来源|缺乏证据|证据不足)", "严重"),
+    (r"(无依据|找不到|未在.*中[发出]现|无来源|缺乏证据|证据不足)", "轻微"),
     (r"(推测|推断|可能不?准确|疑似|待核实|需确认|无法验证)", "轻微"),
     (r"(夸大|过度|过于绝对|不够精确|模糊|笼统)", "轻微"),
     (r"(部分.*错误|细节.*问题|表述.*不准确|轻微.*偏差)", "轻微"),

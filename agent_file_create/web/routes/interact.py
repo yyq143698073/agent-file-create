@@ -587,10 +587,17 @@ async def api_stream(task_id: str = Query("")):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+# ── Tasks list cache ────────────────────────────────────────────────────
+# Avoids filesystem scan on every poll (the frontend calls /api/tasks
+# every 2 s).  A short TTL keeps the list reasonably fresh.
+_tasks_list_cache: dict[str, Any] = {"data": None, "ts": 0.0}
+_TASKS_CACHE_TTL = 2.0  # seconds
+
+
 @router.get("/api/tasks")
 def api_tasks(task_id: str = Query("")):
     task_manager = TaskManager()
-    # Single task detail
+    # Single task detail — always fresh (uncached)
     if task_id:
         tid = task_manager.normalize_task_id(task_id)
         if not tid:
@@ -600,7 +607,11 @@ def api_tasks(task_id: str = Query("")):
         data["chat_summary"] = task_manager.read_chat_summary(tid) or ""
         return data
 
-    # List all tasks
+    # ── List all tasks — serve from cache when fresh ──────────────────
+    now = time.time()
+    if _tasks_list_cache["data"] is not None and (now - _tasks_list_cache["ts"]) < _TASKS_CACHE_TTL:
+        return _tasks_list_cache["data"]
+
     base = result_dir()
     items = []
     if base.exists():
@@ -634,7 +645,10 @@ def api_tasks(task_id: str = Query("")):
                 })
             except Exception:
                 continue
-    return {"tasks": items, "total": len(items)}
+    result: dict[str, Any] = {"tasks": items, "total": len(items)}
+    _tasks_list_cache["data"] = result
+    _tasks_list_cache["ts"] = now
+    return result
 
 
 # ── Gen from chat ───────────────────────────────────────────────────────────
@@ -660,11 +674,14 @@ async def api_gen(request: Request):
     saved_templates_raw = meta.get("saved_templates")
     saved_templates = [str(x) for x in saved_templates_raw] if isinstance(saved_templates_raw, list) else []
     template_dir_str = str(meta.get("template_dir") or "").strip() or None
+    try: target_words = int(meta.get("target_words") or 0)
+    except Exception: target_words = 0
 
     ok, msg = _start_task_thread(
         task_id, user_prompt=prompt, file_paths=file_paths,
         ab_eval=ab_eval, template_dir_override=template_dir_str,
         saved_templates=saved_templates, mode="all",
+        target_words=target_words,
     )
     if not ok:
         raise HTTPException(409, msg)

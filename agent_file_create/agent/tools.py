@@ -50,7 +50,10 @@ def create_tools(
         ):
             return "analysis_results 已存在, 跳过抽取。"
 
-        from agent_file_create.document.extractor import extract_from_file
+        from agent_file_create.document.extractor import (
+            deduplicate_extracted_results,
+            extract_from_file,
+        )
         from agent_file_create.config import MAX_WORKERS_DEFAULT
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -73,9 +76,9 @@ def create_tools(
                 if isinstance(res, dict):
                     res["_file"] = Path(fps[idx]).name
                 results[idx] = res
-        state["analysis_results"] = results
+        state["analysis_results"] = deduplicate_extracted_results(results)
         state["force_regen"] = False
-        return f"已抽取 {len(results)} 个文件。"
+        return f"已抽取 {len(results)} 个文件，去重后保留 {len(state['analysis_results'])} 份材料。"
 
     # ── 2. assess_material ──────────────────────────────────────────
 

@@ -1,0 +1,275 @@
+# -*- coding: utf-8 -*-
+"""
+补测三个缺口: 引用使用率 / 预算缩放 / 覆盖度幻觉量化
+运行: MODEL=qwen3.5:9b python tests/test_missing.py
+"""
+import asyncio, os, re, sys, time
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from agent_file_create.llm_factory import get_chat_model
+from agent_file_create.rag.planner import _get_context_budget
+
+STYLE   = os.getenv("STYLE",   "ollama")
+MODEL   = os.getenv("MODEL",   "qwen3.5:9b")
+ENDPOINT = os.getenv("ENDPOINT", "http://localhost:11434")
+KEY     = os.getenv("KEY",     "")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST A: 引用标注实际使用率
+# ═══════════════════════════════════════════════════════════════════
+
+# Materials WITH citation markers (format matches _compress_hits_annotated output)
+MATERIALS_ANNOTATED = """
+【1】2024年销量达1200万辆，同比增长35% (来源: 2024, market_report.pdf > 市场规模)
+【2】比亚迪市场份额32%，特斯拉18%，蔚来5% (来源: 2024, competition.pdf > 竞争格局)
+【3】纯电占70%，插混25%，氢燃料5% (来源: 2023, tech_roadmap.pdf > 技术路线)
+【4】固态电池预计2026年量产，能量密度突破400Wh/kg (来源: 2024, battery_paper.pdf > 电池技术)
+"""
+
+# Same materials WITHOUT citation markers (plain text)
+MATERIALS_PLAIN = """
+2024年销量达1200万辆，同比增长35%。比亚迪市场份额32%，特斯拉18%，蔚来5%。
+纯电占70%，插混25%，氢燃料5%。固态电池预计2026年量产，能量密度突破400Wh/kg。
+"""
+
+CITATION_PROMPT = ChatPromptTemplate.from_messages([
+    ("human", """\
+根据以下材料撰写一段关于新能源汽车行业的简要分析（150-300字）。
+
+材料:
+{materials}
+
+写作要求:
+- 引用具体数据时，请在句末用【数字】标注对应的编号
+- 例如: 2024年销量达1200万辆【1】，同比增长35%。
+- 优先采信较新的来源"""),
+])
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST B: 预算缩放
+# ═══════════════════════════════════════════════════════════════════
+
+def test_budget():
+    """验证不同 section type 和 target_words 下的预算差异"""
+    types = ["data", "experiment_setup", "analysis", "review"]
+    tw_levels = [0, 2000, 5000, 8000]
+
+    print("\n  Budget by section type and target_words:")
+    print(f"  {'':<20}", end="")
+    for tw in tw_levels:
+        print(f"{f'{tw}w':>8}", end="")
+    print()
+
+    for st in types:
+        print(f"  {st:<20}", end="")
+        for tw in tw_levels:
+            b = _get_context_budget(st, tw)
+            print(f"{b:>8}", end="")
+        print()
+
+    # Check: data should always > review
+    data_8000 = _get_context_budget("data", 8000)
+    review_0 = _get_context_budget("review", 0)
+    ok1 = data_8000 > review_0
+
+    # Check: scaling works
+    data_0 = _get_context_budget("data", 0)
+    ok2 = data_8000 > data_0
+
+    return ok1, ok2, data_8000 / review_0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST C: 覆盖度 — 量化幻觉减少
+# ═══════════════════════════════════════════════════════════════════
+
+# Materials: only cover 3 of 5 knowledge points
+MATERIALS_COVERAGE = """
+RAG 由 Lewis 等人于 2020 年提出，核心是结合稠密检索与序列到序列生成。
+DPR 检索器在 NQ 数据集上 top-20 准确率达 78.3%，BART 生成器在 TriviaQA 上 EM 达 56.8。
+实验使用 4 张 A100 GPU，推理延迟为 120ms/query。代码已开源在 GitHub。
+"""
+
+# Knowledge points with intentional gaps
+COVERAGE_MAP = """
+以下知识点在当前检索材料中的覆盖情况：
+  ● 充足: RAG 核心架构 (DPR + BART)
+  ● 充足: 关键实验结果 (NQ 78.3%, TriviaQA 56.8)
+  ● 充足: 实验配置与性能指标 (4x A100, 120ms)
+  ○ 有限: 与传统方法的对比数据
+  ✗ 无: RAG 在工业界的落地案例
+
+要求:
+- [充足] 可深入展开
+- [有限] 只写已有内容，不延伸
+- [无] 跳过或标注 [需补充数据]
+"""
+
+WRITE_KNOWLEDGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("human", """\
+撰写一段关于 RAG 的简要技术报告（200-400 字），覆盖以下知识点：
+1. RAG 核心架构
+2. 关键实验结果
+3. 与传统方法的对比
+4. 工业界落地案例
+
+参考材料: {materials}
+{coverage}
+
+要求: 严格基于材料写，不要编造数据。"""),
+])
+
+
+# ── Metrics ──
+
+def count_unsupported_claims(text: str, source_facts: set[str]) -> int:
+    """Count numeric claims in text NOT present in source facts."""
+    count = 0
+    for m in re.finditer(r"\d+(?:\.\d+)?\s*[万亿千百]?\s*(?:%|％|万|亿|[BbKkMm])?", text):
+        val = m.group().strip()
+        if len(val) >= 2:
+            matched = any(val in f or f in val for f in source_facts)
+            if not matched:
+                count += 1
+    return count
+
+def extract_all_numbers(text: str) -> set[str]:
+    nums = set()
+    for m in re.finditer(r"\d+(?:\.\d+)?\s*[万亿千百]?\s*(?:%|％|万|亿|[BbKkMm])?", text):
+        v = m.group().strip()
+        if len(v) >= 2:
+            nums.add(v)
+    return nums
+
+
+# ── Runner ──
+
+async def run():
+    llm = get_chat_model(
+        style=STYLE, model=MODEL, endpoint=ENDPOINT, api_key=KEY,
+        temperature=0.01, max_tokens=600, timeout_s=180,
+    )
+    print(f"Model: {MODEL}\n")
+    score = 0
+    total = 3
+
+    # ═══════════════════════════════════════════════════════════════
+    print("=" * 60)
+    print("  TEST A: Citation Marker Usage Rate")
+    print("=" * 60)
+
+    t0 = time.perf_counter()
+    chain = CITATION_PROMPT | llm | StrOutputParser()
+
+    # With annotations
+    text_annotated = (chain.invoke({"materials": MATERIALS_ANNOTATED}) or "").strip()
+    t_annotated = time.perf_counter() - t0
+
+    # Without annotations
+    text_plain = (chain.invoke({"materials": MATERIALS_PLAIN}) or "").strip()
+    t_plain = time.perf_counter() - t0
+
+    cite_annotated = len(re.findall(r"【\d+】", text_annotated))
+    cite_plain = len(re.findall(r"【\d+】", text_plain))
+
+    print(f"\n  With annotated materials ({t_annotated:.0f}s):")
+    print(f"    Citation markers: {cite_annotated}")
+    for line in text_annotated.splitlines()[:5]:
+        print(f"    | {line.strip()[:120]}")
+
+    print(f"\n  With plain materials ({t_plain:.0f}s):")
+    print(f"    Citation markers: {cite_plain}")
+    for line in text_plain.splitlines()[:3]:
+        print(f"    | {line.strip()[:120]}")
+
+    passed_a = cite_annotated > 0
+    print(f"\n  Result: {'PASS' if passed_a else 'FAIL'} "
+          f"(annotated={cite_annotated}, plain={cite_plain})")
+    if passed_a:
+        score += 1
+
+    # ═══════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("  TEST B: Budget Scaling in Practice")
+    print("=" * 60)
+
+    ok1, ok2, ratio = test_budget()
+    print(f"\n  data/8000w > review/0w: {'PASS' if ok1 else 'FAIL'} ({ratio:.1f}x)")
+    print(f"  data/8000w > data/0w:  {'PASS' if ok2 else 'FAIL'} (scaling works)")
+
+    passed_b = ok1 and ok2
+    if passed_b:
+        score += 1
+    print(f"  Result: {'PASS' if passed_b else 'FAIL'}")
+
+    # ═══════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("  TEST C: Coverage Map — Hallucination Reduction")
+    print("=" * 60)
+
+    source_nums = extract_all_numbers(MATERIALS_COVERAGE)
+    print(f"\n  Source numbers: {sorted(source_nums)[:10]}")
+
+    # Without coverage
+    t0 = time.perf_counter()
+    chain_no_cov = WRITE_KNOWLEDGE_PROMPT | llm | StrOutputParser()
+    text_no_cov = (chain_no_cov.invoke({
+        "materials": MATERIALS_COVERAGE, "coverage": "",
+    }) or "").strip()
+    t_no_cov = time.perf_counter() - t0
+
+    # With coverage
+    chain_with_cov = WRITE_KNOWLEDGE_PROMPT | llm | StrOutputParser()
+    text_with_cov = (chain_with_cov.invoke({
+        "materials": MATERIALS_COVERAGE, "coverage": COVERAGE_MAP,
+    }) or "").strip()
+    t_with_cov = time.perf_counter() - t0
+
+    halluc_no_cov = count_unsupported_claims(text_no_cov, source_nums)
+    halluc_with_cov = count_unsupported_claims(text_with_cov, source_nums)
+    has_placeholder = "[需补充数据]" in text_with_cov
+
+    print(f"\n  Without coverage ({t_no_cov:.0f}s, {len(text_no_cov)} chars):")
+    print(f"    Unsupported claims: {halluc_no_cov}")
+    for line in text_no_cov.splitlines()[:4]:
+        print(f"    | {line.strip()[:120]}")
+
+    print(f"\n  With coverage ({t_with_cov:.0f}s, {len(text_with_cov)} chars):")
+    print(f"    Unsupported claims: {halluc_with_cov}")
+    print(f"    Has placeholder:    {has_placeholder}")
+    for line in text_with_cov.splitlines()[:4]:
+        print(f"    | {line.strip()[:120]}")
+
+    reduction = (
+        (halluc_no_cov - halluc_with_cov) / max(halluc_no_cov, 1) * 100
+        if halluc_no_cov > 0 else 0
+    )
+    print(f"\n  Hallucination reduction: {reduction:.0f}% "
+          f"({halluc_no_cov} -> {halluc_with_cov})")
+
+    passed_c = halluc_with_cov <= halluc_no_cov  # not worse
+    if passed_c:
+        score += 1
+    print(f"  Result: {'PASS' if passed_c else 'FAIL'}")
+
+    # ═══════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print(f"  MISSING TESTS SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Test A - Citation Usage:      {'PASS' if passed_a else 'FAIL'} "
+          f"(markers: {cite_annotated})")
+    print(f"  Test B - Budget Scaling:      {'PASS' if passed_b else 'FAIL'} "
+          f"(diff: {ratio:.1f}x)")
+    print(f"  Test C - Hallucination ↓:     {'PASS' if passed_c else 'FAIL'} "
+          f"(reduction: {reduction:.0f}%)")
+    print(f"\n  Score: {score}/{total}")
+    print(f"  {'='*60}")
+    print(f"  Done.")
+
+if __name__ == "__main__":
+    asyncio.run(run())

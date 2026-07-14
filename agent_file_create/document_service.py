@@ -254,28 +254,6 @@ def generate_document(
 
 
 
-def _run_faithfulness_checks(
-    *,
-    content: str,
-    analysis_results: list,
-    task_id: str,
-    output_dir: str,
-) -> str:
-    """Run faithfulness check and hallucination-triggered re-retrieval on content.
-
-    Delegates to QualityPipeline for structured, decomposable execution.
-    """
-    from agent_file_create.quality import QualityPipeline, QualityContext
-
-    ctx = QualityContext(
-        content=content,
-        analysis_results=analysis_results or [],
-        task_id=str(task_id),
-        output_dir=str(output_dir),
-    )
-    result = QualityPipeline().run(ctx)
-    return str(result.content or "")
-
 
 def render_document(
     *,

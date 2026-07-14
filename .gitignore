@@ -38,3 +38,31 @@ datasets/
 external_data/
 source/
 .env
+
+# Personal config
+.claude/settings.local.json
+
+# Documentation (local only)
+docs/
+
+# Temp / one-off scripts
+_parse_resume.py
+_resume_all.txt
+_resume_parsed.txt
+download_qwen2.5vl.py
+
+# Test files
+test.pdf
+test_doc/
+
+# Temp outputs
+ttocx/
+
+# Model files (large binary weights)
+model_files/
+
+# Generated reports
+reports/
+
+# Optimization notes
+optimize/

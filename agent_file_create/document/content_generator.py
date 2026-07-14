@@ -338,19 +338,24 @@ SECTION_SYSTEM_PROMPT = (
     "\n"
     "核心规则：\n"
     "1) 用全新语言重构核心观点，严禁直接复制粘贴材料中的长句。\n"
-    "2) 用因果、递进、转折等连接词建立段落间关系。主章节(H2)开篇承接前文、结尾过渡到下一节。子节(H3)直接切入。去重：前文已详述的论点只做一句话回顾。\n"
+    "2) 段落间用自然的因果、递进关系串联。避免每段都以「承接前文」开头（最多1-2次）。\n"
     "3) 优先引用定量内容（具体数值、超参数、指标），避免空洞定性描述。\n"
-    "4) 降低幻觉：不编造数字、机构名、人名、年份。材料中明确出现的数值可引用并标注具体来源。不确定就说「相关数据暂缺」。\n"
-    "5) 溯源简称：每个【n】编号从对应文件名取简短关键词作简称。不同编号必须有不同的简称。\n"
-    "6) 每个关键论断标注【n】（据XX），编号和口头引用一一对应。\n"
-    "7) 时效优先：优先采信年份较新的来源。引用3年以上文献需注明年份。\n"
-    "8) 标注格式：同一编号全文使用完全相同的口头引用文本。\n"
-    "9) 同一段落每个【n】编号最多出现1次，段落结尾统一标注。\n"
-    "10) 每章至少使用2种不同编号。通篇只用【1】判定为不合格。\n"
-    "11) 完成后数一数【n】种类，不到2种则重写。\n"
-    "12) 讨论方法局限时直接说明。首次英文缩写必须给全称。\n"
+    "4) 降低幻觉：不编造数字、机构名、人名、年份。不确定的内容可以说「该维度在现有材料中尚未充分覆盖」。\n"
+    "5) 引用格式硬性要求：每个关键论断后标注【n】即可（如「准确率达95.3%【1】」），**不需要**添加（据XX）口头引用。参考文献在文末统一列出。\n"
+    "6) **绝对禁止**使用半角[n]或裸写「据XX」不带编号。\n"
+    "7) 同一段落每个【n】最多出现1次。**硬性要求**：每章至少使用2种不同编号。材料充足的章节应争取使用3种以上。不要为了凑编号而编造不存在的内容——如果某来源确实没有相关材料，宁可少引也绝不虚构。\n"
+    "8) 材料不足时自然表述：如果某方面缺乏素材，用「该维度在现有材料中尚未充分覆盖，有待后续补充」自然地融入正文。\n"
+    "9) 讨论方法局限时直接说明。首次英文缩写必须给全称。\n"
+    "10) 引用来源具体化：从材料文件名提取关键词确定【n】对应哪个文献，确保每个【n】指向明确的不同来源。\n"
+    "11) **防编造硬性要求**：只写来源材料中实际存在的事实、数据、方法。不要提出来源材料中未提及的\"改进方向\"\"优化路径\"\"未来机制\"。如果某方面缺乏素材，直接说「该维度在现有材料中未涉及」，不要自行补充。\n"
+    "12) **禁止在正文中嵌入参考文献列表**：参考文献统一放在文末的「## 参考文献」章节。不要在正文段落中罗列「【1】文献A 【2】文献B」等条目。\n"
     "\n"
-    "内容处理：表格数据用小段落描述趋势不逐行罗列。多方案对比用「相比之下」等短语。数据不足时说明「材料中暂缺该维度数据」不编造。"
+    "内容处理：表格数据用小段落描述趋势不逐行罗列。多方案对比用「相比之下」等短语。\n"
+    "\n"
+    "**写作风格硬性要求**：\n"
+    "- 这是一份**成果报告**，不是研究计划。多写材料中已有的事实、数据、结论。\n"
+    "- **禁止**使用「未来方向」「可验证」「未来可」「后续可探索」「后续可」等措辞。如果要提改进空间，用「当前方法在XX方面存在不足」一笔带过（不超过1句话），不要展开讨论。\n"
+    "- 每段的主题句应该是一个**事实陈述**或**实验结论**，不是推测或计划。"
 )
 
 
@@ -359,7 +364,7 @@ def _build_system_prompt_for_section(section_type: str) -> str:
     hints = {
         "data": "【数据型章节】必须逐条引用来源数据，不可笼统概括。每个数据点标注出处。数据不足只写已有数据，禁止推测。",
         "experiment_setup": "【实验设定型章节】准确描述实验配置和参数。数据集描述含规模、来源、划分。必须列出至少2个对比基线。评估指标必须具体。",
-        "analysis": "【分析型章节】可在材料事实基础上做合理推理延伸但标注「（分析推测）」。鼓励多材料综合对比。可提出推理观点但不可与材料事实矛盾。",
+        "analysis": "【分析型章节】可在材料事实基础上做合理推理延伸。鼓励多材料综合对比。不可与材料事实矛盾。",
     }
     base = SECTION_SYSTEM_PROMPT
     hint = hints.get(section_type, "")
@@ -397,7 +402,7 @@ def _build_section_prompt(
     if next_title:
         parts.append(f"下一章节：{next_title}（本节结尾请做好内容铺垫）")
     else:
-        parts.append("⚠️ 这是本文最后一章（总结/展望/结论）。请提出 2-3 个具体的、可验证的未来研究方向或改进建议，不要停留在「需要进一步研究」的笼统陈述。")
+        parts.append("⚠️ 这是本文最后一章（总结/展望/结论）。请基于前文分析提出 2-3 条具体的改进建议或局限讨论，每条需有事实依据，不要笼统陈述。")
     parts += [
         "",
         "前文摘要（用于保持连贯）：",
@@ -447,7 +452,7 @@ def _build_section_prompt(
             parts.append("")
 
     parts += [
-        f"写作要求：本节严格控制在 {lo}~{hi} 字以内。超出字数限制的内容会被截断。",
+        f"写作要求：本节需撰写 {lo}~{hi} 字。不足 {lo} 字则内容不够充实，超过 {hi} 字则会被截断。请确保达到最低字数要求。",
         "只输出本节正文，不要输出标题行。不要输出「本节」「本章」等元描述文字。",
         "",
         "正文：",
@@ -508,16 +513,24 @@ def _check_citation_compliance(text: str) -> list[str]:
     3. Each 【n】 has a corresponding verbal reference (据XX / 来源XX)
     4. Citation numbers are ≤ 20 (sanity check against hallucination)
     """
-    if not text or "【" not in text:
-        return ["缺少引用标注【n】：正文未使用任何引用标记"]
+    # Accept both full-width 【n】 and half-width [n] as "has citations"
+    _has_full = "【" in text
+    _has_half = bool(re.search(r"\[\d+\]", text))
+    if not text or (not _has_full and not _has_half):
+        return ["缺少引用标注：正文未使用任何引用标记【n】"]
 
     issues: list[str] = []
 
     # 1. Count unique citation numbers
     markers = re.findall(r"【(\d+)】", text)
     unique_nums = set(int(m) for m in markers)
-    if len(unique_nums) < 2:
-        issues.append(f"引用来源过少：仅使用 {len(unique_nums)} 种引用编号（需≥2）")
+    if len(unique_nums) == 0:
+        issues.append("缺少引用标注【n】：正文未使用任何引用标记")
+    elif len(unique_nums) < 2:
+        issues.append(
+            f"引用来源过少：仅使用{len(unique_nums)}种引用编号，每章必须至少使用2种。"
+            f"可以从不同角度引用同一材料（如【1】引用方法、【2】引用数据）。"
+        )
 
     # 2. Check for duplicate 【n】 in same paragraph
     paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
@@ -526,18 +539,44 @@ def _check_citation_compliance(text: str) -> list[str]:
         if len(para_markers) > len(set(para_markers)):
             issues.append(f"同段重复引用：第{i+1}段中同一编号出现多次")
 
-    # 3. Check that 【n】 has verbal reference nearby
-    for m in re.finditer(r"【(\d+)】", text):
-        n = m.group(1)
-        # Check 30 chars after the marker for source text
-        after = text[m.end():m.end() + 40]
-        if not re.search(r"[据参来][^，。；\n]{2,20}", after):
-            issues.append(f"引用【{n}】缺少口头引用说明（如'据XX年报'）")
-            break  # one example is enough
+    # 3. Detect bare oral references without citation numbers
+    _bare_count = 0
+    _bare_example = ""
+    for _bm in re.finditer(r'据[^\s，。；\n]{4,40}', text):
+        _before = text[max(0, _bm.start()-20):_bm.start()]
+        if not re.search(r'【\d+】', _before):
+            _bare_count += 1
+            if not _bare_example:
+                _bare_example = _bm.group()[:30]
+    if _bare_count:
+        issues.append(
+            f"裸引用（缺编号）：发现{_bare_count}处「据XX」未带【n】编号。"
+            f"直接使用【n】标注即可，不需要括注。示例：{_bare_example}"
+        )
 
-    # 4. Sanity check: citation numbers shouldn't be absurdly high
+    # 5. Detect half-width brackets [n] — must use full-width 【n】
+    halfwidth = re.findall(r'(?<![【\[])\[(\d+)\](?![】\]])', text)
+    if halfwidth:
+        issues.append(
+            f"半角括号：发现{len(halfwidth)}处半角[n]，必须全部改为全角【n】"
+        )
+
+    # 6. Sanity check: citation numbers shouldn't be absurdly high
     if unique_nums and max(unique_nums) > 20:
         issues.append(f"引用编号异常：最大编号 {max(unique_nums)} > 20，可能存在幻觉")
+
+    # 7. Style check: banned template phrases
+    _banned_words = [
+        "可验证", "未来可", "未来方向", "未来研究", "未来工作",
+        "后续可", "后续探索", "后续验证", "后续研究", "后续工作",
+    ]
+    for _bw in _banned_words:
+        if _bw in text:
+            issues.append(
+                f"写作风格问题：使用了禁止的措辞「{_bw}」。"
+                f"请改写为事实陈述，直接写出实验数据或结论。"
+            )
+            break
 
     return issues
 
@@ -596,8 +635,19 @@ def generate_section_content(
     section_system = _build_system_prompt_for_section(section_type)
 
     # ── Q4 P0: Citation compliance check + auto-retry ──────────────────────
+    # Limited to 2 total attempts (was 3) — after the first retry with
+    # explicit citation feedback, a second retry rarely improves output
+    # quality and wastes 10-20 s of LLM time.
+    #
+    # H3 sub-sections skip citation checks entirely — they inherit source
+    # context from their parent H2 and rarely have enough content to
+    # satisfy the ≥2-source rule independently.
     citation_feedback = ""
-    for attempt in range(3):
+    # Run style check for ALL sections (banned words, bare refs).
+    # Citation diversity check (≥2 【n】) only applies to H2.
+    max_attempts = 2 if level == 2 else 1
+    _style_check_needed = True  # all sections
+    for attempt in range(max_attempts):
         _check_cancel(task_id)
         if citation_feedback and attempt > 0:
             # Inject citation compliance feedback into the prompt
@@ -626,11 +676,16 @@ def generate_section_content(
         if t1 - t0 >= 8:
             logger.info(f"section_slow title={section_title} seconds={t1 - t0:.2f} prompt_chars={len(prompt)}")
 
-        # Q4 P0: Post-generation citation compliance check
-        if enriched_context and "【" in enriched_context:
+        # Post-generation checks:
+        # - Style check (banned words, bare refs): ALL sections
+        # - Citation diversity (≥2 【n】): H2 sections only
+        if level == 2 or _style_check_needed:
             cite_issues = _check_citation_compliance(text)
+            # H3: only retry on style issues, skip citation diversity requirement
+            if level != 2:
+                cite_issues = [i for i in cite_issues if '来源过少' not in i]
             if cite_issues:
-                if attempt < 2:  # still have retries
+                if attempt < max_attempts - 1:  # still have retries
                     citation_feedback = "引用合规问题（请修正后重新输出）：\n" + "\n".join(
                         f"- {issue}" for issue in cite_issues
                     )
@@ -690,9 +745,9 @@ def generate_full_content(outline: str, multimodal_results: Dict[str, Any], user
     total_sections = sum(1 for item in flat if int(item.get("level") or 0) >= 2)
     _h2n = sum(1 for item in flat if int(item.get("level") or 0) == 2)
     _h3n = sum(1 for item in flat if int(item.get("level") or 0) == 3)
-    _total_w = _h2n * 2 + _h3n
+    _total_w = _h2n * 3 + _h3n
     if target_words and target_words > 0 and _total_w > 0:
-        _h2_budget = max(100, (target_words * 2) // _total_w)
+        _h2_budget = max(150, (target_words * 3) // _total_w)
         _h3_budget = max(80, target_words // _total_w)
     else:
         _h2_budget = _h3_budget = 0
@@ -883,13 +938,13 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
         return ""
 
     total_sections = len(tasks)
-    # Weight H2 (chapter overview) sections 2× vs H3 (detail) so that
-    # the word budget is proportional to each section's structural role.
+    # Weight H2 (chapter) 3× vs H3 (detail) 1× — H2 sections carry the
+    # main narrative and need more words for substantive discussion.
     _h2n = sum(1 for _t in tasks if _t["level"] == 2)
     _h3n = sum(1 for _t in tasks if _t["level"] == 3)
-    _total_w = _h2n * 2 + _h3n
+    _total_w = _h2n * 3 + _h3n
     if target_words and target_words > 0 and _total_w > 0:
-        _h2_budget = max(100, (target_words * 2) // _total_w)
+        _h2_budget = max(150, (target_words * 3) // _total_w)
         _h3_budget = max(80, target_words // _total_w)
     else:
         _h2_budget = _h3_budget = 0
@@ -1025,6 +1080,9 @@ def generate_full_content_parallel(outline: str, multimodal_results: Dict[str, A
                     batch_results[idx] = str(fut.result() or "")
                 except Exception as e:
                     batch_results[idx] = f"（本节生成失败：{str(e)[:120]}）"
+                # Push into outer results dict BEFORE flushing so
+                # _flush_partial can see the new section body
+                results[idx] = batch_results[idx]
                 _check_cancel(task_id)
                 nonlocal done_count
                 done_count += 1

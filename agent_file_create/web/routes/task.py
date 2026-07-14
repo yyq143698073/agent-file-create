@@ -53,7 +53,10 @@ def _run_task(task_id: str, file_paths: list[str], user_prompt: str, *, ab_eval:
     task_manager.write_status(task_id, "processing", stage="extract", message="开始并行解析文件…", extra={"total_files": len(file_paths), "done_files": 0, "ab_eval": bool(ab_eval), "ab_results": [], "saved_templates": st_names})
 
     from agent_file_create.config import MAX_WORKERS_DEFAULT
-    from agent_file_create.document.extractor import extract_from_file
+    from agent_file_create.document.extractor import (
+        deduplicate_extracted_results,
+        extract_from_file,
+    )
     from agent_file_create.preprocessor import compute_quality_metrics
 
     def _extract_one(fp: str) -> tuple[int, dict, dict | None]:
@@ -135,7 +138,7 @@ def _run_task(task_id: str, file_paths: list[str], user_prompt: str, *, ab_eval:
             idx_sorted = sorted(indexed_shared, key=lambda x: x[0])
             ar_list = [ar for _, ar, _ in idx_sorted]
             ab_list = [ab for _, _, ab in idx_sorted if ab is not None]
-        return ar_list, ab_list
+        return deduplicate_extracted_results(ar_list), ab_list
 
     partial_results, ab_results = _get_latest_results()
 

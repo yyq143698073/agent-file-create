@@ -3,6 +3,8 @@ import logging
 import random
 import re
 import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -37,6 +39,13 @@ class ChatHandler:
         self._task_manager = task_manager or TaskManager()
         self._regenerate_fn = regenerate_fn  # callable(task_id, mode) -> (bool, str)
 
+        # ── History memory cache ───────────────────────────────────────
+        # Each RunnableWithMessageHistory chain calls get_session_history()
+        # before every invocation, which creates a new TaskChatMessageHistory
+        # that reads the full history from file.  Caching avoids that I/O.
+        self._history_cache: OrderedDict[str, TaskChatMessageHistory] = OrderedDict()
+        self._history_cache_max: int = 64
+
         # Chat LLM — higher token budget for substantive replies
         self._chat_llm = get_chat_model(
             style=CONTENT_API_STYLE,
@@ -61,21 +70,30 @@ class ChatHandler:
         _lobby_chain = lobby_prompt | self._chat_llm | StrOutputParser()
         _task_chain = task_chat_prompt | self._chat_llm | StrOutputParser()
 
-        def _get_session_history(session_id: str):
-            return TaskChatMessageHistory(session_id, self._task_manager)
-
         self._lobby_chain_with_history = RunnableWithMessageHistory(
             _lobby_chain,
-            get_session_history=_get_session_history,
+            get_session_history=self._get_session_history,
             input_messages_key="user_input",
             history_messages_key="history",
         )
         self._task_chain_with_history = RunnableWithMessageHistory(
             _task_chain,
-            get_session_history=_get_session_history,
+            get_session_history=self._get_session_history,
             input_messages_key="user_input",
             history_messages_key="history",
         )
+
+    def _get_session_history(self, session_id: str) -> TaskChatMessageHistory:
+        """Return cached TaskChatMessageHistory, or create and cache a new one."""
+        if session_id in self._history_cache:
+            self._history_cache.move_to_end(session_id)
+            return self._history_cache[session_id]
+
+        history = TaskChatMessageHistory(session_id, self._task_manager)
+        self._history_cache[session_id] = history
+        while len(self._history_cache) > self._history_cache_max:
+            self._history_cache.popitem(last=False)
+        return history
 
     # ── helpers ─────────────────────────────────────────────────────────
 
@@ -250,51 +268,167 @@ class ChatHandler:
         if len(m) < 10:
             return None
 
-        help_cmds = self._help_text()
         return (
             f"好的！我注意到你想要生成一份报告。按以下步骤开始：\n\n"
             f"**1️⃣ 上传材料**\n"
             f"将相关文件拖拽到左侧上传区域，或点击「选择文件」按钮。\n\n"
             f"**2️⃣（可选）选择模板**\n"
             f"在左侧上传区选择模板文件，或从已保存模板中挑选。\n\n"
-            f"**3️⃣ 发送生成命令**\n"
-            f"材料准备好后，发送：\n"
-            f"`/gen {m[:120]}`\n\n"
+            f"**3️⃣ 直接说出你的需求**\n"
+            f"材料准备好后，直接在对话框里输入：\n"
+            f"`请根据这些材料，{m[:120]}`\n\n"
             f"**💡 也可以先搜知识库**\n"
-            f"如果左侧有知识库，发送 `/kb use <知识库名>` 选择知识库，\n"
-            f"然后 `/kb ask <你的问题>` 查找相关资料。\n\n"
-            f"---\n"
-            f"其他可用指令：\n{help_cmds}"
+            f"如果你已经在顶部选择了知识库，也可以直接提问，我会先结合知识库内容回答。\n\n"
+            f"如果你习惯命令方式，斜杠指令也还可以继续使用。"
         )
 
     def _help_text(self) -> str:
         return "\n".join(
             [
-                "可用指令（在聊天框输入）：",
-                "- /help：查看指令",
-                "- /status：查看当前任务状态",
-                "- /pause：暂停当前任务",
-                "- /resume：继续当前任务",
-                "- /cancel：取消当前任务",
-                "- /regen [doc|all|<章节标题>]：重新生成（doc=重跑文档阶段；all=从抽取开始；章节标题=只重新生成该章节及其子节）",
-                "- /prompt <文本>：更新需求（不自动重跑）",
-                "- /prompt! <文本>：更新需求并立即 /regen doc",
-                "- /template [task|default]：切换模板来源（task=使用本任务模板；default=使用全局默认模板）",
-                "- /files：查看已上传文件",
-                "- /templates：查看可用模板",
-                "- /append：提示如何追加文件/模板到当前任务",
-                "- /kb ask <问题>：在知识库中检索并回答",
-                "- /kb list：列出知识库",
-                "- /kb docs [kb]：查看知识库中已上传的文件",
-                "- /kb use <kb>：选择知识库用于问答",
-                "- /kb clear：取消知识库选择",
-                "- /kb stats [kb]：查看知识库统计（文档数、chunk数）",
-                "- /kb delete <kb> [doc_id]：删除知识库（指定 doc_id 则只删除该文档）",
+                "不用记命令，直接跟我说你想做什么就行 👇",
                 "",
-                "结构化协议（前端/调用方可直接传 action）：",
-                '{"task_id":"<id>", "message":"可选", "action":{"type":"pause|resume|cancel|status|help|regenerate|set_prompt|set_template_mode|list_files|list_templates|kb_list|kb_use|kb_clear|kb_stats|kb_delete"}}',
+                "**📝 生成报告**",
+                "上传材料后直接说：「帮我写一份技术方案」「根据材料生成市场分析」",
+                "",
+                "**🔍 搜知识库**",
+                "「在知识库里查一下 RAG 是什么」「切换到产品知识库」",
+                "",
+                "**✏️ 修改报告**",
+                "「这段太长了精简一下」「加点数据」「换个风格重写」",
+                "",
+                "**📊 查看和管理**",
+                "「看看进度」「暂停一下」「继续生成」「取消任务」",
+                "",
+                "**🔄 重新生成**",
+                "「按这个要求重新生成」「重新写第三章」",
+                "",
+                "💡 如果上面没有你想做的，直接描述就行，我会尽力理解。",
             ]
         ).strip()
+
+    @staticmethod
+    def _matches_any(message: str, patterns: list[str]) -> bool:
+        text = str(message or "").strip()
+        if not text:
+            return False
+        return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+    @staticmethod
+    def _clean_kb_candidate(name: str) -> str:
+        kb = str(name or "").strip().strip("`'\"“”‘’「」")
+        kb = kb.strip("：:，,。！？；;（）()[]【】 ")
+        kb = re.sub(r"^(?:到|为|成|一下|一下子|那个|这个|当前|现在)+", "", kb).strip()
+        kb = re.sub(r"(?:里面?|里|中|一下|一下子)+$", "", kb).strip()
+        if kb == "默认":
+            return "default"
+        return kb
+
+    def _list_known_kbs(self) -> list[str]:
+        try:
+            return [str(x).strip() for x in get_kb().list_kb() if str(x).strip()]
+        except Exception:
+            return []
+
+    def _match_known_kb_name(self, message: str) -> str:
+        text = str(message or "").strip().lower()
+        if not text:
+            return ""
+        known = sorted(self._list_known_kbs(), key=len, reverse=True)
+        for kb in known:
+            kbl = kb.lower()
+            if kbl and kbl in text:
+                return kb
+            if kbl and (kbl + "知识库") in text:
+                return kb
+            if kbl and (kbl + "资料库") in text:
+                return kb
+        return ""
+
+    def _extract_kb_name_from_text(self, message: str) -> str:
+        known = self._match_known_kb_name(message)
+        if known:
+            return known
+        patterns = [
+            r"(?:切换到|切到|使用|启用|选择|改用|新建|创建|新增|删除|移除|查看|看看|列出|统计|关于)\s*[“\"「]?([^，。；！？\n]{1,40}?)[”\"」]?(?:知识库|资料库)",
+            r"(?:在|从|用)\s*[“\"「]?([^，。；！？\n]{1,40}?)[”\"」]?(?:知识库|资料库)(?:里|中)?",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, str(message or ""), re.IGNORECASE)
+            if not m:
+                continue
+            kb = self._clean_kb_candidate(m.group(1))
+            if kb and kb not in {"知识", "资料"}:
+                return kb
+        return ""
+
+    def _resolve_kb_for_action(self, task_id: str, requested_kb: str = "") -> str:
+        kb = self._clean_kb_candidate(requested_kb)
+        if kb:
+            resolved = self._match_known_kb_name(kb) or kb
+            return resolved
+        meta = self._task_manager.read_task_meta(task_id)
+        active_kb = self._clean_kb_candidate(str(meta.get("active_kb") or ""))
+        if active_kb:
+            return self._match_known_kb_name(active_kb) or active_kb
+        known = self._list_known_kbs()
+        return known[0] if known else ""
+
+    def _extract_kb_question_from_text(self, message: str) -> str:
+        text = str(message or "").strip()
+        patterns = [
+            r"(?:在|从|用)\s*[“\"「]?[^，。；！？\n]{0,40}?[”\"」]?(?:知识库|资料库)(?:里|中)?(?:帮我)?(?:查一下|查|搜索|检索|搜一下|帮我查|帮我找|回答|说明|解释)\s*(.+)$",
+            r"(?:根据|基于)\s*[“\"「]?[^，。；！？\n]{0,40}?[”\"」]?(?:知识库|资料库).*(?:回答|说明|解释)\s*(.+)$",
+            r"(?:在)?(?:知识库|资料库)(?:里|中)?(?:帮我)?(?:查一下|查|搜索|检索|搜一下|帮我查|帮我找|回答|说明|解释)\s*(.+)$",
+            r"(?:在|从|用).*(?:知识库|资料库)(?:里|中)?\s*[：:]\s*(.+)$",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                return str(m.group(1) or "").strip(" ：:，,。！？；;")
+        return ""
+
+    def _parse_natural_kb_action(self, message: str) -> Optional[dict]:
+        m = str(message or "").strip()
+        if not m:
+            return None
+        kb_name = self._extract_kb_name_from_text(m)
+
+        if self._matches_any(m, [r"(?:列出|看看|查看).*(?:所有)?知识库", r"有哪些知识库", r"知识库列表"]):
+            return {"type": "kb_list"}
+        if self._matches_any(m, [r"(?:新建|创建|新增).*(?:知识库|资料库)"]):
+            return {"type": "kb_create", "kb": kb_name}
+        if self._matches_any(m, [r"(?:不用|不使用|关闭|取消|清除|别用).*(?:知识库|资料库)", r"不要查知识库"]):
+            return {"type": "kb_clear"}
+        if self._matches_any(m, [r"(?:删除|移除).*(?:知识库|资料库)"]):
+            return {"type": "kb_delete", "kb": kb_name}
+        if self._matches_any(m, [r"(?:知识库|资料库).*(?:有哪些(?:文档|资料|文件)|文档列表|资料列表|文件列表)", r"(?:列出|查看|看看).*(?:知识库|资料库).*(?:文档|资料|文件)"]):
+            return {"type": "kb_docs", "kb": kb_name}
+        if self._matches_any(m, [r"(?:知识库|资料库).*(?:统计|文档数|chunk数|规模|情况)"]):
+            return {"type": "kb_stats", "kb": kb_name}
+
+        question = self._extract_kb_question_from_text(m)
+        if question:
+            action: dict[str, str] = {"type": "kb_ask", "question": question}
+            if kb_name:
+                action["kb"] = kb_name
+            return action
+
+        if self._matches_any(m, [r"(?:切换到|切到|使用|启用|选择|改用).{0,30}(?:知识库|资料库)"]):
+            return {"type": "kb_use", "kb": kb_name}
+        return None
+
+    def _extract_regenerate_scope_from_text(self, message: str) -> dict:
+        m = str(message or "").strip()
+        if re.search(r"(?:全部|整份|全文|从头|完全重新)", m, re.IGNORECASE):
+            return {"type": "regenerate", "scope": "all"}
+        sec = re.search(
+            r"(?:把|将)?((?:第[一二三四五六七八九十0-9]+章)|(?:第[一二三四五六七八九十0-9]+节)|(?:[^，。；！？\s]{2,20}章节)|(?:[^，。；！？\s]{2,20}部分))(?:重新生成|重写|重做|再生成)",
+            m,
+            re.IGNORECASE,
+        )
+        if sec:
+            return {"type": "regenerate", "scope": "section", "section": sec.group(1).strip()}
+        return {"type": "regenerate", "scope": "doc"}
 
     def _parse_chat_action(self, message: str, body_action: Any) -> Optional[dict]:
         if isinstance(body_action, dict) and body_action.get("type"):
@@ -349,6 +483,11 @@ class ChatHandler:
                 return {"type": "append"}
             if cmd in {"kb"}:
                 sub = (parts[1].strip().lower() if len(parts) >= 2 else "")
+                if sub in {"create", "new"}:
+                    name = (parts[2].strip() if len(parts) >= 3 else "").strip()
+                    if not name:
+                        return {"type": "help"}
+                    return {"type": "kb_create", "kb": name}
                 if sub in {"list", "ls"}:
                     return {"type": "kb_list"}
                 if sub in {"use"}:
@@ -377,6 +516,27 @@ class ChatHandler:
                     return {"type": "kb_delete", "kb": name, "doc_id": doc_id}
                 return {"type": "help"}
             return {"type": "help"}
+        kb_action = self._parse_natural_kb_action(m)
+        if kb_action:
+            return kb_action
+        if self._matches_any(m, [r"帮助", r"怎么用", r"如何使用", r"你能做什么", r"有哪些功能"]):
+            return {"type": "help"}
+        if self._matches_any(m, [r"查看.*(?:状态|进度)", r"当前.*(?:状态|进度)", r"任务.*(?:状态|进度)", r"进行到哪", r"完成了?吗"]):
+            return {"type": "status"}
+        if self._matches_any(m, [r"暂停", r"先停一下", r"先别继续", r"等一下再"]):
+            return {"type": "pause"}
+        if self._matches_any(m, [r"继续(?:生成|写|执行)?", r"恢复(?:生成|写|执行)?", r"接着(?:生成|写|执行)?"]):
+            return {"type": "resume"}
+        if self._matches_any(m, [r"取消(?:任务|生成)?", r"停止(?:任务|生成)?", r"终止(?:任务|生成)?", r"不用生成了", r"先别生成了"]):
+            return {"type": "cancel"}
+        if self._matches_any(m, [r"重新生成", r"重新来", r"再生成", r"重做", r"从头生成", r"重写一版"]):
+            return self._extract_regenerate_scope_from_text(m)
+        if self._matches_any(m, [r"查看.*(?:文件|材料)", r"上传了哪些(?:文件|材料)", r"现在有哪些(?:文件|材料)"]):
+            return {"type": "list_files"}
+        if self._matches_any(m, [r"查看.*模板", r"有哪些模板", r"模板列表"]):
+            return {"type": "list_templates"}
+        if self._matches_any(m, [r"怎么追加", r"追加.*(?:文件|材料|模板)", r"继续上传"]):
+            return {"type": "append"}
         if low in {"暂停", "pause"}:
             return {"type": "pause"}
         if low in {"继续", "恢复", "resume"}:
@@ -421,15 +581,28 @@ class ChatHandler:
         if typ in {"status"}:
             return self._format_status(task_id)
 
+        if typ == "kb_create":
+            kb = self._clean_kb_candidate(str(action.get("kb") or ""))
+            if not kb:
+                return "请告诉我知识库名称，例如：“新建一个产品知识库”。"
+            try:
+                get_kb().register_kb(kb)
+                self._task_manager.write_task_meta(task_id, {"active_kb": kb})
+                return f"已创建知识库 {kb}，并切换为当前对话使用的知识库。你现在可以继续说“把文件传到这个知识库”或“在这个知识库里查一下 …”。"
+            except Exception as e:
+                return f"创建知识库失败：{str(e)[:180]}"
         if typ == "kb_list":
             items = get_kb().list_kb()
             if not items:
-                return "暂无知识库。可调用 /api/kb/upload 上传文件入库。"
+                return "暂无知识库。你可以在左侧 KB 面板上传文件，或者直接说“新建一个知识库”。"
             return "知识库列表：\n" + "\n".join(["- " + str(x) for x in items[:50]])
         if typ == "kb_use":
-            kb = str(action.get("kb") or "").strip()
+            kb = self._resolve_kb_for_action(task_id, str(action.get("kb") or ""))
             if not kb:
-                return "用法：/kb use <kb>"
+                known = self._list_known_kbs()
+                if known:
+                    return "请告诉我要切换到哪个知识库，例如：“切换到产品知识库”。"
+                return "当前还没有可用知识库。你可以先说“新建一个知识库”，或在左侧上传文件入库。"
             self._task_manager.write_task_meta(task_id, {"active_kb": kb})
             return f"好，后面聊到相关问题时我会先去 {kb} 知识库里查一下。"
         if typ == "kb_clear":
@@ -438,13 +611,12 @@ class ChatHandler:
         if typ == "kb_ask":
             question = str(action.get("question") or "").strip()
             if not question:
-                return "用法：/kb ask <你的问题>"
-            return self._handle_kb_ask(task_id, question)
+                return "请直接告诉我你想查什么，例如：“在产品知识库里查一下 RAG 是什么”。"
+            return self._handle_kb_ask(task_id, question, kb_name=str(action.get("kb") or "").strip())
         if typ == "kb_docs":
-            kb = str(action.get("kb") or "").strip()
-            meta = self._task_manager.read_task_meta(task_id)
+            kb = self._resolve_kb_for_action(task_id, str(action.get("kb") or ""))
             if not kb:
-                kb = str(meta.get("active_kb") or "").strip() or "default"
+                return "当前没有可查看的知识库。你可以先说“列出知识库”或“新建一个知识库”。"
             try:
                 docs = get_kb().list_docs(kb=kb)
                 if not docs:
@@ -461,17 +633,19 @@ class ChatHandler:
             except Exception as e:
                 return f"获取文件列表失败：{str(e)[:180]}"
         if typ == "kb_stats":
-            kb = str(action.get("kb") or "").strip() or "default"
+            kb = self._resolve_kb_for_action(task_id, str(action.get("kb") or ""))
+            if not kb:
+                return "当前没有可统计的知识库。你可以先说“列出知识库”或“新建一个知识库”。"
             try:
                 st = get_kb().kb_stats(kb=kb)
                 return f"知识库 {kb}：文档数={st.get('doc_count',0)} chunk数={st.get('chunk_count',0)}"
             except Exception as e:
                 return f"获取统计失败：{str(e)[:180]}"
         if typ == "kb_delete":
-            kb = str(action.get("kb") or "").strip()
+            kb = self._resolve_kb_for_action(task_id, str(action.get("kb") or ""))
             doc_id = str(action.get("doc_id") or "").strip()
             if not kb:
-                return "用法：/kb delete <kb> [doc_id]"
+                return "请告诉我要删除哪个知识库，例如：“删除产品知识库”。"
             try:
                 if doc_id:
                     r = get_kb().delete_doc(kb=kb, doc_id=doc_id)
@@ -487,7 +661,7 @@ class ChatHandler:
                 return f"删除失败：{str(e)[:180]}"
 
         if task_id == "lobby":
-            return "当前未选择 task_id。可先上传材料生成任务，或输入 task_id 加载后再执行控制指令。"
+            return "当前还没有任务。你可以先上传材料，然后直接告诉我你想生成什么内容。"
 
         st = self._task_manager.read_status(task_id)
         stage = str(st.get("stage") or "").strip()
@@ -496,7 +670,7 @@ class ChatHandler:
             self._task_manager.pause_task(task_id)
             self._task_manager.write_status(
                 task_id, "paused", stage=stage or "pause",
-                message="已暂停（发送 /resume 继续，/cancel 取消）", extra={}
+                message="已暂停（直接回复继续可恢复，回复取消可终止）", extra={}
             )
             return "先停一下，等你准备好了跟我说一声就行。"
         if typ == "resume":
@@ -524,7 +698,7 @@ class ChatHandler:
         if typ == "list_templates":
             tps = self._task_manager.list_task_templates(task_id)
             if not tps:
-                return "当前任务没有模板文件。你可以在上传时附带模板，或使用 /template default 使用全局默认模板。"
+                return "当前任务没有模板文件。你可以在上传时附带模板，或者直接告诉我改用默认模板。"
             names = [Path(x).name for x in tps[:30]]
             tail = "…" if len(tps) > 30 else ""
             return "可用模板：\n" + "\n".join(["- " + x for x in names]) + tail
@@ -537,13 +711,13 @@ class ChatHandler:
         if typ == "set_prompt":
             p = str(action.get("prompt") or "").strip()
             if not p:
-                return "prompt 不能为空。示例：/prompt 请生成一份面向管理层的报告"
+                return "需求不能为空。你可以直接说：请生成一份面向管理层的报告。"
             self._task_manager.write_task_meta(task_id, {"user_prompt": p})
             if bool(action.get("regen")):
                 fps = self._resolve_task_files(task_id)
                 tpl_override, tps = self._resolve_template_override(task_id)
                 return "好的，需求已更新，正在重新生成。"
-            return "好的，需求已更新。想重跑的话发 /regen doc 就行。"
+            return "好的，需求已更新。你可以继续补充意见，或者直接说“按这个要求重新生成”。"
         if typ == "append":
             return "\n".join(
                 [
@@ -581,7 +755,9 @@ class ChatHandler:
 
     def validate_clarify_answer(self, message: str, questions: list[str]) -> tuple[bool, str]:
         """Check if the user's reply is relevant to clarification questions.
-        Returns (is_valid, warning_message). Warning is empty if valid."""
+
+        Returns (is_valid, warning_message). Warning is empty if valid.
+        """
         m = (message or "").strip()
         if not m:
             return False, "请提供具体的补充信息后再提交，或回复「跳过」使用默认设置继续生成。"
@@ -590,19 +766,33 @@ class ChatHandler:
         if len(m) >= 15:
             return True, ""
 
-        # Extract keywords from questions
-        q_chars = set()
-        for q in (questions or [])[:4]:
-            for ch in q:
-                if ch.isalpha() or '一' <= ch <= '鿿':
-                    q_chars.add(ch)
+        # For short answers, do a quick relevance check:
+        # Does the answer share at least 2 Chinese characters with any question?
+        if questions:
+            try:
+                import jieba
+                answer_words = set(jieba.lcut(m))
+                for q in questions[:4]:
+                    q_words = set(jieba.lcut(q))
+                    overlap = answer_words & q_words
+                    if len(overlap) >= 2:
+                        return True, ""
+            except ImportError:
+                pass
+            # Fallback: character-level overlap
+            m_chars = set(m)
+            for q in questions[:4]:
+                q_chars = set(q)
+                overlap = m_chars & q_chars
+                if len(overlap) >= 3:
+                    return True, ""
 
-        # Heuristic: if very short answer shares keywords with questions, accept
-        overlap = sum(1 for ch in m if ch in q_chars)
-        if overlap >= 3:
-            return True, ""
-
-        return True, ""
+        # Short answer with no detectable relevance — warn but still accept
+        # (don't block the user, just let them know)
+        return True, (
+            "收到。不过你的回复比较简短，可能与问题不太相关。"
+            "如果搞错了，请重新描述你的需求；如果没问题，我会继续处理。"
+        )
 
     # ── Clarify phase (moved from web layer into handler) ─────────────────
 
@@ -852,18 +1042,18 @@ class ChatHandler:
         chat that doesn't warrant a full LLM invocation. Otherwise None."""
         m = (message or "").strip()
         if not m:
-            return "请输入消息。你可以提问、发送指令，或输入 /help 查看可用命令。"
+            return "请输入消息。你可以直接说你的问题、修改意见，或者生成需求。"
 
         low = m.lower()
 
         # ── Single-char / meaningless input ──────────────────────────
         if len(m) <= 2 and low not in {"hi", "ok", "好", "行", "是", "对", "嗯", "有", "no", "go", "嗯嗯"}:
-            return "请直接说出你的问题或需求，我会尽力帮你。\n\n💡 试试：/help 查看所有指令，或直接输入你想了解的内容。"
+            return "请直接说出你的问题或需求，我会尽力帮你。\n\n💡 例如：生成报告、查看进度、继续执行、补充修改意见。"
 
         # ── Interjections / testing noise ─────────────────────────────
         if low in {"喂", "喂喂", "有人吗", "在吗在吗", "test", "测试", "testing",
                    "？？", "？？？", "?", "??", "???", "。。。", "…"}:
-            return "你好！有什么可以帮你的？你可以上传材料生成报告，或者直接在对话框中提问。\n\n💡 输入 /help 查看所有可用指令。"
+            return "你好！有什么可以帮你的？你可以上传材料后直接说生成需求，也可以继续追问、修改或查看进度。"
 
         # ── Greetings (random variant) — checked BEFORE length filter ──
         if low in cls._GREETINGS:
@@ -879,12 +1069,21 @@ class ChatHandler:
 
     @classmethod
     def _detect_modification_intent(cls, message: str) -> bool:
-        """Check if the message expresses intent to modify the report."""
+        """Check if the message expresses intent to modify the report.
+
+        The length cap is removed — a long detailed feedback like
+        "第三章关于供应链的部分写得太笼统了，需要补充..." is a
+        legitimate modification request.
+        """
         m = (message or "").strip()
-        if not m or len(m) > 120:
+        if not m or m.startswith("/"):
             return False
-        if m.startswith("/"):
-            return False
+        # For very long messages (>200 chars), only match if strong
+        # modification keywords appear in the first 150 chars — this
+        # avoids classifying a long narrative as a modification request.
+        if len(m) > 200:
+            head = m[:150]
+            return any(kw in head for kw in cls._MODIFICATION_KEYWORDS)
         return any(kw in m for kw in cls._MODIFICATION_KEYWORDS)
 
     # ── Context builder (shared by chat_reply and chat_reply_stream) ─────
@@ -974,7 +1173,7 @@ class ChatHandler:
 
         if status == "paused":
             return (
-                f"当前任务已暂停（task_id={task_id}）。发送 /resume 继续，/cancel 取消，/status 查看状态。",
+                f"当前任务已暂停（task_id={task_id}）。直接回复“继续”就能恢复，回复“取消”会终止当前任务。",
                 {},
             )
 
@@ -1163,10 +1362,10 @@ class ChatHandler:
             append_msg = (message or "").strip()
             # Avoid duplicate appends
             if append_msg in old_prompt:
-                return "\n\n---\n💡 你的需求中已包含类似要求，可发送 /regen doc 按最新需求重新生成。"
+                return "\n\n---\n💡 你的需求中已包含类似要求。你可以直接说“按这个要求重新生成”。"
             new_prompt = (old_prompt + "\n" + append_msg).strip()
             self._task_manager.write_task_meta(task_id, {"user_prompt": new_prompt})
-            return "\n\n---\n💡 已根据你的反馈更新生成需求。发送 /regen doc 即可按新要求重新生成报告。"
+            return "\n\n---\n💡 已根据你的反馈更新生成需求。你可以继续补充，也可以直接说“请按这个要求重新生成”。"
         except Exception:
             return ""
 
@@ -1216,7 +1415,7 @@ class ChatHandler:
             return self._handle_modification_quick(task_id, m)
 
         # ── Route: CONTROL_TASK (slash commands) ──────────────────────
-        if intent == ChatIntent.CONTROL_TASK and m.startswith("/"):
+        if intent == ChatIntent.CONTROL_TASK:
             act = self._parse_chat_action(m, None)
             if act:
                 return self._handle_chat_action(task_id, act)
@@ -1271,17 +1470,17 @@ class ChatHandler:
             meta = self._task_manager.read_task_meta(task_id)
             old_prompt = str(meta.get("user_prompt") or "").strip()
             if m in old_prompt:
-                return "💡 你的需求中已包含类似要求，可发送 /regen doc 按最新需求重新生成。"
+                return "💡 你的需求中已包含类似要求。你可以直接说“按这个要求重新生成”。"
             new_prompt = (old_prompt + "\n" + m).strip()
             self._task_manager.write_task_meta(task_id, {"user_prompt": new_prompt})
             logger.info("modify_intent task=%s msg_len=%d prompt_len=%d",
                         task_id, len(m), len(new_prompt))
-            return "💡 已根据你的反馈更新生成需求。发送 /regen doc 即可按新要求重新生成报告。"
+            return "💡 已根据你的反馈更新生成需求。你可以直接说“按这个要求重新生成”，我就会继续处理。"
         except Exception as e:
             logger.warning("modify_intent_failed task=%s err=%s", task_id, e)
             return "未能更新需求，请稍后重试。"
 
-    def _handle_kb_ask(self, task_id: str, question: str) -> str:
+    def _handle_kb_ask(self, task_id: str, question: str, kb_name: str = "") -> str:
         """Handle /kb ask command — uses answer_smart() for full KB QA pipeline.
 
         This is the SAME chain used by the KB panel's /api/kb/query endpoint,
@@ -1289,7 +1488,7 @@ class ChatHandler:
         """
         # Determine which KB to use
         meta = self._task_manager.read_task_meta(task_id)
-        kb_name = str(meta.get("active_kb") or "").strip()
+        kb_name = self._resolve_kb_for_action(task_id, kb_name or str(meta.get("active_kb") or ""))
         if not kb_name:
             try:
                 available = get_kb().list_kb()
@@ -1298,13 +1497,13 @@ class ChatHandler:
             if available:
                 kb_name = available[0]
             else:
-                return "当前没有可用的知识库。请在 KB 面板上传文档后重试，或使用 /kb use <名称> 选择知识库。"
+                return "当前没有可用的知识库。请先上传文档，或直接说“新建一个知识库”。"
 
         try:
             result = get_kb().answer_smart(kb=kb_name, question=question)
         except Exception as e:
             logger.warning("kb_ask_failed kb=%s err=%s", kb_name, e)
-            return f"知识库检索失败：{str(e)[:180]}。请检查知识库是否正常。\n\n💡 提示：发送 /kb list 查看可用知识库。"
+            return f"知识库检索失败：{str(e)[:180]}。请检查知识库是否正常。\n\n💡 你可以先说“列出知识库”看看当前可用的知识库。"
 
         # Format citations: group by document, show sections as sub-items
         citations_lines = []
@@ -1418,7 +1617,7 @@ class ChatHandler:
             return
 
         # ── Route: CONTROL_TASK ──────────────────────────────────────
-        if intent == ChatIntent.CONTROL_TASK and m.startswith("/"):
+        if intent == ChatIntent.CONTROL_TASK:
             act = self._parse_chat_action(m, None)
             if act:
                 yield self._handle_chat_action(task_id, act)

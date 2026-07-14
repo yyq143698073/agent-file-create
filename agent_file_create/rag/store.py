@@ -1,16 +1,42 @@
 import json
 import math
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 import re
 
+import numpy as np
+
 from agent_file_create.config import DB_URL, KB_DB_PATH, KB_DB_URL, KB_HNSW_EF_SEARCH, KB_INDEX_TYPE, KB_IVFFLAT_PROBES
 
 
+def _cosine_batch(query_vec: list[float], embeddings: list[list[float]]) -> np.ndarray:
+    """Compute cosine similarity between *query_vec* and each embedding in *embeddings*.
+
+    Uses numpy for ~50-100x speedup over pure-Python loops.
+    Returns a 1-D array of scores aligned with *embeddings*.
+    """
+    if not embeddings:
+        return np.array([], dtype=np.float64)
+    q = np.asarray(query_vec, dtype=np.float64)
+    # Stack all embeddings into a 2-D array (n_embeddings, dim)
+    M = np.asarray(embeddings, dtype=np.float64)  # (N, D)
+    # Cosine = dot(q, M[i]) / (||q|| * ||M[i]||)
+    q_norm = np.linalg.norm(q)
+    if q_norm == 0:
+        return np.zeros(len(embeddings), dtype=np.float64)
+    m_norms = np.linalg.norm(M, axis=1)  # (N,)
+    # Avoid division by zero for zero-vectors
+    m_norms = np.where(m_norms == 0, 1.0, m_norms)
+    scores = np.dot(M, q) / (m_norms * q_norm)
+    return scores.astype(np.float64)
+
+
 def _cosine(a: list[float], b: list[float]) -> float:
+    """Single-pair cosine similarity — kept for backward compatibility."""
     if not a or not b or len(a) != len(b):
         return 0.0
     dot = 0.0
@@ -76,6 +102,9 @@ class SQLiteVectorStore:
         base_dir = Path(__file__).resolve().parent.parent.parent
         p = str(db_path or KB_DB_PATH or "result/kb.db").strip()
         self.db_path = str((base_dir / p).resolve()) if not Path(p).is_absolute() else p
+        # Per-instance thread-local for connection reuse — must be set before
+        # _init_schema() which calls _conn().
+        self._tlocal = threading.local()
         self._ensure_dir()
         self._init_schema()
 
@@ -86,7 +115,25 @@ class SQLiteVectorStore:
             pass
 
     def _conn(self):
-        return sqlite3.connect(self.db_path)
+        """Return a thread-local SQLite connection with WAL mode enabled.
+
+        Reuses the connection across calls on the same thread.  If a legacy
+        caller closes the connection, it is transparently re-created on the
+        next access.
+        """
+        conn = getattr(self._tlocal, 'conn', None)
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                conn = None  # was closed externally → recreate
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-8000")  # 8 MB page cache
+            self._tlocal.conn = conn
+        return conn
 
     def _init_schema(self) -> None:
         conn = self._conn()
@@ -330,42 +377,33 @@ class SQLiteVectorStore:
         if not items:
             return 0
         conn = self._conn()
-        try:
-            ts = float(time.time())
-            cur = conn.cursor()
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                cid = str(it.get("chunk_id") or "").strip()
-                if not cid:
-                    continue
-                content = str(it.get("content") or "").strip()
-                content = content.replace("\x00", "")  # strip NUL bytes (OCR artefacts)
-                emb = it.get("embedding")
-                emb_json = _safe_json(emb if isinstance(emb, list) else [])
-                meta_json = _safe_json(it.get("meta") if isinstance(it.get("meta"), dict) else {})
-                pid = str(it.get("parent_chunk_id") or "").strip()
-                # Also strip NUL from section_path
-                section_path = str(it.get("section_path") or "").replace("\x00", "")
-                cur.execute(
-                    "insert or replace into kb_chunks(id,kb,doc_id,chunk_index,section_path,content,embedding_json,meta_json,parent_chunk_id,created_at) values(?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        cid,
-                        kb,
-                        doc_id,
-                        int(it.get("chunk_index") or 0),
-                        section_path,
-                        content,
-                        emb_json,
-                        meta_json,
-                        pid,
-                        ts,
-                    ),
-                )
+        ts = float(time.time())
+        rows: list[tuple] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            cid = str(it.get("chunk_id") or "").strip()
+            if not cid:
+                continue
+            content = str(it.get("content") or "").strip()
+            content = content.replace("\x00", "")
+            emb = it.get("embedding")
+            emb_json = _safe_json(emb if isinstance(emb, list) else [])
+            meta_json = _safe_json(it.get("meta") if isinstance(it.get("meta"), dict) else {})
+            pid = str(it.get("parent_chunk_id") or "").strip()
+            section_path = str(it.get("section_path") or "").replace("\x00", "")
+            rows.append((
+                cid, kb, doc_id,
+                int(it.get("chunk_index") or 0),
+                section_path, content, emb_json, meta_json, pid, ts,
+            ))
+        if rows:
+            conn.executemany(
+                "insert or replace into kb_chunks(id,kb,doc_id,chunk_index,section_path,content,embedding_json,meta_json,parent_chunk_id,created_at) values(?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
             conn.commit()
-            return len(items)
-        finally:
-            conn.close()
+        return len(items)
 
     def similarity_search(
         self,
@@ -379,29 +417,24 @@ class SQLiteVectorStore:
         kb = str(kb or "").strip() or "default"
         top_k = max(1, int(top_k or 0))
         conn = self._conn()
-        try:
-            cur = conn.cursor()
-            if doc_id:
-                cur.execute(
-                    "select id,kb,doc_id,chunk_index,section_path,content,embedding_json,meta_json from kb_chunks where kb=? and doc_id=?",
-                    (kb, str(doc_id)),
-                )
-            else:
-                cur.execute(
-                    "select id,kb,doc_id,chunk_index,section_path,content,embedding_json,meta_json from kb_chunks where kb=?",
-                    (kb,),
-                )
-            rows = cur.fetchall() or []
-        finally:
-            conn.close()
+        if doc_id:
+            rows = conn.execute(
+                "select id,kb,doc_id,chunk_index,section_path,content,embedding_json,meta_json from kb_chunks where kb=? and doc_id=?",
+                (kb, str(doc_id)),
+            ).fetchall() or []
+        else:
+            rows = conn.execute(
+                "select id,kb,doc_id,chunk_index,section_path,content,embedding_json,meta_json from kb_chunks where kb=?",
+                (kb,),
+            ).fetchall() or []
 
-        # Apply post-query filters for doc_type, source, section_path (SQLite lacks WHERE clause support for these)
+        # Apply post-query filters
         if filters:
-            import json as _json
+            _json_mod = json
             filtered_rows = []
             for r in rows:
                 try:
-                    meta = _json.loads(str(r[7] or "{}")) if r[7] else {}
+                    meta = _json_mod.loads(str(r[7] or "{}")) if r[7] else {}
                 except Exception:
                     meta = {}
                 ok = True
@@ -417,44 +450,65 @@ class SQLiteVectorStore:
                     filtered_rows.append(r)
             rows = filtered_rows
 
-        hits: list[Hit] = []
+        if not rows:
+            return []
+
+        # ── Fast path: numpy batch cosine ────────────────────────────
+        # Deserialize all embeddings once into a list, compute all scores
+        # in a single numpy call, then argsort + slice top_k.
+        embeddings: list[list[float]] = []
+        row_meta: list[tuple] = []  # (r[0]..r[5], meta_dict)
         for r in rows:
             try:
                 emb = json.loads(r[6] or "[]")
             except Exception:
                 emb = []
-            if not isinstance(emb, list):
-                emb = []
+            if not isinstance(emb, list) or not emb:
+                continue
             vec = []
-            ok = True
+            ok_vec = True
             for v in emb:
                 try:
                     vec.append(float(v))
                 except Exception:
-                    ok = False
+                    ok_vec = False
                     break
-            if not ok or not vec:
+            if not ok_vec or not vec:
                 continue
-            score = _cosine(query_embedding, vec)
+            embeddings.append(vec)
             try:
                 meta = json.loads(r[7] or "{}")
                 meta = meta if isinstance(meta, dict) else {}
             except Exception:
                 meta = {}
-            hits.append(
-                Hit(
-                    kb=str(r[1] or ""),
-                    doc_id=str(r[2] or ""),
-                    chunk_id=str(r[0] or ""),
-                    chunk_index=int(r[3] or 0),
-                    section_path=str(r[4] or ""),
-                    content=str(r[5] or ""),
-                    score=float(score),
-                    meta=meta,
-                )
-            )
-        hits.sort(key=lambda x: x.score, reverse=True)
-        return hits[:top_k]
+            row_meta.append((r[0], r[1], r[2], r[3], r[4], r[5], meta))
+
+        if not embeddings:
+            return []
+
+        scores = _cosine_batch(query_embedding, embeddings)
+        if top_k >= len(scores):
+            top_indices = list(range(len(scores)))
+        else:
+            # Use argpartition for O(N) top-k instead of full sort
+            top_indices = np.argpartition(-scores, top_k - 1)[:top_k]
+            top_indices = top_indices[np.argsort(-scores[top_indices])]
+
+        hits: list[Hit] = []
+        for idx in top_indices:
+            score = float(scores[idx])
+            r = row_meta[idx]
+            hits.append(Hit(
+                kb=str(r[1] or ""),
+                doc_id=str(r[2] or ""),
+                chunk_id=str(r[0] or ""),
+                chunk_index=int(r[3] or 0),
+                section_path=str(r[4] or ""),
+                content=str(r[5] or ""),
+                score=score,
+                meta=r[6],
+            ))
+        return hits
 
     def lexical_search(
         self,

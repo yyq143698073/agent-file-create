@@ -67,6 +67,7 @@ class AgentState(TypedDict, total=False):
     skills_used: list                # names of skills that were invoked
     skill_prompt: str                # the LLM prompt for skill selection (for UI display)
     skill_calls_raw: str             # raw LLM response for skill selection
+    web_citations: list              # [{"title": "...", "url": "...", "snippet": "..."}] — from web_search
 
     # ── Planner + Critic ──────────────────────────────────────────────
     task_plan: list                  # ★ Planner: [{"task": "...", "needs": "...", "priority": "高/中/低"}, ...]

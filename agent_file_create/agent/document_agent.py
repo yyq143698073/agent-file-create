@@ -143,6 +143,26 @@ class DocumentAgent:
         # Already in async context — use thread to avoid nested loop
         return _get_async_pool().submit(asyncio.run, coro).result()
 
+    def _should_skip_skills(self) -> bool:
+        """Return True only when nothing is available — no KB AND no skills."""
+        # Check if any KB is configured
+        try:
+            meta = self._task_manager.read_task_meta(self.task_id)
+            if str(meta.get("active_kb") or "").strip():
+                return False
+        except Exception:
+            pass
+        # Check if any skills are available (e.g. web_search)
+        try:
+            from agent_file_create.skills import get_registry
+            registry = get_registry()
+            registry.discover()
+            if registry.list_all():
+                return False  # web_search can run without KB
+        except Exception:
+            pass
+        return True  # truly nothing available
+
     @staticmethod
     def _build_llm(timeout_s: int = MODEL_TIMEOUT_SHORT):
         """Lightweight LLM for clarification / routing (not content generation)."""
@@ -235,7 +255,12 @@ class DocumentAgent:
 
     @staticmethod
     def _route_after_assess(state: AgentState) -> str:
-        """Skip clarification if the user has already provided preferences."""
+        """Skip clarification when user context is already sufficient.
+
+        The clarify question is shown via status.json polling by the
+        frontend — NOT via LangGraph interrupt in the chat stream.
+        The interrupt writes to status.json, and the frontend's 2s
+        polling loop picks up the clarify_questions from there."""
         if state.get("force_regen"):
             return "enrich"
         if (state.get("user_clarifications") or "").strip():
@@ -301,7 +326,10 @@ class DocumentAgent:
             logger.info("extract skip   task=%s (already done)", self.task_id)
             return {}
 
-        from agent_file_create.document.extractor import extract_from_file
+        from agent_file_create.document.extractor import (
+            deduplicate_extracted_results,
+            extract_from_file,
+        )
         from agent_file_create.config import MAX_WORKERS_DEFAULT
 
         fps = state.get("file_paths", self.file_paths)
@@ -329,8 +357,9 @@ class DocumentAgent:
                     res["_file"] = Path(fps[idx]).name
                 results[idx] = res
 
-        logger.info("extract done   task=%s files=%d", self.task_id, len(results))
-        return {"analysis_results": results, "force_regen": False}
+        deduped = deduplicate_extracted_results(results)
+        logger.info("extract done   task=%s files=%d deduped=%d", self.task_id, len(results), len(deduped))
+        return {"analysis_results": deduped, "force_regen": False}
 
     # ── Node: plan (Planner) ─────────────────────────────────────────────────
 
@@ -446,6 +475,11 @@ class DocumentAgent:
         logger.info("enrich  start  task=%s", self.task_id)
         if state.get("enriched_context") and state.get("skills_used"):
             logger.info("enrich  skip   task=%s (already done)", self.task_id)
+            return {}
+        # Fast skip: no KB configured and no skills available → skip immediately
+        if self._should_skip_skills():
+            logger.info("enrich  skip   task=%s (no KB/skills configured)", self.task_id)
+            return {}
             return {}
 
         # ── Query Rewrite: rewrite casual/spoken prompt into precise search query ──
@@ -566,6 +600,10 @@ class DocumentAgent:
         (e.g. web_search) to fetch up-to-date data for the content.
         """
         logger.info("research start  task=%s", self.task_id)
+        # Fast skip: no skills available → skip immediately
+        if self._should_skip_skills():
+            logger.info("research skip   task=%s (no skills configured)", self.task_id)
+            return {}
 
         try:
             from agent_file_create.skills import get_registry
@@ -608,6 +646,22 @@ class DocumentAgent:
         calls = registry.parse_skill_calls(raw)
         logger.info("research llm_selected=%s task=%s", [c.skill_name for c in calls], self.task_id)
 
+        # ── Auto-trigger web_search as fallback ──────────────────────────
+        # Even if the LLM didn't select any skills, run at least a web
+        # search so the report has real, verifiable references beyond
+        # just the uploaded files / KB.
+        _has_web = any(c.skill_name == "web_search" for c in calls)
+        if not _has_web:
+            # Auto-add web_search with the user's topic as query
+            _wp = (user_prompt or "").strip()
+            if _wp:
+                from agent_file_create.skills import SkillCall
+                calls.append(SkillCall(skill_name="web_search", params={
+                    "query": _wp[:200],
+                    "max_results": 5,
+                }))
+                logger.info("research auto_web_search query=%.60s", _wp)
+
         if not calls:
             return {}
 
@@ -623,6 +677,9 @@ class DocumentAgent:
         context_parts = [existing_context] if existing_context else []
         skills_used = list(state.get("skills_used") or [])
 
+        # ── Collect web search citations ────────────────────────────
+        _web_citations: list[dict] = []  # [{title, url, snippet}]
+
         for call, result in results:
             if call.skill_name not in skills_used:
                 skills_used.append(call.skill_name)
@@ -634,18 +691,43 @@ class DocumentAgent:
                 "data": result.data,
                 "error": result.error,
             })
+
+            # Format web_search results with 【n】 citation markers so the
+            # LLM can reference them with specific, verifiable sources.
+            if call.skill_name == "web_search" and result.success:
+                articles = (result.data or {}).get("articles") or []
+                for _a in articles[:8]:
+                    _title = str(_a.get("title") or "").strip()
+                    _url = str(_a.get("url") or "").strip()
+                    _snippet = str(_a.get("snippet") or "").strip()
+                    if _title:
+                        _web_citations.append({
+                            "title": _title, "url": _url, "snippet": _snippet,
+                        })
+                if _web_citations:
+                    _ws_lines = ["### web_search\n以下来自网络搜索的真实文献，请在正文中引用时使用对应的【n】编号：\n"]
+                    for _i, _wc in enumerate(_web_citations, 1):
+                        _ws_lines.append(
+                            f"【W{_i}】 {_wc['title']}\n"
+                            f"   摘要: {_wc['snippet'][:200]}\n"
+                            f"   链接: {_wc['url']}"
+                        )
+                    context_parts.append("\n".join(_ws_lines))
+                    continue  # already added formatted context
+
             ctx = result.to_context()
             if ctx:
                 context_parts.append(f"### {call.skill_name}\n{ctx}")
 
         enriched = "\n\n".join(context_parts) if context_parts else existing_context
-        logger.info("research done   task=%s skills=%s chars=%d",
-                     self.task_id, skills_used, len(enriched))
+        logger.info("research done   task=%s skills=%s web_citations=%d chars=%d",
+                     self.task_id, skills_used, len(_web_citations), len(enriched))
 
         return {
             "skills_used": skills_used,
             "enriched_context": enriched,
             "skill_results": skill_results,
+            "web_citations": _web_citations,  # for reference list
         }
 
     # ── Node: clarify ────────────────────────────────────────────────────────
@@ -1016,7 +1098,8 @@ class DocumentAgent:
 
         try:
             from agent_file_create.document.content_generator import (
-                generate_full_content as _gen,
+                generate_full_content_parallel as _gen,
+                parse_outline_sections,
             )
 
             ar = state.get("analysis_results") or []
@@ -1026,14 +1109,20 @@ class DocumentAgent:
             user_prompt = state.get("rewritten_prompt") or raw_prompt
             feedback = state.get("satisfaction_feedback", "")
             enriched = state.get("enriched_context", "")
+            if len(enriched) > 8000:
+                enriched = enriched[:8000] + "\n\n... (上下文已截断)"
             target_words = int(state.get("target_words") or 0)
 
             # ── Planner: pre-plan knowledge (skip if KB is empty) ──
+            from agent_file_create.prompts.rag import Citation
+            from agent_file_create.rag.kb import KnowledgeBase
+            _kb = KnowledgeBase()  # used both inside and outside try
+            _kb_name = ""
+            _plan = None
+            _plan_parts = []  # set inside try; used by global sources code
             try:
                 from agent_file_create.rag.planner import plan_all_sections, build_citation_map, format_citation_list
-                from agent_file_create.rag.kb import KnowledgeBase
                 from agent_file_create.task.manager import TaskManager
-                _kb = KnowledgeBase()
                 _tm = TaskManager()
                 _task_meta = _tm.read_task_meta(self.task_id)
                 _active_kb = str(_task_meta.get("active_kb") or "").strip()
@@ -1105,7 +1194,11 @@ class DocumentAgent:
                             _citation_map = build_citation_map(_all_cit_maps)  # once after all sections
                             # Append annotated materials to enriched context so LLM sees 【n】 markers
                             if _annotated_parts:
-                                enriched = (enriched or "") + "\n\n---\n\n# 带编号引用的检索材料\n\n" + "\n\n".join(_annotated_parts)
+                                enriched = (enriched or "") + (
+                                    "\n\n---\n\n"
+                                    "# 检索材料（仅供写作参考，不要复制到正文）\n\n"
+                                    + "\n\n".join(_annotated_parts)
+                                )
                         except Exception:
                             _citation_map = {}
                         _citation_refs = format_citation_list(_citation_map) if _citation_map else ""
@@ -1124,9 +1217,183 @@ class DocumentAgent:
                 _citation_map = {}
                 _citation_refs = ""
 
+            # ── Inject global source list into enriched context ─────────
+            # Planner only retrieves per-section relevant hits.  To encourage
+            # citing diverse sources, prepend a menu of ALL available
+            # documents (KB + uploads + web) with citation markers.
+            _global_sources: list[str] = []
+            _src_id = max(len(_citation_map or {}), 1)
+            # KB documents — list ALL, not just planner hits
+            if _kb_name:
+                try:
+                    _all_kb_docs = _kb.list_docs(kb=_kb_name)
+                    for _doc in (_all_kb_docs or [])[:15]:
+                        _title = str(_doc.get("title") or _doc.get("doc_id") or "").strip()
+                        if _title and _title not in _global_sources:
+                            _global_sources.append(_title)
+                except Exception:
+                    pass
+            # Direct uploads
+            for _r in (ar or []):
+                if isinstance(_r, dict):
+                    _t = str(_r.get("title") or _r.get("_file") or "").strip()
+                    if _t and _t not in _global_sources:
+                        _global_sources.append(_t)
+            # Web search results
+            for _wc in (state.get("web_citations") or []):
+                _t = str(_wc.get("title") or "").strip()
+                if _t and _t not in _global_sources:
+                    _global_sources.append(_t)
+            # ── Build content snippets for global sources ────────────────
+            # So the LLM knows what each source is about and can cite
+            # real content instead of fabricating.
+            _source_snippets: dict[str, str] = {}
+            for _gs in _global_sources:
+                try:
+                    # Try KB first, then direct uploads, then web
+                    if _kb_name:
+                        _docs = _kb.list_docs(kb=_kb_name)
+                        for _d in (_docs or []):
+                            if str(_d.get("title") or _d.get("doc_id") or "") == _gs:
+                                _chunks = _kb.store.get_chunks_by_doc_id(kb=_kb_name, doc_id=str(_d.get("doc_id") or ""))
+                                if _chunks:
+                                    _txt = _chunks[0].content[:200] if _chunks[0].content else ""
+                                    _source_snippets[_gs] = _txt.strip()
+                                break
+                    # Direct uploads
+                    if not _source_snippets.get(_gs):
+                        for _r in (ar or []):
+                            if str(_r.get("title") or _r.get("_file") or "") == _gs:
+                                _txt = str(_r.get("summary") or _r.get("text") or "")[:200]
+                                if _txt.strip():
+                                    _source_snippets[_gs] = _txt.strip()
+                                break
+                    # Web search
+                    if not _source_snippets.get(_gs):
+                        for _wc in (state.get("web_citations") or []):
+                            if str(_wc.get("title") or "") == _gs:
+                                _txt = str(_wc.get("snippet") or "")[:200]
+                                if _txt.strip():
+                                    _source_snippets[_gs] = _txt.strip()
+                                break
+                except Exception:
+                    pass
+            logger.debug("content source_snippets=%d  task=%s", len(_source_snippets), self.task_id)
+
+            # ── Distribute global sources into per-section context ──────
+            if _global_sources and _plan and _plan_parts:
+                _next_id = max(len(_citation_map or {}), 1) + 1
+                # Register all sources in the citation map
+                for _gs in _global_sources:
+                    if _next_id not in (_citation_map or {}):
+                        _citation_map[_next_id] = Citation(
+                            doc_id=_gs, chunk_id="", section_path="",
+                            score=1.0, snippet=_gs,
+                        )
+                    _next_id += 1
+
+                # Distribute sources round-robin across sections (2-3 per section)
+                _sec_titles = list(_plan.keys())
+                _gs_idx = 0
+                _per_section = min(3, max(1, len(_global_sources) // max(len(_sec_titles), 1)))
+                # Build extras keyed by section title, then merge into
+                # _plan_parts by matching [章节素材: Title] prefix
+                _extras: dict[str, list[str]] = {}
+                for _st in _sec_titles:
+                    _section_gs = _global_sources[_gs_idx:_gs_idx + _per_section]
+                    _gs_idx = (_gs_idx + _per_section) % max(len(_global_sources), 1)
+                    if _section_gs:
+                        _gs_lines = []
+                        for _gs in _section_gs:
+                            _gs_info = _source_snippets.get(_gs, "")
+                            for _n, _c in _citation_map.items():
+                                if _c.doc_id == _gs:
+                                    _info = f" — {_gs_info}" if _gs_info else ""
+                                    _gs_lines.append(f"【{_n}】 {_gs}{_info}")
+                                    break
+                        if _gs_lines:
+                            _extras[_st] = _gs_lines
+                # Merge extras into _plan_parts by matching section prefix
+                for _pi in range(1, len(_plan_parts)):
+                    _part = _plan_parts[_pi]
+                    for _st, _lines in _extras.items():
+                        if f"[章节素材: {_st}]" in _part:
+                            _plan_parts[_pi] = _part + (
+                                f"\n[补充文献及内容摘要]\n"
+                                + "\n".join(_lines) + "\n"
+                            )
+                            break
+                # Rebuild enriched with per-section source annotations
+                enriched = "\n\n".join(_plan_parts) if len(_plan_parts) > 1 else enriched
+                if len(enriched) > 8000:
+                    enriched = enriched[:8000] + "\n\n... (上下文已截断)"
+                _citation_refs = format_citation_list(_citation_map) if _citation_map else ""
+                logger.info("content global_sources=%d distributed per_section=%d  task=%s",
+                            len(_global_sources), _per_section, self.task_id)
+            elif _global_sources:
+                # No Planner — distribute global sources evenly across
+                # sections by injecting a "本章可用文献" note into enriched.
+                _next_id = 1
+                for _gs in _global_sources:
+                    _citation_map[_next_id] = Citation(
+                        doc_id=_gs, chunk_id="", section_path="",
+                        score=1.0, snippet=_gs,
+                    )
+                    _next_id += 1
+                # Build section list from outline
+                _sec_titles_flat = [s["title"] for s in parse_outline_sections(outline) if s.get("level", 0) >= 2]
+                _per_sec = max(2, len(_global_sources) // max(len(_sec_titles_flat), 1))
+                _gs_idx = 0
+                _src_lines = [
+                    f"# 📚 可用文献（共 {len(_global_sources)} 篇，仅供引用参考，不要复制此列表到正文）\n",
+                    f"每章可引用的文献编号如下。只引用文献中确实包含的内容。\n",
+                ]
+                for _st in _sec_titles_flat:
+                    _sec_srcs = _global_sources[_gs_idx:_gs_idx + _per_sec]
+                    _gs_idx = (_gs_idx + _per_sec) % max(len(_global_sources), 1)
+                    _src_lines.append(f"## {_st}")
+                    for _gs in _sec_srcs:
+                        _n_str = ""
+                        for _n, _c in _citation_map.items():
+                            if _c.doc_id == _gs:
+                                _n_str = f"【{_n}】"
+                                break
+                        _info = _source_snippets.get(_gs, "")
+                        _src_lines.append(f"- {_n_str} {_gs}" + (f" — {_info[:150]}" if _info else ""))
+                    if _gs_idx == 0 and _sec_srcs:  # wrapped around
+                        break
+                enriched = (enriched or "") + "\n".join(_src_lines)
+                if len(enriched) > 8000:
+                    enriched = enriched[:8000] + "\n\n... (上下文已截断)"
+                _citation_refs = format_citation_list(_citation_map) if _citation_map else ""
+                logger.info("content global_sources=%d no_planner distributed  task=%s", len(_global_sources), self.task_id)
+
             content = _gen(outline, multimodal, user_prompt, task_id=self.task_id,
                           feedback=feedback, enriched_context=enriched,
                           target_words=target_words)
+
+            # ── Deduplicate citations within paragraphs ────────────────
+            # Same 【n】 appearing 2+ times in one paragraph is noisy.
+            # Keep only the first occurrence per paragraph.
+            def _dedup_para_citations(text: str) -> str:
+                lines = text.split("\n")
+                result = []
+                for line in lines:
+                    markers = re.findall(r'【(\d+)】', line)
+                    seen_in_line: set[str] = set()
+                    for m in markers:
+                        if m in seen_in_line:
+                            # Remove all but first occurrence of this number in the line
+                            first_pos = line.find(f"【{m}】")
+                            # Remove subsequent occurrences
+                            pos = line.find(f"【{m}】", first_pos + 1)
+                            while pos >= 0:
+                                line = line[:pos] + line[pos + len(f"【{m}】"):]
+                                pos = line.find(f"【{m}】", first_pos + 1)
+                        seen_in_line.add(m)
+                    result.append(line)
+                return "\n".join(result)
+            content = _dedup_para_citations(content)
 
             # Faithfulness check moved to quality_gate node (optional, user-decided)
 
@@ -1148,40 +1415,109 @@ class DocumentAgent:
             except Exception as e:
                 logger.debug("save_content_version_failed ver=%d err=%s", current_ver, e)
 
-            # Citation post-processing: renumber + optionally append reference list
+            # Citation post-processing: renumber + append reference list
             if content:
                 try:
                     from agent_file_create.rag.planner import renumber_citations
+                    _orig_cit_map = dict(_citation_map or {})
                     content, _citation_map = renumber_citations(content, _citation_map or {})
-                    _citation_refs = format_citation_list(_citation_map) if _citation_map else ""
+                    _ref_map = _citation_map if _citation_map else _orig_cit_map
+                    _citation_refs = format_citation_list(_ref_map) if _ref_map else ""
+                    # Fallback: if citation_map is empty, build from content markers
+                    if not _citation_refs:
+                        _inline_ids = set(re.findall(r'[【\[](\d+)[】\]]', content))
+                        if _inline_ids:
+                            _citation_refs = "\n".join(
+                                f"【{i}】 来源待标注" for i in sorted(set(int(x) for x in _inline_ids))
+                            )
                 except Exception:
                     pass
 
-            # Template-aware reference placement:
-            # if the template has {{references}} placeholder, don't append —
-            # the renderer will inject it there. Otherwise append at end.
-            _template_has_refs = False
+            # ── Build complete reference list ──────────────────────────────
+            # Map citation numbers to document names from the citation map.
+            _final_refs: dict[int, str] = {}
+
+            # Parse citation_refs (from format_citation_list) which has
+            # 【n】 doc_name lines.  Use doc_names directly — no oral labels.
+            if _citation_refs:
+                for _line in _citation_refs.strip().split("\n"):
+                    _line = _line.strip()
+                    if _line:
+                        _m = re.match(r'[【\[](\d+)[】\]]\s*(.+)', _line)
+                        if _m:
+                            _cid = int(_m.group(1))
+                            _final_refs[_cid] = _m.group(2).strip()
+
+            # 2. Add directly uploaded file names
+            _next_ref_id = max(_final_refs.keys(), default=0) + 1
+            _direct_files = []
+            for _r in (ar or []):
+                if isinstance(_r, dict):
+                    _title = str(_r.get("title") or _r.get("_file") or "").strip()
+                    if _title and _title not in _direct_files:
+                        _direct_files.append(_title)
+            for _title in _direct_files:
+                _final_refs[_next_ref_id] = _title
+                _next_ref_id += 1
+
+            # 3. Add web search citations
+            _web_cits = state.get("web_citations") or []
+            for _wc in _web_cits:
+                _title_url = (_wc.get("title") or "") + " " + (_wc.get("url") or "")
+                _final_refs[_next_ref_id] = _title_url.strip()
+                _next_ref_id += 1
+
+            # 4. Build final reference string — deduplicated + consecutive
+            if _final_refs:
+                _ref_lines = []
+                _new_id = 0
+                _seen_labels: set[str] = set()
+                for _old_id in sorted(_final_refs):
+                    _label = _final_refs[_old_id]
+                    # Clean up: remove pdf/docx extension, normalize
+                    _label = re.sub(r'\.(pdf|docx?|txt|md)$', '', _label, flags=re.I)
+                    _label = re.sub(r'[_\s]+$', '', _label).strip()
+                    if len(_label) > 80:
+                        _label = _label[:77] + "..."
+                    # Dedup by normalized label — same source appears only once
+                    _norm = _label.lower().replace("_", "").replace(" ", "")
+                    if _norm in _seen_labels:
+                        continue
+                    _seen_labels.add(_norm)
+                    _new_id += 1
+                    _ref_lines.append(f"【{_new_id}】 {_label}")
+                _citation_refs = "\n".join(_ref_lines)
+
+            # ── Strip any mid-report reference sections ──────────────────
+            # The LLM sometimes copies the enriched context's citation
+            # markers into the body as "参考文献【1】文献A【2】文献B".
+            # Remove all reference-like sections before the final one.
+            _ref_pattern = r'\n(?:---\s*\n)?(?:#{1,3}\s*)?参考文献[：:\s]*\n(?:(?:【\d+】|\[\d+\]).*(?:\n|$))*'
+            _all_refs = list(re.finditer(_ref_pattern, content or ""))
+            # Keep only the LAST occurrence — strip all earlier ones
+            if len(_all_refs) > 1:
+                # Work backwards to preserve indices
+                for _rm in reversed(_all_refs[:-1]):
+                    content = content[:_rm.start()] + content[_rm.end():]
+
+            if _citation_refs and content:
+                content = content.rstrip() + "\n\n---\n\n## 参考文献\n\n" + _citation_refs
+
+            # ── Sync preview file with final processed content ──────────
+            # content.md on disk (read by the frontend preview panel) may
+            # still show the pre-renumber/pre-critic version.  Overwrite it
+            # so the preview matches what will be rendered.
             try:
-                tpl_dir = self.template_dir_override or state.get("template_dir_override") or ""
-                if tpl_dir:
-                    from agent_file_create.document.template_renderer import _get_template_placeholders
-                    td = Path(tpl_dir)
-                    if td.exists() and td.is_dir():
-                        for tp in sorted(td.glob("*.md")):
-                            if "references" in _get_template_placeholders(str(tp)):
-                                _template_has_refs = True
-                                break
-            except Exception as e:
-                logger.debug("template_placeholder_check_failed err=%s", e)
+                _prev_path = Path(__file__).resolve().parent.parent.parent / "result" / str(self.task_id) / "content.md"
+                _prev_path.parent.mkdir(parents=True, exist_ok=True)
+                _prev_path.write_text(content, encoding="utf-8")
+                logger.debug("content preview_synced  task=%s", self.task_id)
+            except Exception:
+                pass
 
-            # Check if outline already has a references section
-            _outline_has_refs = bool(re.search(r'^#+\s*(?:参考|引用|文献|来源)', outline or "", re.MULTILINE | re.IGNORECASE))
-            if _citation_refs and not _template_has_refs and not _outline_has_refs:
-                content = (content or "") + "\n\n---\n\n" + _citation_refs
-
-            logger.info("content done   task=%s chars=%d ver=%d citations=%d template_has_refs=%s",
+            logger.info("content done   task=%s chars=%d ver=%d citations=%d",
                         self.task_id, len(content or ""), current_ver,
-                        len(_citation_map), _template_has_refs)
+                        len(_citation_map or {}))
             return {
                 "content": content,
                 "content_versions": versions,
@@ -1229,6 +1565,9 @@ class DocumentAgent:
         materials_full = "\n".join(materials_parts)
         materials = materials_full[:3000]
 
+        # Fast skip: short content (< 2000 chars) or few sections (< 3 H2) → regex-only
+        _h2_count = len(re.findall(r"^##\s+", content, re.MULTILINE))
+        _skip_llm_review = len(content) < 2000 or _h2_count < 3
         if len(content) < 200:
             logger.info("critic_analyze skip   task=%s (content too short)", self.task_id)
             return {
@@ -1272,14 +1611,19 @@ class DocumentAgent:
         except Exception as e:
             logger.debug("critic_analyze regex_filter skipped: %s", e)
 
-        try:
-            from agent_file_create.document._critic import run_critic
-
-            # LLM review (on already-hardened content)
-            report = run_critic(content=content_patched, outline=outline, materials=materials)
-        except Exception as e:
-            logger.warning("critic_analyze failed task=%s err=%s", self.task_id, e)
+        if _skip_llm_review and not regex_issues:
+            # Short doc + no regex problems → skip costly LLM review entirely
+            logger.info("critic_analyze skip   task=%s (short doc, regex clean)", self.task_id)
             report = {"issues": [], "raw": "", "passed": True}
+        else:
+            try:
+                from agent_file_create.document._critic import run_critic
+
+                # LLM review (on already-hardened content)
+                report = run_critic(content=content_patched, outline=outline, materials=materials)
+            except Exception as e:
+                logger.warning("critic_analyze failed task=%s err=%s", self.task_id, e)
+                report = {"issues": [], "raw": "", "passed": True}
 
         issues = regex_issues + report.get("issues", [])
         n_issues = len(issues)
@@ -1414,6 +1758,22 @@ class DocumentAgent:
             "critic_auto_fix done   task=%s fixed=%d changed=%s",
             self.task_id, len(fixable), _had_changes,
         )
+
+        # ── Re-compress citations after fix ──────────────────────────────
+        # The LLM fix may change citation numbers.  Re-run the same
+        # compression that _node_render uses so downstream consumers
+        # (satisfaction preview, final render) see consistent IDs.
+        if _had_changes:
+            _fc = fixed_content
+            _all = sorted(set(int(m) for m in re.findall(r'[【\[](\d+)[】\]]', _fc)))
+            if len(_all) > 1 and _all != list(range(1, len(_all) + 1)):
+                _remap = {old: new for new, old in enumerate(_all, 1)}
+                def _c(m):
+                    old_id = int(m.group(1))
+                    new_id = _remap.get(old_id, old_id)
+                    return f"【{new_id}】（" + m.group(2) + "）" if m.group(2) else f"【{new_id}】"
+                fixed_content = re.sub(r'【(\d+)】(?:（(.+?)）)?', _c, _fc)
+                logger.info("critic_auto_fix recompressed citations  task=%s", self.task_id)
 
         return {"content": fixed_content if _had_changes else content}
 
@@ -1581,6 +1941,60 @@ class DocumentAgent:
                         content = str(v.get("content") or content)
                         logger.info("render using_selected_version  task=%s version=%s", self.task_id, selected_version)
                         break
+
+            # ── Final cleanup: strip construction markers before rendering ──
+            # The prompt instructs the LLM to use [需补充…] markers for missing
+            # data, but these must never reach the rendered output.  Clean them
+            # here as a last line of defence regardless of which code path
+            # produced the content (content node, critic, auto-fix, regen, …).
+            import re as _re
+            for _pat in [
+                r'[\[【]\s*需补充[^\]】]*[\]】]',     # [需补充…]
+                r'[（(]\s*需补充[^）)]*[）)]',          # （需补充…）
+                r'[（(]\s*材料[暂缺不][^）)]*[）)]',     # （材料暂缺…）（材料不足…）
+                r'[（(]\s*数据[暂缺不][^）)]*[）)]',     # （数据暂缺…）（数据不足…）
+                r'[（(]\s*分析推测[^）)]*[）)]',         # （分析推测…）
+            ]:
+                content = _re.sub(_pat, '', content)
+
+            # ── Compress citation IDs to be consecutive (no gaps like [1][9][33]) ──
+            _all_ids = sorted(set(int(m) for m in re.findall(r'[【\[](\d+)[】\]]', content or "")))
+            if len(_all_ids) > 1 and _all_ids != list(range(1, len(_all_ids) + 1)):
+                _remap = {old: new for new, old in enumerate(_all_ids, 1)}
+                def _compress_id(m):
+                    old_id = int(m.group(1))
+                    new_id = _remap.get(old_id, old_id)
+                    return f"【{new_id}】"
+                content = re.sub(r'[【\[](\d+)[】\]]', _compress_id, content or "")
+                # Also remap citation_refs
+                _refs = str(state.get("citation_refs") or "")
+                if _refs:
+                    _new_refs_lines = []
+                    for _line in _refs.split("\n"):
+                        _m = re.match(r'【(\d+)】(.*)', _line.strip())
+                        if _m:
+                            _old = int(_m.group(1))
+                            _new = _remap.get(_old, _old)
+                            _new_refs_lines.append(f"【{_new}】{_m.group(2)}")
+                        else:
+                            _new_refs_lines.append(_line)
+                    state["citation_refs"] = "\n".join(_new_refs_lines)
+
+            # ── Ensure complete reference list before rendering ──
+            if "## 参考文献" not in (content or "") and not content.rstrip().endswith("参考文献"):
+                _text_ids = sorted(set(int(m) for m in re.findall(r'[【\[](\d+)[】\]]', content or "")))
+                if _text_ids:
+                    # Parse existing refs from state
+                    _existing = {}
+                    _refs_raw = str(state.get("citation_refs") or "")
+                    for _line in _refs_raw.split("\n"):
+                        _m = re.match(r'【(\d+)】(.+)', _line.strip())
+                        if _m:
+                            _existing[int(_m.group(1))] = _m.group(2).strip()
+                    # Build list: only include IDs that have real source data
+                    _ref_lines = [f"【{i}】{_existing[i]}" for i in _text_ids if i in _existing]
+                    if _ref_lines:
+                        content = content.rstrip() + "\n\n---\n\n## 参考文献\n\n" + "\n".join(_ref_lines)
 
             outline = str(state.get("outline") or "")
             output_dir = str(

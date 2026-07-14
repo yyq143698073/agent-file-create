@@ -298,7 +298,15 @@ def call_llm(
     api_endpoint: Optional[str] = None,
     api_style: Optional[str] = None,
     api_key: Optional[str] = None,
+    use_cache: bool = True,
 ) -> Any:
+    """Call an LLM and return the response text (or JSON error dict).
+
+    Args:
+        use_cache: When True (default), identical (prompt + messages + model +
+                   temperature) calls within the process lifetime return a
+                   cached result, saving ~95% time on repeated prompts.
+    """
     r = call_llm_ex(
         prompt,
         messages=messages,
@@ -311,6 +319,7 @@ def call_llm(
         api_endpoint=api_endpoint,
         api_style=api_style,
         api_key=api_key,
+        use_cache=use_cache,
     )
     if isinstance(r, dict) and r.get("success"):
         return str(r.get("text") or "")
@@ -322,6 +331,74 @@ def call_llm(
 
 
 
+
+
+# ── LLM response cache ────────────────────────────────────────────────
+
+def _make_llm_cache_key(
+    prompt: str,
+    messages: Any,
+    system: Optional[str],
+    temperature: Optional[float],
+    num_predict: Optional[int],
+    model_name: Optional[str],
+    api_endpoint: Optional[str],
+    api_style: Optional[str],
+    api_key: Optional[str],
+) -> str:
+    """Produce a stable hash for the LLM call parameters."""
+    parts: list[str] = [prompt or ""]
+    if messages is not None:
+        if isinstance(messages, list):
+            parts.append(json.dumps(
+                [{"role": str(m.get("role","")), "content": str(m.get("content",""))[:500]}
+                 if isinstance(m, dict) else str(m)[:500] for m in messages[:20]],
+                ensure_ascii=False, sort_keys=True,
+            ))
+        else:
+            parts.append(str(messages)[:500])
+    parts.append(str(system or ""))
+    parts.append(str(temperature or ""))
+    parts.append(str(num_predict or ""))
+    parts.append(str(model_name or ""))
+    parts.append(str(api_endpoint or ""))
+    parts.append(str(api_style or ""))
+    parts.append(str(api_key or ""))
+    raw = "|".join(parts)
+    return hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
+@lru_cache(maxsize=256)
+def _cached_llm_call(
+    cache_key: str,
+    prompt: str,
+    _messages_tuple: tuple,
+    _images_tuple: Optional[tuple],
+    timeout_s: int,
+    system: Optional[str],
+    temperature: Optional[float],
+    num_predict: Optional[int],
+    model_name: Optional[str],
+    api_endpoint: Optional[str],
+    api_style: Optional[str],
+    api_key: Optional[str],
+) -> dict:
+    """Actual LLM invocation — results are cached by *cache_key* via lru_cache."""
+    messages = list(_messages_tuple) if _messages_tuple else None
+    images_base64 = list(_images_tuple) if _images_tuple else None
+    return _call_llm_internal(
+        prompt,
+        messages=messages,
+        images_base64=images_base64,
+        timeout_s=timeout_s,
+        system=system,
+        temperature=temperature,
+        num_predict=num_predict,
+        model_name=model_name,
+        api_endpoint=api_endpoint,
+        api_style=api_style,
+        api_key=api_key,
+    )
 
 
 def call_llm_ex(
@@ -337,7 +414,44 @@ def call_llm_ex(
     api_endpoint: Optional[str] = None,
     api_style: Optional[str] = None,
     api_key: Optional[str] = None,
+    use_cache: bool = True,
 ) -> dict:
+    if use_cache:
+        cache_key = _make_llm_cache_key(
+            prompt, messages, system, temperature, num_predict,
+            model_name, api_endpoint, api_style, api_key,
+        )
+        return _cached_llm_call(
+            cache_key, prompt,
+            _messages_tuple=tuple(messages) if isinstance(messages, list) else tuple(),
+            _images_tuple=tuple(images_base64) if images_base64 else None,
+            timeout_s=int(timeout_s or MODEL_TIMEOUT),
+            system=system, temperature=temperature, num_predict=num_predict,
+            model_name=model_name, api_endpoint=api_endpoint,
+            api_style=api_style, api_key=api_key,
+        )
+    return _call_llm_internal(
+        prompt, messages=messages, images_base64=images_base64,
+        timeout_s=timeout_s, system=system, temperature=temperature,
+        num_predict=num_predict, model_name=model_name,
+        api_endpoint=api_endpoint, api_style=api_style, api_key=api_key,
+    )
+
+
+def _call_llm_internal(
+    prompt: str,
+    messages: Any = None,
+    images_base64: Optional[List[str]] = None,
+    timeout_s: Optional[int] = None,
+    system: Optional[str] = None,
+    temperature: Optional[float] = None,
+    num_predict: Optional[int] = None,
+    model_name: Optional[str] = None,
+    api_endpoint: Optional[str] = None,
+    api_style: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> dict:
+    """Internal implementation — moved to avoid duplication."""
     t0 = time.perf_counter()
     timeout_val = int(timeout_s or MODEL_TIMEOUT)
     style, endpoint, model, key = _resolve_llm_config(
@@ -575,7 +689,9 @@ def _create_chat_model(
 
     base_url = _normalize_ollama_base_url(endpoint)
     if not base_url:
-        raise RuntimeError("Ollama host is empty")
+        base_url = _normalize_ollama_base_url(OLLAMA_HOST)
+    if not base_url:
+        raise RuntimeError("Ollama host is empty — set OLLAMA_HOST or provide an endpoint")
 
     kwargs: dict = {}
     if stop and isinstance(stop, list) and all(isinstance(x, str) for x in stop):

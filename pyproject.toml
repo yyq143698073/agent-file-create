@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-file-create"
+version = "0.1.0"
+description = "AI-powered document generation agent with RAG and web chat interface"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "queek"}
+]
+# Dependencies are listed in requirements.txt; re-declare key ones here.
+# Full dependency list is maintained in requirements.txt for clarity.
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    "langchain-core>=0.2.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+agent-file-create = "agent_file_create.cli:main"
+agent-file-create-web = "agent_file_create.web.server:run"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent_file_create*"]

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
+import re
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,95 @@ _MODIFICATION_INDICATORS = [
     "太啰嗦", "太繁琐", "太简略", "太笼统", "太抽象", "太具体",
     "数据", "图表", "案例", "分析", "对比",
 ]
+
+_CONTROL_PATTERNS = {
+    "help": [
+        r"帮助",
+        r"怎么用",
+        r"如何使用",
+        r"你能做什么",
+        r"有哪些功能",
+        r"可用功能",
+    ],
+    "status": [
+        r"查看.*(?:状态|进度)",
+        r"当前.*(?:状态|进度)",
+        r"任务.*(?:状态|进度)",
+        r"现在.*到哪",
+        r"进行到哪",
+        r"完成了?吗",
+    ],
+    "pause": [
+        r"暂停",
+        r"先停一下",
+        r"先别继续",
+        r"等一下再",
+    ],
+    "resume": [
+        r"继续(?:生成|写|执行)?",
+        r"恢复(?:生成|写|执行)?",
+        r"接着(?:生成|写|执行)?",
+    ],
+    "cancel": [
+        r"取消(?:任务|生成)?",
+        r"停止(?:任务|生成)?",
+        r"终止(?:任务|生成)?",
+        r"不用生成了",
+        r"先别生成了",
+    ],
+    "regenerate": [
+        r"重新生成",
+        r"重新来",
+        r"再生成",
+        r"重做",
+        r"从头生成",
+        r"重写一版",
+    ],
+    "files": [
+        r"查看.*(?:文件|材料)",
+        r"上传了哪些(?:文件|材料)",
+        r"现在有哪些(?:文件|材料)",
+    ],
+    "templates": [
+        r"查看.*模板",
+        r"有哪些模板",
+        r"模板列表",
+    ],
+    "append": [
+        r"怎么追加",
+        r"追加.*(?:文件|材料|模板)",
+        r"继续上传",
+    ],
+    "kb_list": [
+        r"(?:列出|看看|查看).*(?:所有)?知识库",
+        r"有哪些知识库",
+        r"知识库列表",
+    ],
+    "kb_create": [
+        r"(?:新建|创建|新增).*(?:知识库|资料库)",
+    ],
+    "kb_use": [
+        r"(?:切换到|切到|使用|启用|选择|改用).{0,30}(?:知识库|资料库)",
+    ],
+    "kb_clear": [
+        r"(?:不用|不使用|关闭|取消|清除|别用).*(?:知识库|资料库)",
+        r"不要查知识库",
+    ],
+    "kb_docs": [
+        r"(?:知识库|资料库).*(?:有哪些(?:文档|资料|文件)|文档列表|资料列表|文件列表)",
+        r"(?:列出|查看|看看).*(?:知识库|资料库).*(?:文档|资料|文件)",
+    ],
+    "kb_stats": [
+        r"(?:知识库|资料库).*(?:统计|文档数|chunk数|规模|情况)",
+    ],
+    "kb_delete": [
+        r"(?:删除|移除).*(?:知识库|资料库)",
+    ],
+    "kb_ask": [
+        r"(?:在|从|用).{0,30}(?:知识库|资料库).*(?:查一下|查|搜索|检索|搜一下|帮我查|帮我找|回答|说明|解释)",
+        r"(?:在)?(?:知识库|资料库)(?:里|中)?.*(?:查一下|查|搜索|检索|搜一下|帮我查|帮我找)",
+    ],
+}
 
 
 def classify_intent(
@@ -101,22 +191,26 @@ def classify_intent(
     if _is_trivial_greeting(m):
         return ChatIntent.GENERAL_CHAT
 
-    # 4. Modification intent → MODIFY_REPORT (keyword match, fast)
+    # 4. Natural-language control intent → CONTROL_TASK
+    if _detect_control_intent(m):
+        return ChatIntent.CONTROL_TASK
+
+    # 5. Modification intent → MODIFY_REPORT (keyword match, fast)
     if has_report_content and _detect_modification_intent_rule(m):
         return ChatIntent.MODIFY_REPORT
 
-    # 5. KB query intent → KB_QUERY (explicit KB mention or conceptual question)
+    # 6. KB query intent → KB_QUERY (explicit KB mention or conceptual question)
     #    Only triggers when NOT a modification intent (checked above)
     if _detect_kb_query(m):
         return ChatIntent.KB_QUERY
     if has_report_content and _detect_modification_intent_rule(m):
         return ChatIntent.MODIFY_REPORT
 
-    # 5. Short message with report context → QUESTION_REPORT
+    # 7. Short message with report context → QUESTION_REPORT
     if has_report_content and _looks_like_question(m):
         return ChatIntent.QUESTION_REPORT
 
-    # 6. Ambiguous longer messages → LLM classification (if available)
+    # 8. Ambiguous longer messages → LLM classification (if available)
     #    Messages >20 chars that didn't match any rule are likely
     #    meaningful — use LLM to avoid misclassifying them as GENERAL_CHAT.
     if llm is not None and has_report_content and len(m) > 20:
@@ -126,8 +220,19 @@ def classify_intent(
                          llm_intent.value, m)
             return llm_intent
 
-    # 7. Fallback
+    # 9. Fallback
     return ChatIntent.GENERAL_CHAT
+
+
+def _detect_control_intent(message: str) -> bool:
+    """Detect common task-control instructions expressed in natural language."""
+    m = (message or "").strip()
+    if not m:
+        return False
+    for patterns in _CONTROL_PATTERNS.values():
+        if any(re.search(p, m, re.IGNORECASE) for p in patterns):
+            return True
+    return False
 
 
 _KB_QUERY_KEYWORDS = [

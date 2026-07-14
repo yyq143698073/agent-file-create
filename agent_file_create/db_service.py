@@ -50,14 +50,27 @@ def _ensure_schema_version_table(conn) -> None:
 
 
 def _get_current_version(conn) -> int:
-    """Get the current schema version, or 0 if no migrations have been applied."""
+    """Get the current schema version, or 0 if no migrations have been applied.
+
+    Distinguishes between "schema_version table doesn't exist yet" (return 0)
+    and genuine database errors (re-raise).  Previously the blanket ``except``
+    was swallowing connection failures and aborted-transaction errors, causing
+    ``run_migrations`` to blindly retry v1 inserts that already existed.
+    """
     cur = conn.cursor()
     try:
         cur.execute("select max(version) from schema_version")
         row = cur.fetchone()
         return int(row[0]) if row and row[0] is not None else 0
     except Exception:
-        return 0
+        # Only return 0 when the tracking table hasn't been created yet;
+        # anything else (connection lost, permission denied, transaction
+        # aborted, …) should propagate so the caller can handle it.
+        try:
+            cur.execute("select 1 from schema_version limit 1")
+        except Exception:
+            return 0  # table genuinely missing → never migrated
+        raise
 
 
 def run_migrations(conn) -> int:
@@ -104,8 +117,8 @@ def run_migrations(conn) -> int:
 
 @_register_migration(1, "Initial schema: document_tasks, outlines, contents, rendered_outputs, task_status")
 def _migration_v1(conn):
-    """Create all initial tables. Delegates to init_db() which uses IF NOT EXISTS."""
-    init_db(conn)
+    """Create all initial tables (idempotent: uses IF NOT EXISTS)."""
+    _create_tables(conn)
 
 
 def _dialect() -> str:
@@ -130,7 +143,8 @@ def get_db_connection():
     return conn
 
 
-def init_db(conn) -> None:
+def _create_tables(conn) -> None:
+    """Idempotent table creation for the initial schema (used by both init_db and v1 migration)."""
     d = _dialect()
     cur = conn.cursor()
     if d == "postgres":
@@ -280,6 +294,11 @@ def init_db(conn) -> None:
             """
         )
     conn.commit()
+
+
+def init_db(conn) -> None:
+    """Create initial tables and auto-apply any pending schema migrations."""
+    _create_tables(conn)
 
     # Auto-apply any pending migrations
     try:
